@@ -6,11 +6,13 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/leshaunj/hermes/internal/config"
 	"github.com/leshaunj/hermes/internal/db"
 )
 
 var (
-	dbPath   string
+	cfgPath  string
+	cfg      *config.Config
 	database *db.DB
 )
 
@@ -20,20 +22,28 @@ var rootCmd = &cobra.Command{
 	Long: `hermes manages OCI image tag approvals and gatekeeps OCI Distribution
 registries via a REST API used as nginx auth_request middleware.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		// serve opens its own DB after parsing flags; skip here.
+		// Load configuration.
+		c, err := config.Load(cfgPath)
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		cfg = c
+
+		// serve opens its own DB connection; skip here.
 		if cmd.Name() == "serve" {
 			return nil
 		}
-		d, err := db.Open(dbPath)
+
+		d, err := db.Open(cfg.DB.DSN())
 		if err != nil {
-			return fmt.Errorf("open database %q: %w", dbPath, err)
+			return fmt.Errorf("open database: %w", err)
 		}
 		database = d
 		return nil
 	},
 	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
 		if database != nil {
-			return database.Close()
+			database.Close()
 		}
 		return nil
 	},
@@ -48,5 +58,5 @@ func Execute() {
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "hermes.db", "path to the SQLite database")
+	rootCmd.PersistentFlags().StringVar(&cfgPath, "config", config.DefaultPath, "path to hermes.yaml")
 }

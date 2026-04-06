@@ -1,7 +1,4 @@
 // Package oci provides OCI registry reference parsing and manifest fetching.
-// Reference parsing is delegated to go-containerregistry/pkg/name and /pkg/authn.
-// Manifest fetching uses net/http directly to avoid pulling in the full
-// go-containerregistry remote stack (which requires klauspost/compress).
 package oci
 
 import (
@@ -31,7 +28,6 @@ func FetchManifest(imageRef string) (*ManifestResult, error) {
 		return nil, fmt.Errorf("parse reference %q: %w", imageRef, err)
 	}
 
-	// Resolve credentials from the Docker keychain.
 	auth, err := authn.DefaultKeychain.Resolve(ref.Context().Registry)
 	if err != nil {
 		return nil, fmt.Errorf("resolve credentials: %w", err)
@@ -62,7 +58,6 @@ func FetchManifest(imageRef string) (*ManifestResult, error) {
 	}, nil
 }
 
-// fetchManifest performs the actual HTTP request, handling Bearer auth challenges.
 func fetchManifest(url string, authCfg *authn.AuthConfig, registry, repository string) ([]byte, string, error) {
 	client := &http.Client{}
 
@@ -70,7 +65,6 @@ func fetchManifest(url string, authCfg *authn.AuthConfig, registry, repository s
 	if err != nil {
 		return nil, "", fmt.Errorf("build request: %w", err)
 	}
-	// Accept the most common manifest media types.
 	req.Header.Set("Accept", strings.Join([]string{
 		"application/vnd.oci.image.manifest.v1+json",
 		"application/vnd.docker.distribution.manifest.v2+json",
@@ -85,8 +79,7 @@ func fetchManifest(url string, authCfg *authn.AuthConfig, registry, repository s
 	}
 	defer resp.Body.Close()
 
-	// Handle Bearer token challenge (401 + WWW-Authenticate).
-	if resp.Status == "401 Unauthorized" || resp.StatusCode == http.StatusUnauthorized {
+	if resp.StatusCode == http.StatusUnauthorized {
 		token, err := fetchBearerToken(resp.Header.Get("WWW-Authenticate"), authCfg)
 		if err != nil {
 			return nil, "", fmt.Errorf("bearer auth: %w", err)
@@ -118,10 +111,7 @@ func readManifestResponse(resp *http.Response) ([]byte, string, error) {
 	return body, digest, nil
 }
 
-// fetchBearerToken exchanges credentials for a Bearer token using the
-// WWW-Authenticate challenge from the registry.
 func fetchBearerToken(challenge string, authCfg *authn.AuthConfig) (string, error) {
-	// Parse: Bearer realm="https://...",service="...",scope="..."
 	if !strings.HasPrefix(challenge, "Bearer ") {
 		return "", fmt.Errorf("unsupported auth scheme: %q", challenge)
 	}
@@ -175,7 +165,6 @@ func fetchBearerToken(challenge string, authCfg *authn.AuthConfig) (string, erro
 	return tok.AccessToken, nil
 }
 
-// parseChallenge parses key="value" pairs from a Bearer auth challenge.
 func parseChallenge(s string) map[string]string {
 	params := map[string]string{}
 	for _, part := range strings.Split(s, ",") {
@@ -191,7 +180,6 @@ func parseChallenge(s string) map[string]string {
 	return params
 }
 
-// applyAuth sets the Authorization header from an AuthConfig.
 func applyAuth(req *http.Request, authCfg *authn.AuthConfig) {
 	if authCfg == nil {
 		return
@@ -205,8 +193,8 @@ func applyAuth(req *http.Request, authCfg *authn.AuthConfig) {
 	}
 }
 
-// ParseRef decomposes an image reference string into registry, repository, and tag.
-// Returns an error if the reference does not include a tag (digest-only refs are rejected).
+// ParseRef decomposes an image reference into registry, repository, and tag.
+// Returns an error if the reference does not include a tag.
 func ParseRef(imageRef string) (db.ImageRef, error) {
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {

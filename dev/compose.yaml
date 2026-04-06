@@ -1,0 +1,72 @@
+# dev/compose.yaml — development / evaluation stack for hermes
+#
+# Usage:
+#   docker compose -f dev/compose.yaml up
+#
+# The hermes CLI can be run against this stack by setting:
+#   --config dev/hermes.yaml
+#
+# nginx listens on http://localhost:8888 and proxies approved OCI pulls
+# through hermes.  See dev/nginx.conf for the location block details.
+
+name: hermes-dev
+
+services:
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hermes
+      POSTGRES_PASSWORD: hermes
+      POSTGRES_DB: hermes
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hermes"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── hermes ───────────────────────────────────────────────────────────────────
+  hermes:
+    build:
+      context: ..
+      dockerfile: Containerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Override individual config values via environment variables by
+      # mounting a hermes.yaml or by extending this service.
+      #
+      # The default config path is /etc/hermes.yaml; mount your own or
+      # rely on the defaults (which point at 'postgres:5432').
+      : ""
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./hermes.yaml:/etc/hermes.yaml:ro
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── nginx ────────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      hermes:
+        condition: service_healthy
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/hermes.conf:ro
+    ports:
+      - "8888:80"
+
+volumes:
+  postgres_data:

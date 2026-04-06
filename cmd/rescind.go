@@ -10,12 +10,12 @@ import (
 )
 
 var rescindCmd = &cobra.Command{
-	Use:   "rescind <image>",
+	Use:   "rescind IMAGE",
 	Short: "Rescind approval for an OCI image tag",
-	Long: `rescind marks a previously approved image as rescinded, immediately
-preventing it from passing the API's authorization check.
+	Long: `rescind sets a previously approved IMAGE to the 'rescinded' state,
+immediately preventing it from passing the API's authorization check.
 
-The image can be re-approved with 'hermes approve'.
+A rescinded image can be re-approved with 'hermes approve'.
 
 Examples:
   hermes rescind registry.example.com/myapp:v1.2.3`,
@@ -33,10 +33,22 @@ func runRescind(_ *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := database.UpsertStatus(ref, db.StatusRescinded); err != nil {
+	img, err := database.GetByRef(ref)
+	if err != nil {
+		return err
+	}
+	if img == nil {
+		return fmt.Errorf("image not found: %s/%s:%s", ref.Registry, ref.Repository, ref.Tag)
+	}
+	if img.State != db.StateApproved {
+		return fmt.Errorf("image is %s, not approved — cannot rescind", img.State)
+	}
+
+	if err := database.Rescind(ref); err != nil {
 		return err
 	}
 
+	logEvent("rescind", img, nil)
 	fmt.Printf("rescinded  %s/%s:%s\n", ref.Registry, ref.Repository, ref.Tag)
 	return nil
 }
