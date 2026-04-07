@@ -26,6 +26,8 @@ actions:
   compose:
     command: docker compose --progress=plain
     load_secrets: true
+  hermes:
+    command: ops compose exec -T hermes hermes
   logs:
     alias: l
     command: ops compose logs --tail 100 --follow
@@ -47,9 +49,12 @@ actions:
     command: ops -q logs-with restart
   shell:
     alias: sh
-    command: ops compose exec quantum sh
+    command: |-
+      #!/usr/bin/env bash
+      ops compose exec -it ${1:-hermes} ${2:-sh} "${@:3}"
+    param_expansion: true
   start:
-    command: ops compose up --detach --no-recreate --yes
+    command: ops compose up --build --detach --yes
   start-wait:
     command: ops start --wait
   start-with-logs:
