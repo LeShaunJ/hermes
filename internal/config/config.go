@@ -2,10 +2,12 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 
-	"gopkg.in/yaml.v3"
+	"github.com/spf13/viper"
 )
 
 // DefaultPath is the canonical location of the hermes configuration file.
@@ -13,25 +15,25 @@ const DefaultPath = "/etc/hermes.yaml"
 
 // Config is the top-level hermes configuration.
 type Config struct {
-	Server   ServerConfig `yaml:"server"`
-	DB       DBConfig     `yaml:"db"`
-	Trivy    TrivyConfig  `yaml:"trivy"`
-	CacheURL string       `yaml:"cache_url"`
+	Server   ServerConfig `mapstructure:"server"`
+	DB       DBConfig     `mapstructure:"db"`
+	Trivy    TrivyConfig  `mapstructure:"trivy"`
+	CacheURL string       `mapstructure:"cache_url"`
 }
 
 // ServerConfig configures the HTTP API server.
 type ServerConfig struct {
-	Addr string `yaml:"addr"`
+	Addr string `mapstructure:"addr"`
 }
 
 // DBConfig configures the PostgreSQL connection.
 type DBConfig struct {
-	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
-	User     string `yaml:"user"`
-	Password string `yaml:"password"`
-	Name     string `yaml:"name"`
-	SSLMode  string `yaml:"sslmode"`
+	Host     string `mapstructure:"host"`
+	Port     int    `mapstructure:"port"`
+	User     string `mapstructure:"user"`
+	Password string `mapstructure:"password"`
+	Name     string `mapstructure:"name"`
+	SSLMode  string `mapstructure:"sslmode"`
 }
 
 // DSN returns a libpq-style connection string.
@@ -45,48 +47,42 @@ func (d DBConfig) DSN() string {
 // TrivyConfig configures the trivy container runner.
 type TrivyConfig struct {
 	// Image is the trivy Docker image to use (default: aquasec/trivy:latest).
-	Image string `yaml:"image"`
+	Image string `mapstructure:"image"`
 	// Args are extra arguments appended to `trivy image`.
-	Args []string `yaml:"args"`
+	Args []string `mapstructure:"args"`
 	// ConvertArgs are extra arguments appended to `trivy convert`.
-	ConvertArgs []string `yaml:"convert_args"`
+	ConvertArgs []string `mapstructure:"convert_args"`
 }
 
-// defaults returns a Config pre-populated with sensible defaults.
-func defaults() Config {
-	return Config{
-		Server: ServerConfig{
-			Addr: ":8080",
-		},
-		DB: DBConfig{
-			Host:    "localhost",
-			Port:    5432,
-			User:    "hermes",
-			Name:    "hermes",
-			SSLMode: "disable",
-		},
-		Trivy: TrivyConfig{
-			Image: "aquasec/trivy:latest",
-		},
-	}
-}
-
-// Load reads the YAML config at path.
+// Load reads the YAML config at path using viper.
+// Environment variables prefixed with HERMES_ override file values
+// (e.g. HERMES_DB_PASSWORD overrides db.password).
 // If path does not exist the default configuration is returned with no error.
 func Load(path string) (*Config, error) {
-	cfg := defaults()
+	v := viper.New()
 
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &cfg, nil
-		}
+	// Defaults mirror the zero-value behaviour of the previous implementation.
+	v.SetDefault("server.addr", ":8080")
+	v.SetDefault("db.host", "localhost")
+	v.SetDefault("db.port", 5432)
+	v.SetDefault("db.user", "hermes")
+	v.SetDefault("db.name", "hermes")
+	v.SetDefault("db.sslmode", "disable")
+	v.SetDefault("trivy.image", "aquasec/trivy:latest")
+
+	// HERMES_DB_HOST, HERMES_DB_PASSWORD, HERMES_SERVER_ADDR, …
+	v.SetEnvPrefix("hermes")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read config %q: %w", path, err)
 	}
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	var cfg Config
+	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
-
 	return &cfg, nil
 }
