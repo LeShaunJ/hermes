@@ -2,24 +2,23 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/leshaunj/hermes/internal/db"
 	"github.com/leshaunj/hermes/internal/oci"
 )
 
 var rejectCmd = &cobra.Command{
-	Use:   "reject <image>",
-	Short: "Reject an OCI image tag (do not use)",
-	Long: `reject marks an image tag as rejected, signalling that it must not be
-used. Unlike rescind, rejection is a deliberate "do not use" declaration.
+	Use:   "reject IMAGE",
+	Short: "Reject an OCI image tag",
+	Long: `reject marks an IMAGE as rejected — a deliberate "do not use" declaration.
 
-If the image already has a record (e.g. from a prior approval), the existing
-manifest and Trivy report are preserved and only the status is changed.
-If the image has no prior record, a skeleton record is created.
+You will be asked to confirm before the rejection is recorded.
+Enter YES to confirm; anything else cancels the operation.
 
-Re-approving a rejected image requires an explicit 'hermes approve'.
+A rejected image can be re-approved with 'hermes approve' (which forces a
+fresh scan).
 
 Examples:
   hermes reject registry.example.com/myapp:v1.2.3`,
@@ -37,10 +36,29 @@ func runReject(_ *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := database.UpsertStatus(ref, db.StatusRejected); err != nil {
+	img, err := database.GetByRef(ref)
+	if err != nil {
 		return err
 	}
 
+	answer, err := prompt(fmt.Sprintf(
+		"Reject %s/%s:%s? [YES / NO] (default: NO): ",
+		ref.Registry, ref.Repository, ref.Tag,
+	))
+	if err != nil {
+		return err
+	}
+
+	if strings.ToUpper(strings.TrimSpace(answer)) != "YES" {
+		fmt.Println("Cancelled.")
+		return nil
+	}
+
+	if err := database.Reject(ref); err != nil {
+		return err
+	}
+
+	logEvent("reject", img, nil)
 	fmt.Printf("rejected  %s/%s:%s\n", ref.Registry, ref.Repository, ref.Tag)
 	return nil
 }

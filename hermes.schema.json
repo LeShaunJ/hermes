@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leshaunj/hermes/hermes.schema.json",
+  "title": "hermes configuration",
+  "description": "Schema for /etc/hermes.yaml — the hermes OCI image approval system configuration file.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "server": {
+      "description": "HTTP API server settings.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "addr": {
+          "description": "TCP address the API server listens on (e.g. ':8080', '0.0.0.0:8080').",
+          "type": "string",
+          "default": ":8080",
+          "examples": [":8080", "0.0.0.0:9090"]
+        }
+      }
+    },
+    "db": {
+      "description": "PostgreSQL connection settings.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "description": "PostgreSQL server hostname or IP address.",
+          "type": "string",
+          "default": "localhost",
+          "examples": ["localhost", "postgres", "db.internal.example.com"]
+        },
+        "port": {
+          "description": "PostgreSQL server port.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 5432
+        },
+        "user": {
+          "description": "PostgreSQL username.",
+          "type": "string",
+          "default": "hermes"
+        },
+        "password": {
+          "description": "PostgreSQL password.",
+          "type": "string"
+        },
+        "name": {
+          "description": "PostgreSQL database name.",
+          "type": "string",
+          "default": "hermes"
+        },
+        "sslmode": {
+          "description": "PostgreSQL SSL mode.",
+          "type": "string",
+          "enum": ["disable", "require", "verify-ca", "verify-full"],
+          "default": "disable"
+        }
+      }
+    },
+    "trivy": {
+      "description": "Settings for the trivy vulnerability scanner (run as a Docker container).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "description": "Docker image to use for trivy.",
+          "type": "string",
+          "default": "aquasec/trivy:latest",
+          "examples": ["aquasec/trivy:latest", "aquasec/trivy:0.58.2"]
+        },
+        "args": {
+          "description": "Extra CLI arguments appended to 'trivy image' before the image reference.",
+          "type": "array",
+          "items": { "type": "string" },
+          "examples": [
+            ["--ignore-unfixed"],
+            ["--severity", "HIGH,CRITICAL"]
+          ]
+        },
+        "convert_args": {
+          "description": "Extra CLI arguments appended to 'trivy convert' before the input path.",
+          "type": "array",
+          "items": { "type": "string" },
+          "examples": [
+            ["--template", "@contrib/html.tpl"]
+          ]
+        }
+      }
+    },
+    "cache_url": {
+      "description": "Default registry URL for 'hermes approve --cache'. Used when --cache is given without a URL.",
+      "type": "string",
+      "examples": ["cache.registry.internal.example.com", "registry.example.com/cache"]
+    }
+  },
+  "examples": [
+    {
+      "server": { "addr": ":8080" },
+      "db": {
+        "host": "postgres",
+        "port": 5432,
+        "user": "hermes",
+        "password": "s3cr3t",
+        "name": "hermes",
+        "sslmode": "disable"
+      },
+      "trivy": {
+        "image": "aquasec/trivy:latest",
+        "args": ["--ignore-unfixed"],
+        "convert_args": []
+      },
+      "cache_url": "cache.registry.internal.example.com"
+    }
+  ]
+}

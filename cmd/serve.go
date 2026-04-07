@@ -18,41 +18,48 @@ var serveCmd = &cobra.Command{
 middleware for OCI Distribution registry proxies.
 
 The server exposes:
-  GET /validate_image  — authorization check (returns 200 or 401)
-  GET /healthz         — liveness probe
+  GET /validate/<registry>/v2/<repo>/manifests/<tag>
+      Authorization check.  Returns 200 + X-HERMES-IMAGE-URI if approved.
+      Queues unknown images for later CLI review.
 
-nginx configuration example:
+  GET /healthz
+      Liveness probe.
 
-  location ~ ^/v2/(?<repo>.+)/manifests/(?<tag>.+)$ {
-      auth_request /validate_image;
-      auth_request_set $approved_digest $upstream_http_x_approved_digest;
-      auth_request_set $registry_domain $upstream_http_x_registry_domain;
+nginx configuration example (see dev/nginx.conf for a full example):
 
-      proxy_pass https://$registry_domain/v2/$repo/manifests/$approved_digest;
+  location ~ ^/(?<registry>[^/]+)/(?<path>v2/.+)$ {
+      auth_request     /hermes-validate/$registry/$path;
+      auth_request_set $hermes_uri $upstream_http_x_hermes_image_uri;
+      proxy_pass       https://$hermes_uri;
   }
 
-  location = /validate_image {
+  location /hermes-validate/ {
       internal;
-      proxy_pass http://hermes:8080/validate_image?repo=$repo&tag=$tag;
+      proxy_pass              http://hermes:8080/validate/;
       proxy_pass_request_body off;
-      proxy_set_header Content-Length "";
+      proxy_set_header        Content-Length "";
   }`,
 	Args: cobra.NoArgs,
 	RunE: runServe,
 }
 
 func init() {
-	serveCmd.Flags().StringVar(&serveAddr, "addr", ":8080", "listen address")
+	serveCmd.Flags().StringVar(&serveAddr, "addr", "", "listen address (overrides config)")
 	rootCmd.AddCommand(serveCmd)
 }
 
 func runServe(_ *cobra.Command, _ []string) error {
-	d, err := db.Open(dbPath)
+	addr := cfg.Server.Addr
+	if serveAddr != "" {
+		addr = serveAddr
+	}
+
+	d, err := db.Open(cfg.DB.DSN())
 	if err != nil {
-		return fmt.Errorf("open database %q: %w", dbPath, err)
+		return fmt.Errorf("open database: %w", err)
 	}
 	defer d.Close()
 
-	srv := api.New(d, serveAddr)
+	srv := api.New(d, addr)
 	return srv.ListenAndServe()
 }

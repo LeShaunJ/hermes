@@ -1,0 +1,22 @@
+# dev/hermes.yaml — hermes configuration for the dev compose stack
+#
+# Mount this file at /etc/hermes.yaml inside the hermes container, or pass
+# --config dev/hermes.yaml when running the hermes CLI locally.
+
+server:
+  addr: ":8080"
+
+db:
+  host: postgres
+  port: 5432
+  user: hermes
+  password: hermes
+  name: hermes
+  sslmode: disable
+
+trivy:
+  image: aquasec/trivy:latest
+  # args: []           # extra flags for `trivy image`
+  # convert_args: []   # extra flags for `trivy convert`
+
+# cache_url: ""        # default cache registry for `hermes approve --cache`
