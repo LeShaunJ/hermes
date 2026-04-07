@@ -2,12 +2,13 @@
 package db
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/leshaunj/hermes/internal/pgdb"
+	"github.com/lib/pq"
 )
 
 // ── state / group ─────────────────────────────────────────────────────────────
@@ -108,20 +109,20 @@ type Event struct {
 
 // DB wraps the connection pool and exposes all persistence operations.
 type DB struct {
-	pool *pgdb.Pool
+	db *sql.DB
 }
 
 // Open connects to PostgreSQL, runs schema migrations, and returns a DB.
 func Open(dsn string) (*DB, error) {
-	cfg, err := pgdb.ParseDSN(dsn)
+	sqlDB, err := sql.Open("postgres", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("db: parse DSN: %w", err)
+		return nil, fmt.Errorf("db: open: %w", err)
 	}
-	pool := pgdb.NewPool(cfg, 10)
+	sqlDB.SetMaxOpenConns(10)
 
-	d := &DB{pool: pool}
+	d := &DB{db: sqlDB}
 	if err := d.migrate(); err != nil {
-		pool.Close()
+		sqlDB.Close()
 		return nil, fmt.Errorf("db: migrate: %w", err)
 	}
 	return d, nil
@@ -129,7 +130,7 @@ func Open(dsn string) (*DB, error) {
 
 // Close shuts down the connection pool.
 func (d *DB) Close() {
-	d.pool.Close()
+	d.db.Close()
 }
 
 // migrate creates tables if they don't already exist.
@@ -162,7 +163,7 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_events_image_id   ON events(image_id)`,
 	}
 	for _, s := range stmts {
-		if err := d.pool.Exec(s); err != nil {
+		if _, err := d.db.Exec(s); err != nil {
 			return err
 		}
 	}
@@ -174,15 +175,13 @@ func (d *DB) migrate() error {
 // Queue inserts a new image record with state=queued, or returns the existing
 // record unchanged.  Returns the (possibly pre-existing) image.
 func (d *DB) Queue(ref ImageRef) (*Image, error) {
-	sql := fmt.Sprintf(`
+	_, err := d.db.Exec(`
 		INSERT INTO images (registry, repository, tag, state)
-		VALUES (%s, %s, %s, 'queued')
+		VALUES ($1, $2, $3, 'queued')
 		ON CONFLICT (registry, repository, tag) DO NOTHING`,
-		pgdb.QuoteLiteral(ref.Registry),
-		pgdb.QuoteLiteral(ref.Repository),
-		pgdb.QuoteLiteral(ref.Tag),
+		ref.Registry, ref.Repository, ref.Tag,
 	)
-	if err := d.pool.Exec(sql); err != nil {
+	if err != nil {
 		return nil, err
 	}
 	return d.GetByRef(ref)
@@ -191,23 +190,18 @@ func (d *DB) Queue(ref ImageRef) (*Image, error) {
 // SaveScan stores the digest, manifest, and scan report for an image and sets
 // its state to scanned.
 func (d *DB) SaveScan(ref ImageRef, digest, manifest, scanReport string) (*Image, error) {
-	sql := fmt.Sprintf(`
+	_, err := d.db.Exec(`
 		INSERT INTO images (registry, repository, tag, digest, manifest, scan_report, state, updated_at)
-		VALUES (%s, %s, %s, %s, %s, %s, 'scanned', NOW())
+		VALUES ($1, $2, $3, $4, $5, $6, 'scanned', NOW())
 		ON CONFLICT (registry, repository, tag) DO UPDATE SET
 			digest      = EXCLUDED.digest,
 			manifest    = EXCLUDED.manifest,
 			scan_report = EXCLUDED.scan_report,
 			state       = 'scanned',
 			updated_at  = NOW()`,
-		pgdb.QuoteLiteral(ref.Registry),
-		pgdb.QuoteLiteral(ref.Repository),
-		pgdb.QuoteLiteral(ref.Tag),
-		pgdb.QuoteLiteral(digest),
-		pgdb.QuoteLiteral(manifest),
-		pgdb.QuoteLiteral(scanReport),
+		ref.Registry, ref.Repository, ref.Tag, digest, manifest, scanReport,
 	)
-	if err := d.pool.Exec(sql); err != nil {
+	if err != nil {
 		return nil, err
 	}
 	return d.GetByRef(ref)
@@ -215,18 +209,19 @@ func (d *DB) SaveScan(ref ImageRef, digest, manifest, scanReport string) (*Image
 
 // Approve sets an image's state to approved and optionally records the cache registry.
 func (d *DB) Approve(ref ImageRef, cacheRegistry string) error {
-	sql := fmt.Sprintf(`
+	var cr interface{}
+	if cacheRegistry != "" {
+		cr = cacheRegistry
+	}
+	_, err := d.db.Exec(`
 		UPDATE images SET
 			state          = 'approved',
-			cache_registry = %s,
+			cache_registry = $1,
 			updated_at     = NOW()
-		WHERE registry = %s AND repository = %s AND tag = %s`,
-		pgdb.QuoteNullable(cacheRegistry),
-		pgdb.QuoteLiteral(ref.Registry),
-		pgdb.QuoteLiteral(ref.Repository),
-		pgdb.QuoteLiteral(ref.Tag),
+		WHERE registry = $2 AND repository = $3 AND tag = $4`,
+		cr, ref.Registry, ref.Repository, ref.Tag,
 	)
-	return d.pool.Exec(sql)
+	return err
 }
 
 // Rescind sets state to rescinded.
@@ -245,78 +240,57 @@ func (d *DB) SetError(ref ImageRef) error {
 }
 
 func (d *DB) setState(ref ImageRef, state State) error {
-	sql := fmt.Sprintf(`
-		UPDATE images SET state = %s, updated_at = NOW()
-		WHERE registry = %s AND repository = %s AND tag = %s`,
-		pgdb.QuoteLiteral(string(state)),
-		pgdb.QuoteLiteral(ref.Registry),
-		pgdb.QuoteLiteral(ref.Repository),
-		pgdb.QuoteLiteral(ref.Tag),
+	_, err := d.db.Exec(`
+		UPDATE images SET state = $1, updated_at = NOW()
+		WHERE registry = $2 AND repository = $3 AND tag = $4`,
+		string(state), ref.Registry, ref.Repository, ref.Tag,
 	)
-	return d.pool.Exec(sql)
+	return err
+}
+
+// imageColumns is the SELECT column list used by all image queries.
+const imageColumns = `id, registry, repository, tag,
+	COALESCE(digest,''), COALESCE(manifest,''), COALESCE(scan_report,''),
+	state, COALESCE(cache_registry,''),
+	created_at, updated_at`
+
+func scanImageRow(row *sql.Row) (*Image, error) {
+	img := &Image{}
+	err := row.Scan(
+		&img.ID, &img.Registry, &img.Repository, &img.Tag,
+		&img.Digest, &img.Manifest, &img.ScanReport,
+		(*string)(&img.State), &img.CacheRegistry,
+		&img.CreatedAt, &img.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return img, err
 }
 
 // GetByRef returns the Image for ref, or nil if not found.
 func (d *DB) GetByRef(ref ImageRef) (*Image, error) {
-	sql := fmt.Sprintf(`
-		SELECT id, registry, repository, tag,
-		       COALESCE(digest,''), COALESCE(manifest,''), COALESCE(scan_report,''),
-		       state, COALESCE(cache_registry,''),
-		       created_at, updated_at
+	row := d.db.QueryRow(`
+		SELECT `+imageColumns+`
 		FROM images
-		WHERE registry = %s AND repository = %s AND tag = %s
+		WHERE registry = $1 AND repository = $2 AND tag = $3
 		LIMIT 1`,
-		pgdb.QuoteLiteral(ref.Registry),
-		pgdb.QuoteLiteral(ref.Repository),
-		pgdb.QuoteLiteral(ref.Tag),
+		ref.Registry, ref.Repository, ref.Tag,
 	)
-	img := &Image{}
-	row := d.pool.QueryRow(sql)
-	err := row.Scan(
-		&img.ID, &img.Registry, &img.Repository, &img.Tag,
-		&img.Digest, &img.Manifest, &img.ScanReport,
-		(*string)(&img.State), &img.CacheRegistry,
-		&img.CreatedAt, &img.UpdatedAt,
-	)
-	if err == pgdb.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return img, nil
+	return scanImageRow(row)
 }
 
 // GetApproved returns an approved image matching registry+repository+tag, or nil.
 func (d *DB) GetApproved(registry, repository, tag string) (*Image, error) {
-	sql := fmt.Sprintf(`
-		SELECT id, registry, repository, tag,
-		       COALESCE(digest,''), COALESCE(manifest,''), COALESCE(scan_report,''),
-		       state, COALESCE(cache_registry,''),
-		       created_at, updated_at
+	row := d.db.QueryRow(`
+		SELECT `+imageColumns+`
 		FROM images
-		WHERE registry = %s AND repository = %s AND tag = %s
+		WHERE registry = $1 AND repository = $2 AND tag = $3
 		  AND state = 'approved'
 		LIMIT 1`,
-		pgdb.QuoteLiteral(registry),
-		pgdb.QuoteLiteral(repository),
-		pgdb.QuoteLiteral(tag),
+		registry, repository, tag,
 	)
-	img := &Image{}
-	row := d.pool.QueryRow(sql)
-	err := row.Scan(
-		&img.ID, &img.Registry, &img.Repository, &img.Tag,
-		&img.Digest, &img.Manifest, &img.ScanReport,
-		(*string)(&img.State), &img.CacheRegistry,
-		&img.CreatedAt, &img.UpdatedAt,
-	)
-	if err == pgdb.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return img, nil
+	return scanImageRow(row)
 }
 
 // ListFilter specifies optional filters for List.
@@ -327,20 +301,25 @@ type ListFilter struct {
 
 // List returns images ordered by updated_at DESC, with optional filtering.
 func (d *DB) List(f ListFilter) ([]Image, error) {
-	var conditions []string
+	var (
+		conditions []string
+		args       []interface{}
+		argIdx     = 1
+	)
 
 	if len(f.States) > 0 {
-		quoted := make([]string, len(f.States))
+		stateStrs := make([]string, len(f.States))
 		for i, s := range f.States {
-			quoted[i] = pgdb.QuoteLiteral(string(s))
+			stateStrs[i] = string(s)
 		}
-		conditions = append(conditions, "state IN ("+strings.Join(quoted, ",")+")")
+		conditions = append(conditions, fmt.Sprintf("state = ANY($%d)", argIdx))
+		args = append(args, pq.Array(stateStrs))
+		argIdx++
 	}
 
 	if len(f.Refs) > 0 {
 		var refConds []string
 		for _, r := range f.Refs {
-			// r may be "name", "namespace/name", "name:tag", "namespace/name:tag"
 			tag := ""
 			if idx := strings.LastIndex(r, ":"); idx > 0 {
 				tag = r[idx+1:]
@@ -348,13 +327,15 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 			}
 			if tag != "" {
 				refConds = append(refConds, fmt.Sprintf(
-					"(repository = %s AND tag = %s)",
-					pgdb.QuoteLiteral(r), pgdb.QuoteLiteral(tag),
+					"(repository = $%d AND tag = $%d)",
+					argIdx, argIdx+1,
 				))
+				args = append(args, r, tag)
+				argIdx += 2
 			} else {
-				refConds = append(refConds, fmt.Sprintf(
-					"repository = %s", pgdb.QuoteLiteral(r),
-				))
+				refConds = append(refConds, fmt.Sprintf("repository = $%d", argIdx))
+				args = append(args, r)
+				argIdx++
 			}
 		}
 		conditions = append(conditions, "("+strings.Join(refConds, " OR ")+")")
@@ -365,16 +346,13 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 		where = "WHERE " + strings.Join(conditions, " AND ")
 	}
 
-	sql := fmt.Sprintf(`
-		SELECT id, registry, repository, tag,
-		       COALESCE(digest,''), COALESCE(manifest,''), COALESCE(scan_report,''),
-		       state, COALESCE(cache_registry,''),
-		       created_at, updated_at
+	query := fmt.Sprintf(`
+		SELECT `+imageColumns+`
 		FROM images
 		%s
 		ORDER BY updated_at DESC`, where)
 
-	rows, err := d.pool.Query(sql)
+	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -400,28 +378,17 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 
 // LogEvent records an event. imageID may be nil for non-image events.
 func (d *DB) LogEvent(imageID *int64, source EventSource, eventType string, details map[string]interface{}) error {
-	var imgIDSQL string
-	if imageID == nil {
-		imgIDSQL = "NULL"
-	} else {
-		imgIDSQL = fmt.Sprintf("%d", *imageID)
-	}
-
-	detailsSQL := "NULL"
+	var detailsJSON interface{}
 	if len(details) > 0 {
 		b, err := json.Marshal(details)
 		if err == nil {
-			detailsSQL = pgdb.QuoteLiteral(string(b))
+			detailsJSON = string(b)
 		}
 	}
-
-	sql := fmt.Sprintf(`
+	_, err := d.db.Exec(`
 		INSERT INTO events (image_id, source, event_type, details)
-		VALUES (%s, %s, %s, %s)`,
-		imgIDSQL,
-		pgdb.QuoteLiteral(string(source)),
-		pgdb.QuoteLiteral(eventType),
-		detailsSQL,
+		VALUES ($1, $2, $3, $4)`,
+		imageID, string(source), eventType, detailsJSON,
 	)
-	return d.pool.Exec(sql)
+	return err
 }
