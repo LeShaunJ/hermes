@@ -12,8 +12,9 @@ import (
 var rescindCmd = &cobra.Command{
 	Use:   "rescind IMAGE",
 	Short: "Rescind approval for an OCI image tag",
-	Long: `rescind sets a previously approved IMAGE to the 'rescinded' state,
-immediately preventing it from passing the API's authorization check.
+	Long: `rescind sets all platform images for a previously approved IMAGE to the
+'rescinded' state, immediately preventing them from passing the API's
+authorization check.
 
 A rescinded image can be re-approved with 'hermes approve'.
 
@@ -28,27 +29,35 @@ func init() {
 }
 
 func runRescind(_ *cobra.Command, args []string) error {
-	ref, err := oci.ParseRef(args[0])
+	reg, repo, tag, err := oci.ParseRef(args[0])
 	if err != nil {
 		return err
 	}
+	ref := db.ImageRef{Registry: reg, Repository: repo, Tag: tag}
 
-	img, err := database.GetByRef(ref)
+	images, err := database.GetByRef(ref)
 	if err != nil {
 		return err
 	}
-	if img == nil {
-		return fmt.Errorf("image not found: %s/%s:%s", ref.Registry, ref.Repository, ref.Tag)
-	}
-	if img.State != db.StateApproved {
-		return fmt.Errorf("image is %s, not approved — cannot rescind", img.State)
+	if len(images) == 0 {
+		return fmt.Errorf("image not found: %s/%s:%s", reg, repo, tag)
 	}
 
-	if err := database.Rescind(ref); err != nil {
-		return err
+	// All platform images must be approved to rescind.
+	for _, img := range images {
+		if img.State != db.StateApproved {
+			return fmt.Errorf("platform %s/%s is %s, not approved — cannot rescind %s/%s:%s",
+				img.OS, img.Arch, img.State, reg, repo, tag)
+		}
 	}
 
-	logEvent("rescind", img, nil)
-	fmt.Printf("rescinded  %s/%s:%s\n", ref.Registry, ref.Repository, ref.Tag)
+	for _, img := range images {
+		if err := database.Rescind(img.ID); err != nil {
+			return err
+		}
+		logEvent("rescind", img, nil)
+	}
+
+	fmt.Printf("rescinded  %s/%s:%s\n", reg, repo, tag)
 	return nil
 }

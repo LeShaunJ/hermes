@@ -6,13 +6,15 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/leshaunj/hermes/internal/db"
 	"github.com/leshaunj/hermes/internal/oci"
 )
 
 var rejectCmd = &cobra.Command{
 	Use:   "reject IMAGE",
 	Short: "Reject an OCI image tag",
-	Long: `reject marks an IMAGE as rejected — a deliberate "do not use" declaration.
+	Long: `reject marks all platform images for IMAGE as rejected — a deliberate
+"do not use" declaration.
 
 You will be asked to confirm before the rejection is recorded.
 Enter YES to confirm; anything else cancels the operation.
@@ -31,19 +33,20 @@ func init() {
 }
 
 func runReject(_ *cobra.Command, args []string) error {
-	ref, err := oci.ParseRef(args[0])
+	reg, repo, tag, err := oci.ParseRef(args[0])
 	if err != nil {
 		return err
 	}
+	ref := db.ImageRef{Registry: reg, Repository: repo, Tag: tag}
 
-	img, err := database.GetByRef(ref)
+	images, err := database.GetByRef(ref)
 	if err != nil {
 		return err
 	}
 
 	answer, err := prompt(fmt.Sprintf(
-		"Reject %s/%s:%s? [YES / NO] (default: NO): ",
-		ref.Registry, ref.Repository, ref.Tag,
+		"Reject %s/%s:%s (%d platform(s))? [YES / NO] (default: NO): ",
+		reg, repo, tag, len(images),
 	))
 	if err != nil {
 		return err
@@ -54,11 +57,13 @@ func runReject(_ *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if err := database.Reject(ref); err != nil {
-		return err
+	for _, img := range images {
+		if err := database.Reject(img.ID); err != nil {
+			return err
+		}
+		logEvent("reject", img, nil)
 	}
 
-	logEvent("reject", img, nil)
-	fmt.Printf("rejected  %s/%s:%s\n", ref.Registry, ref.Repository, ref.Tag)
+	fmt.Printf("rejected  %s/%s:%s\n", reg, repo, tag)
 	return nil
 }
