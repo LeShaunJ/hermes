@@ -6,6 +6,7 @@ toolchain go1.24.7
 
 require (
 	github.com/google/go-containerregistry v0.20.3
+	github.com/lib/pq v1.12.3
 	github.com/spf13/cobra v1.9.1
 	gopkg.in/yaml.v3 v3.0.1
 )
