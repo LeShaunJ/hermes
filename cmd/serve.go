@@ -18,7 +18,7 @@ var serveCmd = &cobra.Command{
 middleware for OCI Distribution registry proxies.
 
 The server exposes:
-  GET /validate/<registry>/v2/<repo>/manifests/<tag>
+  GET /validate/v2/<registry>/<repo>/manifests/<tag>
       Authorization check.  Returns 200 + X-HERMES-IMAGE-URI if approved.
       Queues unknown images for later CLI review.
 
@@ -27,8 +27,8 @@ The server exposes:
 
 nginx configuration example (see dev/nginx.conf for a full example):
 
-  location ~ ^/(?<registry>[^/]+)/(?<path>v2/.+)$ {
-      auth_request     /hermes-validate/$registry/$path;
+  location ~ ^(?<path>/v2/.+)$ {
+      auth_request     /hermes-validate/$path;
       auth_request_set $hermes_uri $upstream_http_x_hermes_image_uri;
       proxy_pass       https://$hermes_uri;
   }
