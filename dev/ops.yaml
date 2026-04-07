@@ -1,0 +1,66 @@
+---
+actions:
+  bounce:
+    command: |-
+      #!/usr/bin/env bash
+      declare -a args_stop=()
+      declare -a args_start=()
+      declare next=false
+      for arg in "$@"; do
+        if $next; then args_start+=("$arg")
+        elif [ "$arg" != "--" ]; then args_stop+=("$arg")
+        else next=true; continue; fi
+      done
+      ops stop "${args_stop[@]}" &&
+      ops start "${args_start[@]}"
+    description: >-
+      stop and start the container
+      | usage: ops bounce [STOP_OPTS] [-- START_OPTS]
+    param_expansion: true
+  bounce-wait:
+    alias: bw
+    command: ops -q bounce -- --wait
+  bounce-with-logs:
+    alias: bl
+    command: ops -q logs-with bounce
+  compose:
+    command: docker compose --progress=plain
+    load_secrets: true
+  logs:
+    alias: l
+    command: ops compose logs --tail 100 --follow
+  logs-with:
+    alias: lw
+    command: |-
+      #!/usr/bin/env bash
+      ops "${@}" && ops -q logs
+    description: >-
+      run an OCI command, then output logs
+      | usage: ops logs-with [COMMAND] [OPTIONS]
+    param_expansion: true
+  pull:
+    command: ops compose pull
+  restart:
+    command: ops compose restart
+  restart-with-logs:
+    alias: rl
+    command: ops -q logs-with restart
+  shell:
+    alias: sh
+    command: ops compose exec quantum sh
+  start:
+    command: ops compose up --detach --no-recreate --yes
+  start-wait:
+    command: ops start --wait
+  start-with-logs:
+    alias: sl
+    command: ops -q logs-with start
+  status:
+    alias: ps
+    command: ops compose ps
+  stop:
+    command: ops compose down --remove-orphans
+options:
+  exec:
+    load_secrets: true
+...
