@@ -11,7 +11,7 @@ db:
   sslmode: disable
 
 trivy:
-  image: aquasec/trivy:latest
+  image: aquasec/trivy:0.69.3
   # args: []           # extra flags for `trivy image`
   # convert_args: []   # extra flags for `trivy convert`
 

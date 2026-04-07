@@ -12,14 +12,18 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/leshaunj/hermes/internal/db"
 )
+
+var logger = log.New(os.Stdout, "INFO: ", log.Ldate|log.Ltime)
 
 // Server is the hermes HTTP API server.
 type Server struct {
@@ -43,7 +47,7 @@ func New(database *db.DB, addr string) *Server {
 
 // ListenAndServe starts the HTTP server.
 func (s *Server) ListenAndServe() error {
-	log.Printf("hermes API listening on %s", s.addr)
+	logger.Printf("hermes API listening on %s", s.addr)
 	return http.ListenAndServe(s.addr, s.mux)
 }
 
@@ -62,9 +66,12 @@ func (s *Server) ListenAndServe() error {
 func (s *Server) validate(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	registry, repo, tag, ok := parseValidatePath(r.URL.Path)
-	if !ok {
-		http.Error(w, "bad request: expected /validate/v2/<registry>/<repository>/manifests/<tag>", http.StatusBadRequest)
+	registry, repo, tag, err := parseValidatePath(r.URL.Path)
+	if err != nil {
+		msg := fmt.Sprintf("%s (got: %s)", err.Error(), r.URL.Path)
+		logger.Printf("ERROR %s", msg)
+		w.Header().Set("X-Hermes-Error-Msg", msg)
+		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 
@@ -73,7 +80,7 @@ func (s *Server) validate(w http.ResponseWriter, r *http.Request) {
 	// Look up the image.
 	img, err := s.db.GetApproved(registry, repo, tag)
 	if err != nil {
-		log.Printf("ERROR validate db lookup %s/%s:%s — %v", registry, repo, tag, err)
+		logger.Printf("ERROR validate db lookup %s/%s:%s — %v", registry, repo, tag, err)
 		_ = s.db.LogEvent(nil, db.SourceAPI, "validate_error", map[string]interface{}{
 			"registry":   registry,
 			"repository": repo,
@@ -81,7 +88,8 @@ func (s *Server) validate(w http.ResponseWriter, r *http.Request) {
 			"error":      err.Error(),
 			"latency_ms": time.Since(start).Milliseconds(),
 		})
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		w.Header().Set("X-Hermes-Error-Msg", err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
@@ -110,7 +118,11 @@ func (s *Server) validate(w http.ResponseWriter, r *http.Request) {
 	// Not approved — queue the image so it can be reviewed via the CLI.
 	queued, qErr := s.db.Queue(ref)
 	if qErr != nil {
-		log.Printf("WARN validate queue %s/%s:%s — %v", registry, repo, tag, qErr)
+		msg := fmt.Sprintf("WARN validate queue %s/%s:%s — %v", registry, repo, tag, qErr)
+		w.Header().Set("X-Hermes-Error-Msg", msg)
+		logger.Print(msg)
+	} else {
+		w.Header().Set("X-Hermes-Error-Msg", "not approved, but queued for approval")
 	}
 
 	var imageID *int64
@@ -125,7 +137,7 @@ func (s *Server) validate(w http.ResponseWriter, r *http.Request) {
 		"latency_ms": time.Since(start).Milliseconds(),
 	})
 
-	http.Error(w, "not approved", http.StatusUnauthorized)
+	w.WriteHeader(http.StatusUnauthorized)
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
@@ -137,24 +149,24 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 //	/validate/v2/<registry>/<repository>/manifests/<tag>
 //
 // The repository may contain slashes (e.g. "org/team/app").
-func parseValidatePath(path string) (registry, repo, tag string, ok bool) {
+func parseValidatePath(path string) (registry, repo, tag string, err error) {
 	const prefix = "/validate/"
 	if !strings.HasPrefix(path, prefix) {
-		return
+		return "", "", "", errors.New("bad request: expected /validate/ path prefix")
 	}
 	rest := path[len(prefix):]
 
 	// Remainder must be v2/<repo>/manifests/<tag>
 	const v2prefix = "v2/"
 	if !strings.HasPrefix(rest, v2prefix) {
-		return
+		return "", "", "", errors.New("bad request: expected /validate/v2/ path prefix")
 	}
 	rest = rest[len(v2prefix):]
 
 	// First component is the registry.
 	slashIdx := strings.Index(rest, "/")
 	if slashIdx < 0 {
-		return
+		return "", "", "", errors.New("bad request: expected /validate/v2/<registry>/...")
 	}
 	registry = rest[:slashIdx]
 	rest = rest[slashIdx+1:]
@@ -162,14 +174,15 @@ func parseValidatePath(path string) (registry, repo, tag string, ok bool) {
 	const sep = "/manifests/"
 	idx := strings.LastIndex(rest, sep)
 	if idx < 0 {
-		return
+		return "", "", "", errors.New("bad request: expected /validate/v2/<registry>/<repo>/manifests/...")
 	}
+
 	repo = rest[:idx]
 	tag = rest[idx+len(sep):]
 
 	if registry == "" || repo == "" || tag == "" {
-		return
+		return "", "", "", errors.New("bad request: expected /validate/v2/<registry>/<repo>/manifests/<tag>")
 	}
-	ok = true
-	return
+
+	return registry, repo, tag, nil
 }

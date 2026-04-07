@@ -20,6 +20,7 @@ services:
 
   # ── hermes ───────────────────────────────────────────────────────────────────
   hermes:
+    privileged: true
     build:
       context: ..
       dockerfile: Containerfile
@@ -30,8 +31,6 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./hermes.yaml:/etc/hermes.yaml:ro
-    ports:
-      - "8080:8080"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
       interval: 10s
@@ -46,7 +45,9 @@ services:
       hermes:
         condition: service_healthy
     volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/hermes.conf:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./headers.js:/etc/nginx/headers.js:ro
     ports:
       - "8888:80"
 
