@@ -1,8 +1,4 @@
-# dev/hermes.yaml — hermes configuration for the dev compose stack
-#
-# Mount this file at /etc/hermes.yaml inside the hermes container, or pass
-# --config dev/hermes.yaml when running the hermes CLI locally.
-
+# yaml-language-server: $schema=../docs/hermes.schema.json
 server:
   addr: ":8080"
 

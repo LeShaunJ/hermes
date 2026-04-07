@@ -71,17 +71,17 @@ type ImageRef struct {
 
 // Image represents one tracked OCI image tag.
 type Image struct {
-	ID             int64
-	Registry       string
-	Repository     string
-	Tag            string
-	Digest         string // may be empty for queued images
-	Manifest       string // raw JSON, may be empty
-	ScanReport     string // raw JSON trivy report, may be empty
-	State          State
-	CacheRegistry  string // set after successful cache push
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID            int64
+	Registry      string
+	Repository    string
+	Tag           string
+	Digest        string // may be empty for queued images
+	Manifest      string // raw JSON, may be empty
+	ScanReport    string // raw JSON trivy report, may be empty
+	State         State
+	CacheRegistry string // set after successful cache push
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // ── event ─────────────────────────────────────────────────────────────────────

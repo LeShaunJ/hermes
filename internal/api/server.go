@@ -2,7 +2,7 @@
 //
 // The server exposes:
 //
-//	GET /validate/<registry>/v2/<repo>/manifests/<tag>
+//	GET /validate/v2/<registry>/<repo>/manifests/<tag>
 //	    nginx auth_request target.  Extracts registry, repo, and tag from the
 //	    URL path.  Returns 200 + X-HERMES-IMAGE-URI if approved; 401 otherwise.
 //	    Queues unknown images so they can be scanned via the CLI later.
@@ -49,7 +49,7 @@ func (s *Server) ListenAndServe() error {
 
 // validate is the nginx auth_request target.
 //
-// URL format:  GET /validate/<registry>/v2/<repository>/manifests/<tag>
+// URL format:  GET /validate/v2/<registry>/<repository>/manifests/<tag>
 //
 // The registry is the first path component after /validate/.
 // The remainder is a standard OCI Distribution API path.
@@ -64,7 +64,7 @@ func (s *Server) validate(w http.ResponseWriter, r *http.Request) {
 
 	registry, repo, tag, ok := parseValidatePath(r.URL.Path)
 	if !ok {
-		http.Error(w, "bad request: expected /validate/<registry>/v2/<repo>/manifests/<tag>", http.StatusBadRequest)
+		http.Error(w, "bad request: expected /validate/v2/<registry>/<repository>/manifests/<tag>", http.StatusBadRequest)
 		return
 	}
 
@@ -134,7 +134,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 
 // parseValidatePath extracts (registry, repository, tag) from:
 //
-//	/validate/<registry>/v2/<repository>/manifests/<tag>
+//	/validate/v2/<registry>/<repository>/manifests/<tag>
 //
 // The repository may contain slashes (e.g. "org/team/app").
 func parseValidatePath(path string) (registry, repo, tag string, ok bool) {
@@ -144,6 +144,13 @@ func parseValidatePath(path string) (registry, repo, tag string, ok bool) {
 	}
 	rest := path[len(prefix):]
 
+	// Remainder must be v2/<repo>/manifests/<tag>
+	const v2prefix = "v2/"
+	if !strings.HasPrefix(rest, v2prefix) {
+		return
+	}
+	rest = rest[len(v2prefix):]
+
 	// First component is the registry.
 	slashIdx := strings.Index(rest, "/")
 	if slashIdx < 0 {
@@ -151,13 +158,6 @@ func parseValidatePath(path string) (registry, repo, tag string, ok bool) {
 	}
 	registry = rest[:slashIdx]
 	rest = rest[slashIdx+1:]
-
-	// Remainder must be v2/<repo>/manifests/<tag>
-	const v2prefix = "v2/"
-	if !strings.HasPrefix(rest, v2prefix) {
-		return
-	}
-	rest = rest[len(v2prefix):]
 
 	const sep = "/manifests/"
 	idx := strings.LastIndex(rest, sep)
