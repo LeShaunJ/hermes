@@ -75,11 +75,11 @@ type ImageRef struct {
 type Image struct {
 	ID            int64
 	TagID         int64
-	RegistryURL   string          // from registries.url
-	Repository    string          // from tags.repository
-	TagName       string          // from tags.name
-	CacheRegistry string          // URL from registries join; empty if null
-	Digest        string          // platform-specific manifest digest
+	RegistryURL   string // from registries.url
+	Repository    string // from tags.repository
+	TagName       string // from tags.name
+	CacheRegistry string // URL from registries join; empty if null
+	Digest        string // platform-specific manifest digest
 	Arch          string
 	OS            string
 	Manifest      json.RawMessage // jsonb column
@@ -126,10 +126,10 @@ type Fetcher interface {
 // ── manifest media types ──────────────────────────────────────────────────────
 
 const (
-	mediaTypeOCIManifest  = "application/vnd.oci.image.manifest.v1+json"
-	mediaTypeOCIIndex     = "application/vnd.oci.image.index.v1+json"
-	mediaTypeDockerV2     = "application/vnd.docker.distribution.manifest.v2+json"
-	mediaTypeDockerList   = "application/vnd.docker.distribution.manifest.list.v2+json"
+	mediaTypeOCIManifest = "application/vnd.oci.image.manifest.v1+json"
+	mediaTypeOCIIndex    = "application/vnd.oci.image.index.v1+json"
+	mediaTypeDockerV2    = "application/vnd.docker.distribution.manifest.v2+json"
+	mediaTypeDockerList  = "application/vnd.docker.distribution.manifest.list.v2+json"
 )
 
 func isImageManifest(mt string) bool {
@@ -665,7 +665,12 @@ func (d *DB) GetByRef(ref ImageRef) ([]*Image, error) {
 // GetApproved returns the first approved platform image for the given tag, or nil.
 func (d *DB) GetApproved(registry, repository, tag string) (*Image, error) {
 	row := d.db.QueryRow(`
-		SELECT `+imageColumns+`
+		SELECT
+			i.id, i.tag, r.url, t.repository, t.name,
+			COALESCE(cr.url, ''),
+			COALESCE(t.digest, ''), COALESCE(i.arch, ''), COALESCE(i.os, ''),
+			COALESCE(i.manifest::text, 'null'), COALESCE(i.scan_report::text, 'null'),
+			i.state::text, i.created_at, i.updated_at
 		FROM images i
 		JOIN tags    t  ON t.id  = i.tag
 		JOIN registries r ON r.id = t.registry

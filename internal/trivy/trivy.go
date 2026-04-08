@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -35,6 +36,7 @@ func Scan(imageRef string, cfg config.TrivyConfig) (*ScanResult, error) {
 		"-v", "/var/run/docker.sock:/var/run/docker.sock",
 		trivyImage,
 		"image",
+		"--disable-telemetry",
 		"--format", "json",
 		"--quiet",
 	}
@@ -42,8 +44,19 @@ func Scan(imageRef string, cfg config.TrivyConfig) (*ScanResult, error) {
 	args = append(args, imageRef)
 
 	cmd := exec.Command("docker", args...)
-	out, err := cmd.Output()
+
+	stdout, _ := cmd.StdoutPipe()
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("run cmd: %w", err)
+	}
+
+	out, err := io.ReadAll(stdout)
 	if err != nil {
+		return nil, fmt.Errorf("Error reading stream: %v\n", err)
+	}
+
+	if err := cmd.Wait(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return nil, fmt.Errorf("trivy exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
@@ -65,11 +78,11 @@ func Scan(imageRef string, cfg config.TrivyConfig) (*ScanResult, error) {
 func extractJSON(b []byte) ([]byte, error) {
 	start := bytes.IndexByte(b, '{')
 	if start < 0 {
-		return nil, fmt.Errorf("no JSON object found in output (first 200 bytes: %.200s)", b)
+		return nil, fmt.Errorf("no JSON object found in output (size: %d, first 200 bytes: %.200s)", len(b), b)
 	}
 	var buf bytes.Buffer
 	if err := json.Compact(&buf, b[start:]); err != nil {
-		return nil, fmt.Errorf("invalid JSON: %w (first 200 bytes: %.200s)", err, b[start:])
+		return nil, fmt.Errorf("invalid JSON: %w (size: %d, first 200 bytes: <%.200s>)", err, len(b), b[start:])
 	}
 	return buf.Bytes(), nil
 }
