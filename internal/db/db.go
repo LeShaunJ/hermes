@@ -326,9 +326,31 @@ func (d *DB) imagesByTagID(tagID int64) ([]*Image, error) {
 
 // ── Queue ─────────────────────────────────────────────────────────────────────
 
+// QueueStub ensures the registry and tag rows exist without making any
+// outbound registry calls.  It is used by the API server to register a
+// first-seen tag so operators can see it in 'hermes list'.  Manifest
+// fetching happens lazily the first time the operator runs scan/approve.
+func (d *DB) QueueStub(ref ImageRef) error {
+	registryID, err := d.upsertRegistry(ref.Registry)
+	if err != nil {
+		return fmt.Errorf("upsert registry: %w", err)
+	}
+	tagID, err := d.getTagID(registryID, ref.Repository, ref.Tag)
+	if err != nil {
+		return fmt.Errorf("get tag: %w", err)
+	}
+	if tagID != 0 {
+		return nil // already registered
+	}
+	if _, err = d.insertTag(registryID, ref.Repository, ref.Tag, ""); err != nil {
+		return fmt.Errorf("insert stub tag: %w", err)
+	}
+	return nil
+}
+
 // Queue ensures the registry, tag, and per-platform image rows exist in the DB.
-// If the tag is new it fetches the manifest (and per-platform manifests for an
-// image index) via fetcher, then inserts one image row per known platform.
+// If the tag has no image rows yet (including when stub-registered by the API)
+// it fetches the manifest via fetcher and inserts one image row per platform.
 // Returns all image rows for the tag.
 func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 	// 1. Upsert registry.
@@ -337,13 +359,21 @@ func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 		return nil, fmt.Errorf("upsert registry: %w", err)
 	}
 
-	// 2. If tag already exists, return its images without fetching.
+	// 2. Check whether the tag already exists.
 	tagID, err := d.getTagID(registryID, ref.Repository, ref.Tag)
 	if err != nil {
 		return nil, fmt.Errorf("get tag: %w", err)
 	}
 	if tagID != 0 {
-		return d.imagesByTagID(tagID)
+		imgs, err := d.imagesByTagID(tagID)
+		if err != nil {
+			return nil, fmt.Errorf("get images: %w", err)
+		}
+		if len(imgs) > 0 {
+			return imgs, nil // already fully populated
+		}
+		// Tag exists but has no image rows (stub-registered by API).
+		// Fall through to fetch manifests and populate.
 	}
 
 	// 3. Fetch the top-level manifest.

@@ -21,6 +21,7 @@ var rootCmd = &cobra.Command{
 	Short: "OCI image approval system",
 	Long: `hermes manages OCI image tag approvals and gatekeeps OCI Distribution
 registries via a REST API used as nginx auth_request middleware.`,
+	SilenceUsage:      true,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		// Load configuration.
 		c, err := config.Load(cfgPath)

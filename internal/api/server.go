@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/leshaunj/hermes/internal/db"
-	"github.com/leshaunj/hermes/internal/oci"
 )
 
 var logger = log.New(os.Stdout, "INFO: ", log.Ldate|log.Ltime)
@@ -148,22 +147,15 @@ func (s *Server) validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Not approved — queue the image using the client's auth token so hermes
-	// can fetch the manifest from the registry on behalf of the caller.
+	// Not approved — stub-register the tag so operators can see it in 'hermes list'.
+	// No outbound registry calls; manifest fetching happens lazily via the CLI.
 	ref := db.ImageRef{Registry: p.Registry, Repository: p.Repository, Tag: p.Tag}
 	var queuedID *int64
 	if p.Tag != "" {
-		fetcher := oci.NewBearerClient(r.Header.Get("Authorization"))
-		queued, qErr := s.db.Queue(ref, fetcher)
-		if qErr != nil {
-			logger.Printf("WARN validate queue %s/%s:%s — %v", p.Registry, p.Repository, p.Tag, qErr)
-			w.Header().Set("X-Hermes-Error-Msg", "not approved")
-		} else {
-			w.Header().Set("X-Hermes-Error-Msg", "not approved, but queued for approval")
-			if len(queued) > 0 {
-				queuedID = &queued[0].ID
-			}
+		if qErr := s.db.QueueStub(ref); qErr != nil {
+			logger.Printf("WARN validate queue stub %s/%s:%s — %v", p.Registry, p.Repository, p.Tag, qErr)
 		}
+		w.Header().Set("X-Hermes-Error-Msg", "not approved, but queued for approval")
 	} else {
 		w.Header().Set("X-Hermes-Error-Msg", "not approved")
 	}
@@ -190,7 +182,7 @@ func buildImageURI(p parsedPath, img *db.Image) string {
 	case ref == "":
 		ref = p.Tag
 	}
-	return fmt.Sprintf("%s/v2/%s/manifests/%s", p.Registry, p.Repository, ref)
+	return fmt.Sprintf("https://%s/v2/%s/manifests/%s", p.Registry, p.Repository, ref)
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {

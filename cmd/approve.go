@@ -80,8 +80,8 @@ func runApprove(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("queue image: %w", err)
 	}
 
-	// Select the target platform.
-	img, err := selectPlatform(images, approvePlatform)
+	// Select the target platform (already-approved platforms are shown but not selectable).
+	img, err := selectPlatform(images, approvePlatform, db.StateApproved)
 	if err != nil {
 		return err
 	}
