@@ -89,6 +89,8 @@ func runScan(_ *cobra.Command, args []string) error {
 
 	img, err = database.SaveScan(img.ID, json.RawMessage(result.Raw))
 	if err != nil {
+		_ = database.SetError(img.ID)
+		logEvent("scan_error", img, map[string]interface{}{"error": err.Error()})
 		return fmt.Errorf("save scan: %w", err)
 	}
 

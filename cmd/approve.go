@@ -106,6 +106,8 @@ func runApprove(cmd *cobra.Command, args []string) error {
 
 		img, err = database.SaveScan(img.ID, json.RawMessage(result.Raw))
 		if err != nil {
+			_ = database.SetError(img.ID)
+			logEvent("scan_error", img, map[string]interface{}{"error": err.Error()})
 			return fmt.Errorf("save scan: %w", err)
 		}
 		logEvent("scan", img, map[string]interface{}{"digest": img.Digest})

@@ -5,6 +5,7 @@ package trivy
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -50,7 +51,27 @@ func Scan(imageRef string, cfg config.TrivyConfig) (*ScanResult, error) {
 		return nil, fmt.Errorf("run trivy: %w", err)
 	}
 
-	return &ScanResult{Raw: out}, nil
+	// Strip any non-JSON lines that trivy may emit before the report (e.g.
+	// database download progress) even when --quiet is set.
+	raw, err := extractJSON(out)
+	if err != nil {
+		return nil, fmt.Errorf("parse trivy output: %w", err)
+	}
+	return &ScanResult{Raw: raw}, nil
+}
+
+// extractJSON returns the first complete JSON object found in b, compacted.
+// It skips any leading non-JSON content (log lines, progress messages, etc.).
+func extractJSON(b []byte) ([]byte, error) {
+	start := bytes.IndexByte(b, '{')
+	if start < 0 {
+		return nil, fmt.Errorf("no JSON object found in output (first 200 bytes: %.200s)", b)
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, b[start:]); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w (first 200 bytes: %.200s)", err, b[start:])
+	}
+	return buf.Bytes(), nil
 }
 
 // Convert converts a trivy JSON report to another format using

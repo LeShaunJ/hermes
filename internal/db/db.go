@@ -171,9 +171,23 @@ func (d *DB) Close() {
 // migrate creates tables if they don't already exist.
 func (d *DB) migrate() error {
 	stmts := []string{
-		// Drop v1 schema tables (incompatible column layout).
-		`DROP TABLE IF EXISTS events CASCADE`,
-		`DROP TABLE IF EXISTS images CASCADE`,
+		// Drop v1 schema tables only when they exist with the old column layout
+		// (no 'tag' FK column on images).  This guard runs on every startup but
+		// is a no-op once the schema has been migrated or freshly created.
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.tables
+				 WHERE table_schema = 'public' AND table_name = 'images'
+			) AND NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				 WHERE table_schema = 'public'
+				   AND table_name   = 'images'
+				   AND column_name  = 'tag'
+			) THEN
+				DROP TABLE IF EXISTS events CASCADE;
+				DROP TABLE IF EXISTS images CASCADE;
+			END IF;
+		END $$`,
 
 		// registries — unique registry base URLs
 		`CREATE TABLE IF NOT EXISTS registries (
