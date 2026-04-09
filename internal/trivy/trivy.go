@@ -73,18 +73,20 @@ func Scan(imageRef string, cfg config.TrivyConfig) (*ScanResult, error) {
 	return &ScanResult{Raw: raw}, nil
 }
 
-// extractJSON returns the first complete JSON object found in b, compacted.
-// It skips any leading non-JSON content (log lines, progress messages, etc.).
+// extractJSON returns the first complete JSON object found in b.
+// It skips any leading non-JSON content (log lines, progress messages, etc.)
+// and ignores any trailing content after the first complete JSON value.
 func extractJSON(b []byte) ([]byte, error) {
 	start := bytes.IndexByte(b, '{')
 	if start < 0 {
 		return nil, fmt.Errorf("no JSON object found in output (size: %d, first 200 bytes: %.200s)", len(b), b)
 	}
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, b[start:]); err != nil {
-		return nil, fmt.Errorf("invalid JSON: %w (size: %d, first 200 bytes: <%.200s>)", err, len(b), b[start:])
+	dec := json.NewDecoder(bytes.NewReader(b[start:]))
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
-	return buf.Bytes(), nil
+	return raw, nil
 }
 
 // Convert converts a trivy JSON report to another format using

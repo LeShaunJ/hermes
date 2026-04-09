@@ -243,6 +243,32 @@ func (d *DB) migrate() error {
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 
+		// images_before_insert trigger — suppresses duplicate NULL-digest placeholder
+		// rows and auto-removes any placeholder when a real image row is inserted.
+		`CREATE OR REPLACE FUNCTION images_before_insert()
+		RETURNS TRIGGER LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.digest IS NULL THEN
+				IF EXISTS (SELECT 1 FROM images WHERE tag = NEW.tag AND digest IS NULL) THEN
+					RETURN NULL;
+				END IF;
+			ELSE
+				DELETE FROM images WHERE tag = NEW.tag AND digest IS NULL;
+			END IF;
+			RETURN NEW;
+		END;
+		$$`,
+
+		`DO $$ BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_trigger WHERE tgname = 'images_before_insert'
+			) THEN
+				CREATE TRIGGER images_before_insert
+				BEFORE INSERT ON images
+				FOR EACH ROW EXECUTE FUNCTION images_before_insert();
+			END IF;
+		END $$`,
+
 		// indexes
 		`CREATE INDEX IF NOT EXISTS idx_tags_registry       ON tags(registry)`,
 		`CREATE INDEX IF NOT EXISTS idx_tags_digest         ON tags(digest)`,
@@ -340,10 +366,12 @@ func (d *DB) imagesByTagID(tagID int64) ([]*Image, error) {
 
 // ── Queue ─────────────────────────────────────────────────────────────────────
 
-// QueueStub ensures the registry and tag rows exist without making any
-// outbound registry calls.  It is used by the API server to register a
-// first-seen tag so operators can see it in 'hermes list'.  Manifest
-// fetching happens lazily the first time the operator runs scan/approve.
+// QueueStub ensures the registry, tag, and a placeholder image row exist
+// without making any outbound registry calls.  It is used by the API server
+// to register a first-seen tag so operators can see it in 'hermes list'.
+// The trigger images_before_insert suppresses duplicate NULL-digest rows and
+// auto-removes the placeholder when real image rows are inserted.
+// Manifest fetching happens lazily the first time the operator runs scan/approve.
 func (d *DB) QueueStub(ref ImageRef) error {
 	registryID, err := d.upsertRegistry(ref.Registry)
 	if err != nil {
@@ -353,11 +381,20 @@ func (d *DB) QueueStub(ref ImageRef) error {
 	if err != nil {
 		return fmt.Errorf("get tag: %w", err)
 	}
-	if tagID != 0 {
-		return nil // already registered
+	if tagID == 0 {
+		tagID, err = d.insertTag(registryID, ref.Repository, ref.Tag, "")
+		if err != nil {
+			return fmt.Errorf("insert stub tag: %w", err)
+		}
 	}
-	if _, err = d.insertTag(registryID, ref.Repository, ref.Tag, ""); err != nil {
-		return fmt.Errorf("insert stub tag: %w", err)
+	// Insert a NULL-digest placeholder image row so the tag appears in
+	// 'hermes list'.  The trigger suppresses this silently if one already exists.
+	_, err = d.db.Exec(`
+		INSERT INTO images (tag, state) VALUES ($1, 'queued')`,
+		tagID,
+	)
+	if err != nil {
+		return fmt.Errorf("insert placeholder: %w", err)
 	}
 	return nil
 }
@@ -383,10 +420,17 @@ func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 		if err != nil {
 			return nil, fmt.Errorf("get images: %w", err)
 		}
-		if len(imgs) > 0 {
-			return imgs, nil // already fully populated
+		// Filter out NULL-digest placeholder rows inserted by QueueStub.
+		var real []*Image
+		for _, img := range imgs {
+			if img.Digest != "" {
+				real = append(real, img)
+			}
 		}
-		// Tag exists but has no image rows (stub-registered by API).
+		if len(real) > 0 {
+			return real, nil // already fully populated with real platform images
+		}
+		// Only placeholder rows exist (stub-registered by API).
 		// Fall through to fetch manifests and populate.
 	}
 
@@ -715,6 +759,23 @@ func (d *DB) GetApprovedByTagAndDigest(registry, repository, tag, digest string)
 		  AND i.state = 'approved'
 		LIMIT 1`,
 		registry, repository, tag, digest,
+	)
+	return scanImageRow(row)
+}
+
+// GetRejected returns the first rejected platform image for the given tag, or nil.
+func (d *DB) GetRejected(registry, repository, tag string) (*Image, error) {
+	row := d.db.QueryRow(`
+		SELECT `+imageColumns+`
+		FROM images i
+		JOIN tags    t  ON t.id  = i.tag
+		JOIN registries r ON r.id = t.registry
+		LEFT JOIN registries cr ON cr.id = i.cache_registry
+		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
+		  AND i.state = 'rejected'
+		ORDER BY i.id
+		LIMIT 1`,
+		registry, repository, tag,
 	)
 	return scanImageRow(row)
 }

@@ -89,6 +89,12 @@ func runList(_ *cobra.Command, args []string) error {
 }
 
 func outputTable(images []db.Image) error {
+	dash := func(s string) string {
+		if s == "" {
+			return "-"
+		}
+		return s
+	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "REGISTRY\tREPOSITORY\tTAG\tOS\tARCH\tDIGEST\tSTATE\tUPDATED")
 	for _, img := range images {
@@ -100,9 +106,9 @@ func outputTable(images []db.Image) error {
 			img.RegistryURL,
 			img.Repository,
 			img.TagName,
-			img.OS,
-			img.Arch,
-			digest,
+			dash(img.OS),
+			dash(img.Arch),
+			dash(digest),
 			img.State,
 			img.UpdatedAt.Format("2006-01-02 15:04"),
 		)

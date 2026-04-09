@@ -49,9 +49,8 @@ func init() {
 }
 
 func runServe(_ *cobra.Command, _ []string) error {
-	addr := cfg.Server.Addr
 	if serveAddr != "" {
-		addr = serveAddr
+		cfg.Server.Addr = serveAddr
 	}
 
 	d, err := db.Open(cfg.DB.DSN())
@@ -60,6 +59,6 @@ func runServe(_ *cobra.Command, _ []string) error {
 	}
 	defer d.Close()
 
-	srv := api.New(d, addr)
+	srv := api.New(d, cfg)
 	return srv.ListenAndServe()
 }
