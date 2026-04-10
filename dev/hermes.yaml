@@ -1,6 +1,7 @@
 # yaml-language-server: $schema=../docs/hermes.schema.json
 server:
   addr: ":8080"
+  url: http://localhost:8888
 
 db:
   host: postgres
