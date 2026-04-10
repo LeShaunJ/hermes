@@ -11,3 +11,4 @@
 - Always run `gofmt -s -w` on all `.go` files before committing.
 - Be sure to line (_ie: `golangci-lint run`_).
 - Ensure appropriate tests exist for all `.go` files.
+- Ensure `README.md` and `doc/*` are up-to-date.
