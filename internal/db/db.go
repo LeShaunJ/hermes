@@ -13,7 +13,7 @@ import (
 
 // ── state / group ─────────────────────────────────────────────────────────────
 
-// State is the approval-pipeline state of an image tag.
+// State is the approval-pipeline state of a platform image.
 type State string
 
 const (
@@ -45,7 +45,7 @@ func GroupOf(s State) Group {
 	}
 }
 
-// ParseState converts a string to a State or Group.
+// ParseStateOrGroup converts a string to a State or Group.
 // Returns the matched states (multiple for a group), or an error.
 func ParseStateOrGroup(s string) ([]State, error) {
 	switch State(s) {
@@ -63,24 +63,28 @@ func ParseStateOrGroup(s string) ([]State, error) {
 
 // ── image ─────────────────────────────────────────────────────────────────────
 
-// ImageRef is the decomposed lookup key for an image reference.
+// ImageRef is the decomposed lookup key for an image tag reference.
 type ImageRef struct {
 	Registry   string
 	Repository string
 	Tag        string
 }
 
-// Image represents one tracked OCI image tag.
+// Image represents one tracked OCI platform image.
+// Fields are populated by JOIN across registries, tags, and images tables.
 type Image struct {
 	ID            int64
-	Registry      string
-	Repository    string
-	Tag           string
-	Digest        string // may be empty for queued images
-	Manifest      string // raw JSON, may be empty
-	ScanReport    string // raw JSON trivy report, may be empty
+	TagID         int64
+	RegistryURL   string // from registries.url
+	Repository    string // from tags.repository
+	TagName       string // from tags.name
+	CacheRegistry string // URL from registries join; empty if null
+	Digest        string // platform-specific manifest digest
+	Arch          string
+	OS            string
+	Manifest      json.RawMessage // jsonb column
+	ScanReport    json.RawMessage // jsonb column
 	State         State
-	CacheRegistry string // set after successful cache push
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 }
@@ -105,6 +109,37 @@ type Event struct {
 	CreatedAt time.Time
 }
 
+// ── Fetcher ───────────────────────────────────────────────────────────────────
+
+// Fetcher is implemented by oci.Client (duck-typed — the oci package does not
+// import db, avoiding a circular dependency).
+type Fetcher interface {
+	// FetchManifest retrieves the manifest for registry/repository:reference.
+	// reference may be a tag or a digest.
+	// Returns content-digest, content-type (media-type), and raw JSON body.
+	FetchManifest(registry, repository, reference string) (digest, mediaType string, manifest []byte, err error)
+
+	// FetchConfig retrieves the config blob and returns architecture and OS.
+	FetchConfig(registry, repository, configDigest string) (arch, os string, err error)
+}
+
+// ── manifest media types ──────────────────────────────────────────────────────
+
+const (
+	mediaTypeOCIManifest = "application/vnd.oci.image.manifest.v1+json"
+	mediaTypeOCIIndex    = "application/vnd.oci.image.index.v1+json"
+	mediaTypeDockerV2    = "application/vnd.docker.distribution.manifest.v2+json"
+	mediaTypeDockerList  = "application/vnd.docker.distribution.manifest.list.v2+json"
+)
+
+func isImageManifest(mt string) bool {
+	return mt == mediaTypeOCIManifest || mt == mediaTypeDockerV2
+}
+
+func isImageIndex(mt string) bool {
+	return mt == mediaTypeOCIIndex || mt == mediaTypeDockerList
+}
+
 // ── DB ────────────────────────────────────────────────────────────────────────
 
 // DB wraps the connection pool and exposes all persistence operations.
@@ -122,7 +157,7 @@ func Open(dsn string) (*DB, error) {
 
 	d := &DB{db: sqlDB}
 	if err := d.migrate(); err != nil {
-		sqlDB.Close()
+		_ = sqlDB.Close()
 		return nil, fmt.Errorf("db: migrate: %w", err)
 	}
 	return d, nil
@@ -130,26 +165,75 @@ func Open(dsn string) (*DB, error) {
 
 // Close shuts down the connection pool.
 func (d *DB) Close() {
-	d.db.Close()
+	_ = d.db.Close()
 }
 
 // migrate creates tables if they don't already exist.
 func (d *DB) migrate() error {
 	stmts := []string{
+		// Drop v1 schema tables only when they exist with the old column layout
+		// (no 'tag' FK column on images).  This guard runs on every startup but
+		// is a no-op once the schema has been migrated or freshly created.
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.tables
+				 WHERE table_schema = 'public' AND table_name = 'images'
+			) AND NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				 WHERE table_schema = 'public'
+				   AND table_name   = 'images'
+				   AND column_name  = 'tag'
+			) THEN
+				DROP TABLE IF EXISTS events CASCADE;
+				DROP TABLE IF EXISTS images CASCADE;
+			END IF;
+		END $$`,
+
+		// registries — unique registry base URLs
+		`CREATE TABLE IF NOT EXISTS registries (
+			id         BIGSERIAL PRIMARY KEY,
+			url        TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (url)
+		)`,
+
+		// state enum (PostgreSQL 16 supports IF NOT EXISTS on CREATE TYPE)
+		`DO $$ BEGIN
+			CREATE TYPE state AS ENUM
+				('queued','scanned','approved','rescinded','rejected','error');
+		EXCEPTION WHEN duplicate_object THEN NULL;
+		END $$`,
+
+		// tags — one row per (registry, repository, name) triple
+		`CREATE TABLE IF NOT EXISTS tags (
+			id         BIGSERIAL PRIMARY KEY,
+			registry   BIGINT NOT NULL REFERENCES registries(id),
+			repository TEXT NOT NULL,
+			name       TEXT NOT NULL,
+			digest     TEXT,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (registry, repository, name)
+		)`,
+
+		// images — one row per platform image
 		`CREATE TABLE IF NOT EXISTS images (
 			id              BIGSERIAL PRIMARY KEY,
-			registry        TEXT NOT NULL,
-			repository      TEXT NOT NULL,
-			tag             TEXT NOT NULL,
+			cache_registry  BIGINT REFERENCES registries(id),
+			tag             BIGINT NOT NULL REFERENCES tags(id),
 			digest          TEXT,
-			manifest        TEXT,
-			scan_report     TEXT,
-			state           TEXT NOT NULL DEFAULT 'queued',
-			cache_registry  TEXT,
+			arch            TEXT,
+			os              TEXT,
+			manifest        jsonb,
+			scan_report     jsonb,
+			state           state NOT NULL DEFAULT 'queued',
 			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			UNIQUE (registry, repository, tag)
+			UNIQUE (tag, digest)
 		)`,
+
+		// events — audit log
 		`CREATE TABLE IF NOT EXISTS events (
 			id          BIGSERIAL PRIMARY KEY,
 			image_id    BIGINT REFERENCES images(id) ON DELETE SET NULL,
@@ -158,9 +242,42 @@ func (d *DB) migrate() error {
 			details     TEXT,
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_images_state      ON images(state)`,
-		`CREATE INDEX IF NOT EXISTS idx_images_repo_tag   ON images(repository, tag)`,
-		`CREATE INDEX IF NOT EXISTS idx_events_image_id   ON events(image_id)`,
+
+		// images_before_insert trigger — suppresses duplicate NULL-digest placeholder
+		// rows and auto-removes any placeholder when a real image row is inserted.
+		`CREATE OR REPLACE FUNCTION images_before_insert()
+		RETURNS TRIGGER LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.digest IS NULL THEN
+				IF EXISTS (SELECT 1 FROM images WHERE tag = NEW.tag AND digest IS NULL) THEN
+					RETURN NULL;
+				END IF;
+			ELSE
+				DELETE FROM images WHERE tag = NEW.tag AND digest IS NULL;
+			END IF;
+			RETURN NEW;
+		END;
+		$$`,
+
+		`DO $$ BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_trigger WHERE tgname = 'images_before_insert'
+			) THEN
+				CREATE TRIGGER images_before_insert
+				BEFORE INSERT ON images
+				FOR EACH ROW EXECUTE FUNCTION images_before_insert();
+			END IF;
+		END $$`,
+
+		// indexes
+		`CREATE INDEX IF NOT EXISTS idx_tags_registry       ON tags(registry)`,
+		`CREATE INDEX IF NOT EXISTS idx_tags_digest         ON tags(digest)`,
+		`CREATE INDEX IF NOT EXISTS idx_images_tag          ON images(tag)`,
+		`CREATE INDEX IF NOT EXISTS idx_images_state        ON images(state)`,
+		`CREATE INDEX IF NOT EXISTS idx_images_digest       ON images(digest)`,
+		`CREATE INDEX IF NOT EXISTS idx_images_manifest_gin ON images USING gin(manifest)`,
+		`CREATE INDEX IF NOT EXISTS idx_images_scanrpt_gin  ON images USING gin(scan_report)`,
+		`CREATE INDEX IF NOT EXISTS idx_events_image_id     ON events(image_id)`,
 	}
 	for _, s := range stmts {
 		if _, err := d.db.Exec(s); err != nil {
@@ -170,128 +287,500 @@ func (d *DB) migrate() error {
 	return nil
 }
 
-// ── image operations ──────────────────────────────────────────────────────────
+// ── internal helpers ──────────────────────────────────────────────────────────
 
-// Queue inserts a new image record with state=queued, or returns the existing
-// record unchanged.  Returns the (possibly pre-existing) image.
-func (d *DB) Queue(ref ImageRef) (*Image, error) {
+// upsertRegistry inserts a registry URL if absent and returns its id.
+func (d *DB) upsertRegistry(url string) (int64, error) {
+	var id int64
+	err := d.db.QueryRow(`
+		INSERT INTO registries (url)
+		VALUES ($1)
+		ON CONFLICT (url) DO UPDATE SET updated_at = NOW()
+		RETURNING id`,
+		url,
+	).Scan(&id)
+	return id, err
+}
+
+// getTagID returns the id of an existing tag, or 0 if absent.
+func (d *DB) getTagID(registryID int64, repository, tagName string) (int64, error) {
+	var id int64
+	err := d.db.QueryRow(`
+		SELECT id FROM tags
+		WHERE registry = $1 AND repository = $2 AND name = $3`,
+		registryID, repository, tagName,
+	).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return id, err
+}
+
+// insertTag creates a tag row and returns its id.
+func (d *DB) insertTag(registryID int64, repository, tagName, digest string) (int64, error) {
+	var id int64
+	var dgst interface{}
+	if digest != "" {
+		dgst = digest
+	}
+	err := d.db.QueryRow(`
+		INSERT INTO tags (registry, repository, name, digest)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (registry, repository, name) DO UPDATE
+			SET digest = EXCLUDED.digest, updated_at = NOW()
+		RETURNING id`,
+		registryID, repository, tagName, dgst,
+	).Scan(&id)
+	return id, err
+}
+
+// insertImage inserts a platform image row; skips silently on conflict.
+func (d *DB) insertImage(tagID int64, digest, arch, os string, manifest []byte) error {
 	_, err := d.db.Exec(`
-		INSERT INTO images (registry, repository, tag, state)
-		VALUES ($1, $2, $3, 'queued')
-		ON CONFLICT (registry, repository, tag) DO NOTHING`,
-		ref.Registry, ref.Repository, ref.Tag,
+		INSERT INTO images (tag, digest, arch, os, manifest, state)
+		VALUES ($1, $2, $3, $4, $5, 'queued')
+		ON CONFLICT (tag, digest) DO NOTHING`,
+		tagID, digest, arch, os, manifest,
+	)
+	return err
+}
+
+// imagesByTagID returns all image rows for a tag, with joined registry URL.
+func (d *DB) imagesByTagID(tagID int64) ([]*Image, error) {
+	rows, err := d.db.Query(`
+		SELECT `+imageColumns+`
+		FROM images i
+		JOIN tags    t  ON t.id  = i.tag
+		JOIN registries r ON r.id = t.registry
+		LEFT JOIN registries cr ON cr.id = i.cache_registry
+		WHERE i.tag = $1
+		ORDER BY i.id`,
+		tagID,
 	)
 	if err != nil {
 		return nil, err
 	}
-	return d.GetByRef(ref)
+	defer func() { _ = rows.Close() }()
+	return scanImageRows(rows)
 }
 
-// SaveScan stores the digest, manifest, and scan report for an image and sets
-// its state to scanned.
-func (d *DB) SaveScan(ref ImageRef, digest, manifest, scanReport string) (*Image, error) {
+// ── Queue ─────────────────────────────────────────────────────────────────────
+
+// QueueStub ensures the registry, tag, and a placeholder image row exist
+// without making any outbound registry calls.  It is used by the API server
+// to register a first-seen tag so operators can see it in 'hermes list'.
+// The trigger images_before_insert suppresses duplicate NULL-digest rows and
+// auto-removes the placeholder when real image rows are inserted.
+// Manifest fetching happens lazily the first time the operator runs scan/approve.
+func (d *DB) QueueStub(ref ImageRef) error {
+	registryID, err := d.upsertRegistry(ref.Registry)
+	if err != nil {
+		return fmt.Errorf("upsert registry: %w", err)
+	}
+	tagID, err := d.getTagID(registryID, ref.Repository, ref.Tag)
+	if err != nil {
+		return fmt.Errorf("get tag: %w", err)
+	}
+	if tagID == 0 {
+		tagID, err = d.insertTag(registryID, ref.Repository, ref.Tag, "")
+		if err != nil {
+			return fmt.Errorf("insert stub tag: %w", err)
+		}
+	}
+	// Insert a NULL-digest placeholder image row so the tag appears in
+	// 'hermes list'.  The trigger suppresses this silently if one already exists.
+	_, err = d.db.Exec(`
+		INSERT INTO images (tag, state) VALUES ($1, 'queued')`,
+		tagID,
+	)
+	if err != nil {
+		return fmt.Errorf("insert placeholder: %w", err)
+	}
+	return nil
+}
+
+// Queue ensures the registry, tag, and per-platform image rows exist in the DB.
+// If the tag has no image rows yet (including when stub-registered by the API)
+// it fetches the manifest via fetcher and inserts one image row per platform.
+// Returns all image rows for the tag.
+func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
+	// 1. Upsert registry.
+	registryID, err := d.upsertRegistry(ref.Registry)
+	if err != nil {
+		return nil, fmt.Errorf("upsert registry: %w", err)
+	}
+
+	// 2. Check whether the tag already exists.
+	tagID, err := d.getTagID(registryID, ref.Repository, ref.Tag)
+	if err != nil {
+		return nil, fmt.Errorf("get tag: %w", err)
+	}
+	if tagID != 0 {
+		imgs, err := d.imagesByTagID(tagID)
+		if err != nil {
+			return nil, fmt.Errorf("get images: %w", err)
+		}
+		// Filter out NULL-digest placeholder rows inserted by QueueStub.
+		var real []*Image
+		for _, img := range imgs {
+			if img.Digest != "" {
+				real = append(real, img)
+			}
+		}
+		if len(real) > 0 {
+			return real, nil // already fully populated with real platform images
+		}
+		// Only placeholder rows exist (stub-registered by API).
+		// Fall through to fetch manifests and populate.
+	}
+
+	// 3. Fetch the top-level manifest.
+	digest, mediaType, manifest, err := fetcher.FetchManifest(ref.Registry, ref.Repository, ref.Tag)
+	if err != nil {
+		return nil, fmt.Errorf("fetch manifest for %s/%s:%s: %w", ref.Registry, ref.Repository, ref.Tag, err)
+	}
+
+	// 4. Insert tag row (with the top-level digest).
+	tagID, err = d.insertTag(registryID, ref.Repository, ref.Tag, digest)
+	if err != nil {
+		return nil, fmt.Errorf("insert tag: %w", err)
+	}
+
+	switch {
+	case isImageManifest(mediaType):
+		// Single-platform image.
+		if err := d.queueSingleImage(tagID, digest, ref.Registry, ref.Repository, manifest, fetcher); err != nil {
+			return nil, err
+		}
+
+	case isImageIndex(mediaType):
+		// Multi-platform image index.
+		if err := d.queueIndexImages(tagID, ref.Registry, ref.Repository, manifest, fetcher); err != nil {
+			return nil, err
+		}
+
+	default:
+		// Unknown media type — insert a placeholder row so the tag is tracked.
+		if err := d.insertImage(tagID, digest, "", "", manifest); err != nil {
+			return nil, fmt.Errorf("insert image (unknown media type): %w", err)
+		}
+	}
+
+	return d.imagesByTagID(tagID)
+}
+
+// queueSingleImage fetches the config for a single-platform manifest and inserts
+// an image row.
+func (d *DB) queueSingleImage(tagID int64, digest, registry, repository string, manifest []byte, fetcher Fetcher) error {
+	configDigest, err := extractConfigDigest(manifest)
+	if err != nil {
+		// Insert without arch/os if config extraction fails.
+		return d.insertImage(tagID, digest, "", "", manifest)
+	}
+	arch, os, err := fetcher.FetchConfig(registry, repository, configDigest)
+	if err != nil {
+		return d.insertImage(tagID, digest, "", "", manifest)
+	}
+	return d.insertImage(tagID, digest, arch, os, manifest)
+}
+
+// queueIndexImages iterates the manifests in an image index, fetches each
+// known platform's manifest + config, and inserts image rows.
+func (d *DB) queueIndexImages(tagID int64, registry, repository string, indexManifest []byte, fetcher Fetcher) error {
+	var idx struct {
+		Manifests []struct {
+			MediaType string `json:"mediaType"`
+			Digest    string `json:"digest"`
+			Platform  *struct {
+				OS           string `json:"os"`
+				Architecture string `json:"architecture"`
+			} `json:"platform"`
+		} `json:"manifests"`
+	}
+	if err := json.Unmarshal(indexManifest, &idx); err != nil {
+		return fmt.Errorf("parse image index: %w", err)
+	}
+
+	for _, entry := range idx.Manifests {
+		// Skip unknown/attestation entries.
+		if entry.Platform == nil {
+			continue
+		}
+		if entry.Platform.OS == "unknown" || entry.Platform.Architecture == "unknown" {
+			continue
+		}
+
+		// Fetch the platform-specific manifest.
+		mDigest, _, mBody, err := fetcher.FetchManifest(registry, repository, entry.Digest)
+		if err != nil {
+			// Log and skip this platform rather than aborting the whole queue.
+			continue
+		}
+		if mDigest == "" {
+			mDigest = entry.Digest
+		}
+
+		// Fetch config for arch/os (best-effort).
+		arch := entry.Platform.Architecture
+		os := entry.Platform.OS
+		if configDigest, err := extractConfigDigest(mBody); err == nil {
+			if a, o, err := fetcher.FetchConfig(registry, repository, configDigest); err == nil {
+				arch, os = a, o
+			}
+		}
+
+		if err := d.insertImage(tagID, mDigest, arch, os, mBody); err != nil {
+			return fmt.Errorf("insert image %s: %w", mDigest, err)
+		}
+	}
+	return nil
+}
+
+// extractConfigDigest returns the digest from the manifest's config descriptor.
+func extractConfigDigest(manifest []byte) (string, error) {
+	var m struct {
+		Config struct {
+			Digest string `json:"digest"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(manifest, &m); err != nil {
+		return "", err
+	}
+	if m.Config.Digest == "" {
+		return "", fmt.Errorf("no config digest in manifest")
+	}
+	return m.Config.Digest, nil
+}
+
+// ── image scan ────────────────────────────────────────────────────────────────
+
+// SaveScan stores the trivy scan report for an image and sets its state to scanned.
+func (d *DB) SaveScan(imageID int64, scanReport json.RawMessage) (*Image, error) {
 	_, err := d.db.Exec(`
-		INSERT INTO images (registry, repository, tag, digest, manifest, scan_report, state, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, 'scanned', NOW())
-		ON CONFLICT (registry, repository, tag) DO UPDATE SET
-			digest      = EXCLUDED.digest,
-			manifest    = EXCLUDED.manifest,
-			scan_report = EXCLUDED.scan_report,
+		UPDATE images SET
+			scan_report = $1,
 			state       = 'scanned',
-			updated_at  = NOW()`,
-		ref.Registry, ref.Repository, ref.Tag, digest, manifest, scanReport,
+			updated_at  = NOW()
+		WHERE id = $2`,
+		[]byte(scanReport), imageID,
 	)
 	if err != nil {
 		return nil, err
 	}
-	return d.GetByRef(ref)
+	return d.GetByID(imageID)
 }
 
-// Approve sets an image's state to approved and optionally records the cache registry.
-func (d *DB) Approve(ref ImageRef, cacheRegistry string) error {
-	var cr interface{}
+// ── state transitions ─────────────────────────────────────────────────────────
+
+// Approve sets a platform image's state to approved and optionally records the
+// cache registry URL.
+func (d *DB) Approve(imageID int64, cacheRegistry string) error {
+	var cacheRegID interface{}
 	if cacheRegistry != "" {
-		cr = cacheRegistry
+		id, err := d.upsertRegistry(cacheRegistry)
+		if err != nil {
+			return fmt.Errorf("upsert cache registry: %w", err)
+		}
+		cacheRegID = id
 	}
 	_, err := d.db.Exec(`
 		UPDATE images SET
 			state          = 'approved',
 			cache_registry = $1,
 			updated_at     = NOW()
-		WHERE registry = $2 AND repository = $3 AND tag = $4`,
-		cr, ref.Registry, ref.Repository, ref.Tag,
+		WHERE id = $2`,
+		cacheRegID, imageID,
 	)
 	return err
 }
 
-// Rescind sets state to rescinded.
-func (d *DB) Rescind(ref ImageRef) error {
-	return d.setState(ref, StateRescinded)
+// Rescind sets a platform image's state to rescinded.
+func (d *DB) Rescind(imageID int64) error {
+	return d.setImageState(imageID, StateRescinded)
 }
 
-// Reject sets state to rejected.
-func (d *DB) Reject(ref ImageRef) error {
-	return d.setState(ref, StateRejected)
+// Reject sets a platform image's state to rejected.
+func (d *DB) Reject(imageID int64) error {
+	return d.setImageState(imageID, StateRejected)
 }
 
-// SetError sets state to error with a reason stored in a new event.
-func (d *DB) SetError(ref ImageRef) error {
-	return d.setState(ref, StateError)
+// SetError sets a platform image's state to error.
+func (d *DB) SetError(imageID int64) error {
+	return d.setImageState(imageID, StateError)
 }
 
-func (d *DB) setState(ref ImageRef, state State) error {
+func (d *DB) setImageState(imageID int64, state State) error {
 	_, err := d.db.Exec(`
 		UPDATE images SET state = $1, updated_at = NOW()
-		WHERE registry = $2 AND repository = $3 AND tag = $4`,
-		string(state), ref.Registry, ref.Repository, ref.Tag,
+		WHERE id = $2`,
+		string(state), imageID,
 	)
 	return err
 }
 
-// imageColumns is the SELECT column list used by all image queries.
-const imageColumns = `id, registry, repository, tag,
-	COALESCE(digest,''), COALESCE(manifest,''), COALESCE(scan_report,''),
-	state, COALESCE(cache_registry,''),
-	created_at, updated_at`
+// ── image queries ─────────────────────────────────────────────────────────────
+
+// imageColumns is the SELECT column list for all image queries (requires joins
+// with aliases i, t, r, cr).
+const imageColumns = `
+	i.id, i.tag, r.url, t.repository, t.name,
+	COALESCE(cr.url, ''),
+	COALESCE(i.digest, ''), COALESCE(i.arch, ''), COALESCE(i.os, ''),
+	COALESCE(i.manifest::text, 'null'), COALESCE(i.scan_report::text, 'null'),
+	i.state::text, i.created_at, i.updated_at`
 
 func scanImageRow(row *sql.Row) (*Image, error) {
 	img := &Image{}
+	var manifestStr, scanReportStr, stateStr string
 	err := row.Scan(
-		&img.ID, &img.Registry, &img.Repository, &img.Tag,
-		&img.Digest, &img.Manifest, &img.ScanReport,
-		(*string)(&img.State), &img.CacheRegistry,
-		&img.CreatedAt, &img.UpdatedAt,
+		&img.ID, &img.TagID, &img.RegistryURL, &img.Repository, &img.TagName,
+		&img.CacheRegistry,
+		&img.Digest, &img.Arch, &img.OS,
+		&manifestStr, &scanReportStr,
+		&stateStr, &img.CreatedAt, &img.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return img, err
+	if err != nil {
+		return nil, err
+	}
+	img.State = State(stateStr)
+	img.Manifest = json.RawMessage(manifestStr)
+	img.ScanReport = json.RawMessage(scanReportStr)
+	return img, nil
 }
 
-// GetByRef returns the Image for ref, or nil if not found.
-func (d *DB) GetByRef(ref ImageRef) (*Image, error) {
+func scanImageRows(rows *sql.Rows) ([]*Image, error) {
+	var out []*Image
+	for rows.Next() {
+		img := &Image{}
+		var manifestStr, scanReportStr, stateStr string
+		if err := rows.Scan(
+			&img.ID, &img.TagID, &img.RegistryURL, &img.Repository, &img.TagName,
+			&img.CacheRegistry,
+			&img.Digest, &img.Arch, &img.OS,
+			&manifestStr, &scanReportStr,
+			&stateStr, &img.CreatedAt, &img.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		img.State = State(stateStr)
+		img.Manifest = json.RawMessage(manifestStr)
+		img.ScanReport = json.RawMessage(scanReportStr)
+		out = append(out, img)
+	}
+	return out, rows.Err()
+}
+
+// GetByID returns the Image with the given id, or nil if not found.
+func (d *DB) GetByID(id int64) (*Image, error) {
 	row := d.db.QueryRow(`
 		SELECT `+imageColumns+`
-		FROM images
-		WHERE registry = $1 AND repository = $2 AND tag = $3
-		LIMIT 1`,
-		ref.Registry, ref.Repository, ref.Tag,
+		FROM images i
+		JOIN tags    t  ON t.id  = i.tag
+		JOIN registries r ON r.id = t.registry
+		LEFT JOIN registries cr ON cr.id = i.cache_registry
+		WHERE i.id = $1`,
+		id,
 	)
 	return scanImageRow(row)
 }
 
-// GetApproved returns an approved image matching registry+repository+tag, or nil.
+// GetByRef returns all platform images for the given tag reference.
+func (d *DB) GetByRef(ref ImageRef) ([]*Image, error) {
+	rows, err := d.db.Query(`
+		SELECT `+imageColumns+`
+		FROM images i
+		JOIN tags    t  ON t.id  = i.tag
+		JOIN registries r ON r.id = t.registry
+		LEFT JOIN registries cr ON cr.id = i.cache_registry
+		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
+		ORDER BY i.id`,
+		ref.Registry, ref.Repository, ref.Tag,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanImageRows(rows)
+}
+
+// GetApproved returns the first approved platform image for the given tag, or nil.
 func (d *DB) GetApproved(registry, repository, tag string) (*Image, error) {
 	row := d.db.QueryRow(`
-		SELECT `+imageColumns+`
-		FROM images
-		WHERE registry = $1 AND repository = $2 AND tag = $3
-		  AND state = 'approved'
+		SELECT
+			i.id, i.tag, r.url, t.repository, t.name,
+			COALESCE(cr.url, ''),
+			COALESCE(t.digest, ''), COALESCE(i.arch, ''), COALESCE(i.os, ''),
+			COALESCE(i.manifest::text, 'null'), COALESCE(i.scan_report::text, 'null'),
+			i.state::text, i.created_at, i.updated_at
+		FROM images i
+		JOIN tags    t  ON t.id  = i.tag
+		JOIN registries r ON r.id = t.registry
+		LEFT JOIN registries cr ON cr.id = i.cache_registry
+		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
+		  AND i.state = 'approved'
+		ORDER BY i.id
 		LIMIT 1`,
 		registry, repository, tag,
 	)
 	return scanImageRow(row)
 }
+
+// GetApprovedByDigest returns an approved image matching the given digest, or nil.
+func (d *DB) GetApprovedByDigest(registry, repository, digest string) (*Image, error) {
+	row := d.db.QueryRow(`
+		SELECT `+imageColumns+`
+		FROM images i
+		JOIN tags    t  ON t.id  = i.tag
+		JOIN registries r ON r.id = t.registry
+		LEFT JOIN registries cr ON cr.id = i.cache_registry
+		WHERE r.url = $1 AND t.repository = $2
+		  AND i.digest = $3
+		  AND i.state = 'approved'
+		LIMIT 1`,
+		registry, repository, digest,
+	)
+	return scanImageRow(row)
+}
+
+// GetApprovedByTagAndDigest returns an approved image matching digest whose tag
+// name also equals tag, or nil.
+func (d *DB) GetApprovedByTagAndDigest(registry, repository, tag, digest string) (*Image, error) {
+	row := d.db.QueryRow(`
+		SELECT `+imageColumns+`
+		FROM images i
+		JOIN tags    t  ON t.id  = i.tag
+		JOIN registries r ON r.id = t.registry
+		LEFT JOIN registries cr ON cr.id = i.cache_registry
+		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
+		  AND i.digest = $4
+		  AND i.state = 'approved'
+		LIMIT 1`,
+		registry, repository, tag, digest,
+	)
+	return scanImageRow(row)
+}
+
+// GetRejected returns the first rejected platform image for the given tag, or nil.
+func (d *DB) GetRejected(registry, repository, tag string) (*Image, error) {
+	row := d.db.QueryRow(`
+		SELECT `+imageColumns+`
+		FROM images i
+		JOIN tags    t  ON t.id  = i.tag
+		JOIN registries r ON r.id = t.registry
+		LEFT JOIN registries cr ON cr.id = i.cache_registry
+		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
+		  AND i.state = 'rejected'
+		ORDER BY i.id
+		LIMIT 1`,
+		registry, repository, tag,
+	)
+	return scanImageRow(row)
+}
+
+// ── list ──────────────────────────────────────────────────────────────────────
 
 // ListFilter specifies optional filters for List.
 type ListFilter struct {
@@ -312,7 +801,7 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 		for i, s := range f.States {
 			stateStrs[i] = string(s)
 		}
-		conditions = append(conditions, fmt.Sprintf("state = ANY($%d)", argIdx))
+		conditions = append(conditions, fmt.Sprintf("i.state::text = ANY($%d)", argIdx))
 		args = append(args, pq.Array(stateStrs))
 		argIdx++
 	}
@@ -327,13 +816,13 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 			}
 			if tag != "" {
 				refConds = append(refConds, fmt.Sprintf(
-					"(repository = $%d AND tag = $%d)",
+					"(t.repository = $%d AND t.name = $%d)",
 					argIdx, argIdx+1,
 				))
 				args = append(args, r, tag)
 				argIdx += 2
 			} else {
-				refConds = append(refConds, fmt.Sprintf("repository = $%d", argIdx))
+				refConds = append(refConds, fmt.Sprintf("t.repository = $%d", argIdx))
 				args = append(args, r)
 				argIdx++
 			}
@@ -348,30 +837,28 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 
 	query := fmt.Sprintf(`
 		SELECT `+imageColumns+`
-		FROM images
+		FROM images i
+		JOIN tags    t  ON t.id  = i.tag
+		JOIN registries r ON r.id = t.registry
+		LEFT JOIN registries cr ON cr.id = i.cache_registry
 		%s
-		ORDER BY updated_at DESC`, where)
+		ORDER BY i.updated_at DESC`, where)
 
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
-	var out []Image
-	for rows.Next() {
-		var img Image
-		if err := rows.Scan(
-			&img.ID, &img.Registry, &img.Repository, &img.Tag,
-			&img.Digest, &img.Manifest, &img.ScanReport,
-			(*string)(&img.State), &img.CacheRegistry,
-			&img.CreatedAt, &img.UpdatedAt,
-		); err != nil {
-			return nil, err
-		}
-		out = append(out, img)
+	ptrs, err := scanImageRows(rows)
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	out := make([]Image, len(ptrs))
+	for i, p := range ptrs {
+		out[i] = *p
+	}
+	return out, nil
 }
 
 // ── event logging ─────────────────────────────────────────────────────────────

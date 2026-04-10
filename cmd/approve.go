@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,11 +17,11 @@ import (
 
 var (
 	approveCache    string
-	approveCacheSet bool
+	approvePlatform string
 )
 
 var approveCmd = &cobra.Command{
-	Use:   "approve [--cache [URL]] IMAGE",
+	Use:   "approve [--platform OS/ARCH] [--cache [URL]] IMAGE",
 	Short: "Review the scan report and approve an OCI image tag",
 	Long: `approve queues IMAGE if needed, scans it if needed (rejected images are
 always re-scanned), presents the JSON report, and prompts for YES / NO / REJECT.
@@ -29,6 +30,9 @@ always re-scanned), presents the JSON report, and prompts for YES / NO / REJECT.
   NO     — does nothing (leaves state unchanged); exits 0
   REJECT — rejects the image immediately (state: rejected); exits 1
 
+Use --platform to select a specific platform (e.g. linux/amd64).
+If the image is multi-platform and --platform is omitted, you will be prompted.
+
 If --cache is provided the image is pushed to the specified URL upon YES
 (or to cache_url in hermes.yaml if the flag is given with no value).
 A successful push records the cache registry in the database.
@@ -36,6 +40,7 @@ A failed push sets state to 'error' and exits non-zero.
 
 Examples:
   hermes approve registry.example.com/myapp:v1.2.3
+  hermes approve --platform linux/amd64 registry.example.com/myapp:v1.2.3
   hermes approve --cache registry.example.com/myapp:v1.2.3
   hermes approve --cache cache.internal.example.com registry.example.com/myapp:v1.2.3`,
 	Args: cobra.ExactArgs(1),
@@ -43,7 +48,7 @@ Examples:
 }
 
 func init() {
-	// --cache may be given with or without a URL value.
+	approveCmd.Flags().StringVar(&approvePlatform, "platform", "", "platform to approve (os/arch, e.g. linux/amd64)")
 	approveCmd.Flags().StringVar(&approveCache, "cache", "", "push image to this registry upon approval (uses cache_url from config if empty)")
 	approveCmd.Flags().Lookup("cache").NoOptDefVal = "__use_config__"
 	rootCmd.AddCommand(approveCmd)
@@ -52,10 +57,11 @@ func init() {
 func runApprove(cmd *cobra.Command, args []string) error {
 	imageRef := args[0]
 
-	ref, err := oci.ParseRef(imageRef)
+	reg, repo, tag, err := oci.ParseRef(imageRef)
 	if err != nil {
 		return err
 	}
+	ref := db.ImageRef{Registry: reg, Repository: repo, Tag: tag}
 
 	// Resolve cache URL.
 	cacheURL := ""
@@ -66,35 +72,45 @@ func runApprove(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Get or create the DB record.
-	img, err := database.Queue(ref)
+	// Queue the image (fetches manifests if new).
+	fmt.Fprintf(os.Stderr, "Queuing %s...\n", imageRef)
+	images, err := database.Queue(ref, oci.NewDefaultClient())
 	if err != nil {
 		return fmt.Errorf("queue image: %w", err)
 	}
 
+	// Select the target platform (already-approved platforms are shown but not selectable).
+	img, err := selectPlatform(images, approvePlatform, db.StateApproved)
+	if err != nil {
+		return err
+	}
+
 	// Determine whether a (re-)scan is needed.
-	needsScan := img.State == db.StateQueued || img.State == db.StateRejected || img.ScanReport == ""
+	needsScan := img.State == db.StateQueued || img.State == db.StateRejected ||
+		len(img.ScanReport) == 0 || string(img.ScanReport) == "null"
 
 	if needsScan {
-		fmt.Fprintf(os.Stderr, "Fetching manifest for %s...\n", imageRef)
-		manifest, err := oci.FetchManifest(imageRef)
-		if err != nil {
-			return fmt.Errorf("fetch manifest: %w", err)
+		scanRef := imageRef
+		if img.Digest != "" {
+			scanRef = fmt.Sprintf("%s/%s@%s", reg, repo, img.Digest)
 		}
 
-		fmt.Fprintf(os.Stderr, "Scanning %s with trivy...\n", imageRef)
-		result, err := trivy.Scan(imageRef, cfg.Trivy)
+		fmt.Fprintf(os.Stderr, "Scanning %s (%s/%s) with trivy...\n", scanRef, img.OS, img.Arch)
+		result, err := trivy.Scan(scanRef, cfg.Trivy)
 		if err != nil {
-			_ = database.SetError(ref)
+			_ = database.SetError(img.ID)
 			logEvent("scan_error", img, map[string]interface{}{"error": err.Error()})
 			return fmt.Errorf("trivy scan: %w", err)
 		}
 
-		img, err = database.SaveScan(ref, manifest.Digest, string(manifest.Manifest), string(result.Raw))
+		imgID := img.ID
+		img, err = database.SaveScan(imgID, json.RawMessage(result.Raw))
 		if err != nil {
+			_ = database.SetError(imgID)
+			logEvent("scan_error", img, map[string]interface{}{"error": err.Error()})
 			return fmt.Errorf("save scan: %w", err)
 		}
-		logEvent("scan", img, map[string]interface{}{"digest": manifest.Digest})
+		logEvent("scan", img, map[string]interface{}{"digest": img.Digest})
 	}
 
 	// Display the report.
@@ -103,7 +119,8 @@ func runApprove(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, strings.Repeat("─", 72))
-	fmt.Fprintf(os.Stderr, "Image: %s/%s:%s  (digest: %s)\n", ref.Registry, ref.Repository, ref.Tag, img.Digest)
+	fmt.Fprintf(os.Stderr, "Image: %s/%s:%s  platform: %s/%s  (digest: %s)\n",
+		reg, repo, tag, img.OS, img.Arch, img.Digest)
 	fmt.Fprintln(os.Stderr)
 
 	// Prompt.
@@ -116,9 +133,14 @@ func runApprove(cmd *cobra.Command, args []string) error {
 	case "YES":
 		// Push to cache if requested.
 		if cacheURL != "" {
-			fmt.Fprintf(os.Stderr, "Pushing %s to %s...\n", imageRef, cacheURL)
-			if err := pushToCache(imageRef, ref, cacheURL); err != nil {
-				_ = database.SetError(ref)
+			// Build digest-pinned source ref for docker push.
+			pushSrc := imageRef
+			if img.Digest != "" {
+				pushSrc = fmt.Sprintf("%s/%s@%s", reg, repo, img.Digest)
+			}
+			fmt.Fprintf(os.Stderr, "Pushing %s to %s...\n", pushSrc, cacheURL)
+			if err := pushToCache(pushSrc, ref, cacheURL); err != nil {
+				_ = database.SetError(img.ID)
 				logEvent("cache_push_error", img, map[string]interface{}{
 					"cache_url": cacheURL,
 					"error":     err.Error(),
@@ -127,18 +149,18 @@ func runApprove(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		if err := database.Approve(ref, cacheURL); err != nil {
+		if err := database.Approve(img.ID, cacheURL); err != nil {
 			return fmt.Errorf("approve: %w", err)
 		}
 		logEvent("approve", img, map[string]interface{}{"cache_url": cacheURL})
-		fmt.Printf("approved  %s/%s:%s\n", ref.Registry, ref.Repository, ref.Tag)
+		fmt.Printf("approved  %s/%s:%s  (%s/%s)\n", reg, repo, tag, img.OS, img.Arch)
 
 	case "REJECT":
-		if err := database.Reject(ref); err != nil {
+		if err := database.Reject(img.ID); err != nil {
 			return fmt.Errorf("reject: %w", err)
 		}
 		logEvent("reject", img, nil)
-		fmt.Printf("rejected  %s/%s:%s\n", ref.Registry, ref.Repository, ref.Tag)
+		fmt.Printf("rejected  %s/%s:%s  (%s/%s)\n", reg, repo, tag, img.OS, img.Arch)
 		return fmt.Errorf("image rejected")
 
 	default: // NO or empty
@@ -163,26 +185,17 @@ func prompt(message string) (string, error) {
 
 // pushToCache pushes imageRef to the cache registry using `docker` commands.
 func pushToCache(imageRef string, ref db.ImageRef, cacheURL string) error {
-	// Build the destination tag: <cacheURL>/<repository>:<tag>
 	dest := fmt.Sprintf("%s/%s:%s", cacheURL, ref.Repository, ref.Tag)
 
-	// Pull the image locally.
 	if out, err := exec.Command("docker", "pull", imageRef).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker pull: %s: %w", string(out), err)
 	}
-
-	// Re-tag.
 	if out, err := exec.Command("docker", "tag", imageRef, dest).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker tag: %s: %w", string(out), err)
 	}
-
-	// Push.
 	if out, err := exec.Command("docker", "push", dest).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker push: %s: %w", string(out), err)
 	}
-
-	// Clean up the local re-tagged image.
 	_ = exec.Command("docker", "rmi", dest).Run()
-
 	return nil
 }

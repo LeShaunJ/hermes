@@ -2,5 +2,10 @@
 forwards:
   dev: dev
 actions: 
-  build: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o . .
+  build:
+    command: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o . .
+    description: build `hermes` binary
+  test:
+    command: go test -cover $(find . -type f -name '*_test.go' -exec dirname {} \; | uniq)
+    description: run tests
 ...

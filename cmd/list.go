@@ -89,18 +89,26 @@ func runList(_ *cobra.Command, args []string) error {
 }
 
 func outputTable(images []db.Image) error {
+	dash := func(s string) string {
+		if s == "" {
+			return "-"
+		}
+		return s
+	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "REGISTRY\tREPOSITORY\tTAG\tDIGEST\tSTATE\tUPDATED")
+	_, _ = fmt.Fprintln(w, "REGISTRY\tREPOSITORY\tTAG\tOS\tARCH\tDIGEST\tSTATE\tUPDATED")
 	for _, img := range images {
 		digest := img.Digest
 		if len(digest) > 19 {
 			digest = digest[:19] // "sha256:" + 12 hex chars
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			img.Registry,
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			img.RegistryURL,
 			img.Repository,
-			img.Tag,
-			digest,
+			img.TagName,
+			dash(img.OS),
+			dash(img.Arch),
+			dash(digest),
 			img.State,
 			img.UpdatedAt.Format("2006-01-02 15:04"),
 		)
@@ -114,6 +122,8 @@ func outputJSON(images []db.Image) error {
 		Registry      string `json:"registry"`
 		Repository    string `json:"repository"`
 		Tag           string `json:"tag"`
+		OS            string `json:"os,omitempty"`
+		Arch          string `json:"arch,omitempty"`
 		Digest        string `json:"digest,omitempty"`
 		State         string `json:"state"`
 		CacheRegistry string `json:"cache_registry,omitempty"`
@@ -124,9 +134,11 @@ func outputJSON(images []db.Image) error {
 	for i, img := range images {
 		out[i] = jsonImage{
 			ID:            img.ID,
-			Registry:      img.Registry,
+			Registry:      img.RegistryURL,
 			Repository:    img.Repository,
-			Tag:           img.Tag,
+			Tag:           img.TagName,
+			OS:            img.OS,
+			Arch:          img.Arch,
 			Digest:        img.Digest,
 			State:         string(img.State),
 			CacheRegistry: img.CacheRegistry,

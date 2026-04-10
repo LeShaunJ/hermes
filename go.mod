@@ -10,6 +10,8 @@ require (
 	github.com/spf13/cobra v1.9.1
 )
 
+require github.com/DATA-DOG/go-sqlmock v1.5.2 // indirect
+
 require (
 	github.com/docker/cli v29.2.0+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.8.2 // indirect

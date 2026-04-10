@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
@@ -23,7 +24,9 @@ type Config struct {
 
 // ServerConfig configures the HTTP API server.
 type ServerConfig struct {
-	Addr string `mapstructure:"addr"`
+	Addr     string `mapstructure:"addr"`
+	URL      string `mapstructure:"url"`      // public base URL (default: http://hostname:port)
+	Redirect bool   `mapstructure:"redirect"` // use HTTP 307 for blob paths instead of proxying
 }
 
 // DBConfig configures the PostgreSQL connection.
@@ -84,5 +87,19 @@ func Load(path string) (*Config, error) {
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
+
+	// Compute default server.url from hostname + port when not set.
+	if cfg.Server.URL == "" {
+		hostname, _ := os.Hostname()
+		if hostname == "" {
+			hostname = "localhost"
+		}
+		_, port, err := net.SplitHostPort(cfg.Server.Addr)
+		if err != nil {
+			port = strings.TrimPrefix(cfg.Server.Addr, ":")
+		}
+		cfg.Server.URL = "http://" + hostname + ":" + port
+	}
+
 	return &cfg, nil
 }
