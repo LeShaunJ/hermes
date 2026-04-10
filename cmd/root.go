@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -10,10 +11,25 @@ import (
 	"github.com/leshaunj/hermes/internal/db"
 )
 
+// datastore is the subset of db.DB operations used by CLI commands.
+// *db.DB satisfies this interface automatically.
+type datastore interface {
+	Queue(ref db.ImageRef, fetcher db.Fetcher) ([]*db.Image, error)
+	SetError(imageID int64) error
+	SaveScan(imageID int64, scanReport json.RawMessage) (*db.Image, error)
+	LogEvent(imageID *int64, source db.EventSource, eventType string, details map[string]interface{}) error
+	List(f db.ListFilter) ([]db.Image, error)
+	GetByRef(ref db.ImageRef) ([]*db.Image, error)
+	Approve(imageID int64, cacheRegistry string) error
+	Reject(imageID int64) error
+	Rescind(imageID int64) error
+	Close()
+}
+
 var (
 	cfgPath  string
 	cfg      *config.Config
-	database *db.DB
+	database datastore
 )
 
 var rootCmd = &cobra.Command{

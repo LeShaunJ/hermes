@@ -35,16 +35,16 @@ before forwarding client requests to upstream registries.
 
 ## How it works
 
-```
-  docker pull ──► hermes (/v2/<registry>/…)
-                     │
-                     ├── approved  ──► proxy/redirect ──► upstream registry
-                     ├── rejected  ──► 403 DENIED
-                     └── unknown   ──► 401 UNAUTHORIZED
-                                          │
-                                          ├── stub-registers tag in DB
-                                          └── WWW-Authenticate realm rewritten
-                                              through /ident/ for token fetch
+```mermaid
+flowchart TD
+    A[docker pull] --> B["hermes\n/v2/&lt;registry&gt;/…"]
+    B --> C{image state?}
+    C -- approved --> D[proxy / redirect]
+    D --> E[upstream registry]
+    C -- rejected --> F[403 DENIED]
+    C -- unknown --> G[401 UNAUTHORIZED]
+    G --> H[stub-register tag in DB]
+    G --> I["WWW-Authenticate realm\nrewritten through /ident/\nfor token fetch"]
 ```
 
 1. A container runtime targets hermes as its registry endpoint.
@@ -74,12 +74,16 @@ before forwarding client requests to upstream registries.
 
 State transitions:
 
-```
-queued ──scan──► scanned ──approve──► approved ──rescind──► rescinded
-  │                 │                     │
-  ├──reject──►      └──reject──►          └──reject──► rejected
-  │           rejected
-  └──► (re-scan on next approve)
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> scanned : scan
+    scanned --> approved : approve
+    approved --> rescinded : rescind
+    rescinded --> scanned : scan
+    queued --> rejected : reject
+    scanned --> rejected : reject
+    approved --> rejected : reject
 ```
 
 ---

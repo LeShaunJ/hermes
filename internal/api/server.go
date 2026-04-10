@@ -47,15 +47,33 @@ import (
 
 var logger = log.New(os.Stderr, "INFO: ", log.Ldate|log.Ltime)
 
+// storage is the subset of db.DB operations used by Server.
+// *db.DB satisfies this interface automatically.
+type storage interface {
+	GetApproved(registry, repository, tag string) (*db.Image, error)
+	GetApprovedByDigest(registry, repository, digest string) (*db.Image, error)
+	GetApprovedByTagAndDigest(registry, repository, tag, digest string) (*db.Image, error)
+	GetRejected(registry, repository, tag string) (*db.Image, error)
+	QueueStub(ref db.ImageRef) error
+	LogEvent(imageID *int64, source db.EventSource, eventType string, details map[string]interface{}) error
+}
+
 // Server is the hermes OCI gateway server.
 type Server struct {
-	db  *db.DB
+	db  storage
 	cfg *config.Config
 	mux *http.ServeMux
+
+	// challengeRetrieveFn overrides challengeRetrieve in tests to avoid
+	// outbound HTTPS calls.
+	challengeRetrieveFn func(registry, path string) string
+
+	// transport overrides the HTTP transport used by the ident proxy in tests.
+	transport http.RoundTripper
 }
 
 // New creates a Server and registers all routes.
-func New(database *db.DB, cfg *config.Config) *Server {
+func New(database storage, cfg *config.Config) *Server {
 	s := &Server{
 		db:  database,
 		cfg: cfg,
@@ -181,6 +199,9 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 // WWW-Authenticate header from the upstream's 401 response.
 // Returns an empty string if the probe fails or returns no challenge.
 func (s *Server) challengeRetrieve(registry string, path string) string {
+	if s.challengeRetrieveFn != nil {
+		return s.challengeRetrieveFn(registry, path)
+	}
 	client := &http.Client{
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -208,6 +229,7 @@ func challengeParse(header string, account string) string {
 
 	if account != "" {
 		query += delim + "account=" + account
+		delim = "&"
 	}
 
 	for _, match := range matches {
@@ -268,8 +290,15 @@ func (s *Server) serveIdent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	if s.transport != nil {
+		proxy.Transport = s.transport
+	}
 	proxy.Director = func(req *http.Request) {
-		req.URL.Scheme = "https"
+		if s.transport == nil {
+			req.URL.Scheme = "https"
+		} else {
+			req.URL.Scheme = target.Scheme
+		}
 		req.URL.Host = target.Host
 		req.URL.Path = target.Path
 		req.URL.RawQuery = target.RawQuery

@@ -21,6 +21,16 @@ type ScanResult struct {
 	Raw []byte
 }
 
+// execCommand is the constructor for external commands; overridden in tests.
+var execCommand = exec.Command
+
+// SetExecCommand replaces the command constructor used by Scan and Convert.
+// Intended for use in external package tests only.
+func SetExecCommand(fn func(string, ...string) *exec.Cmd) { execCommand = fn }
+
+// ExecCommandVar returns the current execCommand for save-and-restore in tests.
+func ExecCommandVar() func(string, ...string) *exec.Cmd { return execCommand }
+
 // Scan runs `docker run --rm aquasec/trivy image --format json --quiet <imageRef>`
 // and returns the raw JSON report.
 //
@@ -43,7 +53,7 @@ func Scan(imageRef string, cfg config.TrivyConfig) (*ScanResult, error) {
 	args = append(args, cfg.Args...)
 	args = append(args, imageRef)
 
-	cmd := exec.Command("docker", args...)
+	cmd := execCommand("docker", args...)
 
 	stdout, _ := cmd.StdoutPipe()
 
@@ -109,7 +119,7 @@ func Convert(report []byte, format string, cfg config.TrivyConfig) ([]byte, erro
 	args = append(args, cfg.ConvertArgs...)
 	args = append(args, "-") // read from stdin
 
-	cmd := exec.Command("docker", args...)
+	cmd := execCommand("docker", args...)
 	cmd.Stdin = bytes.NewReader(report)
 
 	out, err := cmd.Output()

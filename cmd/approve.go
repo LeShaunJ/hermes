@@ -103,9 +103,10 @@ func runApprove(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("trivy scan: %w", err)
 		}
 
-		img, err = database.SaveScan(img.ID, json.RawMessage(result.Raw))
+		imgID := img.ID
+		img, err = database.SaveScan(imgID, json.RawMessage(result.Raw))
 		if err != nil {
-			_ = database.SetError(img.ID)
+			_ = database.SetError(imgID)
 			logEvent("scan_error", img, map[string]interface{}{"error": err.Error()})
 			return fmt.Errorf("save scan: %w", err)
 		}

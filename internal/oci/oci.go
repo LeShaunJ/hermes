@@ -28,6 +28,10 @@ type ManifestResult struct {
 type Client struct {
 	authHeader string // non-empty: set Authorization header verbatim on all requests
 	//                   empty: resolve credentials via authn.DefaultKeychain
+
+	// scheme is the URL scheme used for registry requests; defaults to "https".
+	// Override to "http" in tests to reach plain httptest servers.
+	scheme string
 }
 
 // NewDefaultClient returns a Client that authenticates via the Docker credential
@@ -47,7 +51,11 @@ func (c *Client) FetchManifest(registry, repository, reference string) (digest, 
 	if err != nil {
 		return "", "", nil, err
 	}
-	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repository, reference)
+	scheme := c.scheme
+	if scheme == "" {
+		scheme = "https"
+	}
+	url := fmt.Sprintf("%s://%s/v2/%s/manifests/%s", scheme, registry, repository, reference)
 	body, dgst, ct, err := c.fetchContent(url, authCfg, registry, repository, true)
 	return dgst, ct, body, err
 }
@@ -58,7 +66,11 @@ func (c *Client) FetchConfig(registry, repository, configDigest string) (arch, o
 	if err != nil {
 		return "", "", err
 	}
-	url := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repository, configDigest)
+	scheme := c.scheme
+	if scheme == "" {
+		scheme = "https"
+	}
+	url := fmt.Sprintf("%s://%s/v2/%s/blobs/%s", scheme, registry, repository, configDigest)
 	body, _, _, err := c.fetchContent(url, authCfg, registry, repository, false)
 	if err != nil {
 		return "", "", err
