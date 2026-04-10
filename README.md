@@ -25,10 +25,10 @@ before forwarding client requests to upstream registries.
   - [report](#report)
   - [serve](#serve)
 - [Gateway API](#gateway-api)
-  - [GET /v2/](#get-v2)
-  - [ANY /v2/\<registry\>/…](#any-v2registry)
-  - [ANY /ident/\<registry\>/…](#any-identregistry)
-  - [GET /healthz](#get-healthz)
+  - [`GET /v2/`](#get-v2)
+  - [`GET /v2/<registry>/…`](#get-v2registry)
+  - [`GET /ident`](#get-ident)
+  - [`GET /healthz`](#get-healthz)
 - [Database](#database)
 
 ---
@@ -306,7 +306,7 @@ hermes serve --addr 0.0.0.0:9090
 hermes implements the OCI Distribution v2 API as a gateway. Configure your
 container runtime or mirror tool to use hermes as its registry endpoint.
 
-### GET /v2/
+### `GET /v2/`
 
 Returns `401 UNAUTHORIZED` with a `WWW-Authenticate: Bearer` challenge pointing
 to `/ident/` and sets `Docker-Distribution-API-Version: registry/2.0`.
@@ -314,7 +314,7 @@ to `/ident/` and sets `Docker-Distribution-API-Version: registry/2.0`.
 This is the standard OCI v2 capability ping — all clients hit this first to
 negotiate auth.
 
-### ANY /v2/\<registry\>/…
+### `GET /v2/<registry>/…`
 
 All OCI Distribution sub-paths rooted at `/v2/<registry>/` are handled:
 
@@ -331,7 +331,7 @@ All OCI Distribution sub-paths rooted at `/v2/<registry>/` are handled:
 Forwarded unconditionally to `https://<registry>/v2/<repo>/…` via proxy or
 307 redirect (controlled by `server.redirect`).
 
-### ANY /ident/\<registry\>/…
+### `GET /ident`
 
 Token-acquisition proxy. The Docker client sends its bearer-token request here;
 hermes proxies it verbatim to `https://<registry>/…`.
@@ -340,7 +340,7 @@ The realm URL in upstream `WWW-Authenticate` headers is automatically rewritten
 to route through `/ident/` so clients never need direct access to the upstream
 auth endpoint.
 
-### GET /healthz
+### `GET /healthz`
 
 Returns `ok\n` with status `200`. Used as a container liveness probe.
 
