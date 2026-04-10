@@ -14,7 +14,6 @@ before forwarding client requests to upstream registries.
 - [Installation](#installation)
   - [Binary](#binary)
   - [Container](#container)
-  - [Dev stack (Docker Compose)](#dev-stack-docker-compose)
 - [Configuration](#configuration)
 - [CLI usage](#cli-usage)
   - [scan](#scan)
@@ -115,25 +114,6 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -p 8080:8080 \
   hermes
-```
-
-### Dev stack (Docker Compose)
-
-The `dev/` directory contains a ready-to-use Compose stack with hermes,
-PostgreSQL, and nginx:
-
-```bash
-docker compose -f dev/compose.yaml up
-```
-
-Edit `dev/hermes.yaml` to customise settings before starting.
-
-The nginx proxy listens on `http://localhost:8888`. Configure your container
-runtime to use hermes as its registry endpoint:
-
-```bash
-# Pull via hermes gateway directly:
-DOCKER_HOST=tcp://localhost:8888 docker pull registry.example.com/myapp:v1.2.3
 ```
 
 ---
