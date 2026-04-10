@@ -178,7 +178,7 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 	if wwwAuth := s.challengeRetrieve(p.Registry, ""); wwwAuth != "" {
 		w.Header().Set("WWW-Authenticate", s.rewriteRealm(wwwAuth))
 	}
-	s.writeOCIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+	s.writeOCIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "approval required")
 }
 
 // challengeRetrieve probes GET https://<registry>/v2/<path> and returns the

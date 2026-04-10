@@ -167,7 +167,7 @@ func TestWriteOCIError(t *testing.T) {
 		code    string
 		message string
 	}{
-		{http.StatusUnauthorized, "UNAUTHORIZED", "authentication required"},
+		{http.StatusUnauthorized, "UNAUTHORIZED", "approval required"},
 		{http.StatusForbidden, "DENIED", "image has been rejected"},
 		{http.StatusBadRequest, "UNSUPPORTED", "bad path"},
 		{http.StatusInternalServerError, "UNKNOWN", "internal error"},
