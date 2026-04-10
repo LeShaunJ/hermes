@@ -45,7 +45,7 @@ import (
 	"github.com/leshaunj/hermes/internal/db"
 )
 
-var logger = log.New(os.Stdout, "INFO: ", log.Ldate|log.Ltime)
+var logger = log.New(os.Stderr, "INFO: ", log.Ldate|log.Ltime)
 
 // Server is the hermes OCI gateway server.
 type Server struct {
@@ -64,6 +64,7 @@ func New(database *db.DB, cfg *config.Config) *Server {
 	s.mux.HandleFunc("/v2/", s.serveOCI)
 	s.mux.HandleFunc("/v2", s.serveOCI)
 	s.mux.HandleFunc("/ident/", s.serveIdent)
+	s.mux.HandleFunc("/ident", s.serveIdent)
 	s.mux.HandleFunc("GET /healthz", s.healthz)
 	return s
 }
@@ -83,7 +84,8 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 	// /v2 or /v2/ root — signal this is a v2-capable registry.
 	if path == "/v2" || path == "/v2/" {
 		w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer realm=\"%s/ident\"", s.cfg.Server.URL))
+		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
@@ -173,23 +175,23 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Build WWW-Authenticate challenge by probing the upstream registry.
-	if wwwAuth := s.upstreamChallenge(p.Registry); wwwAuth != "" {
+	if wwwAuth := s.challengeRetrieve(p.Registry, ""); wwwAuth != "" {
 		w.Header().Set("WWW-Authenticate", s.rewriteRealm(wwwAuth))
 	}
 	s.writeOCIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
 }
 
-// upstreamChallenge probes GET https://<registry>/v2/ and returns the
+// challengeRetrieve probes GET https://<registry>/v2/<path> and returns the
 // WWW-Authenticate header from the upstream's 401 response.
 // Returns an empty string if the probe fails or returns no challenge.
-func (s *Server) upstreamChallenge(registry string) string {
+func (s *Server) challengeRetrieve(registry string, path string) string {
 	client := &http.Client{
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 		Timeout: 5 * time.Second,
 	}
-	resp, err := client.Get("https://" + registry + "/v2/")
+	resp, err := client.Get("https://" + registry + "/v2/" + path)
 	if err != nil {
 		return ""
 	}
@@ -216,29 +218,90 @@ func (s *Server) rewriteRealm(wwwAuth string) string {
 
 // ── identity proxy ────────────────────────────────────────────────────────────
 
+var scopeRe = regexp.MustCompile(`^repository:([^/]+)/(.+):pull$`)
+var wwwAuthRe = regexp.MustCompile(`\b(\w+)="([^"]+)"`)
+
+func challengeParse(header string, account string) string {
+	matches := wwwAuthRe.FindAllStringSubmatch(header, -1)
+	realm := ""
+	query := ""
+	delim := "?"
+
+	if account != "" {
+		query += delim + "account=" + account
+	}
+
+	for _, match := range matches {
+		if len(match) > 2 {
+			if match[1] == "realm" {
+				realm = match[2]
+			} else {
+				query += delim + match[1] + "=" + match[2]
+				delim = "&"
+			}
+		}
+	}
+
+	if realm == "" {
+		return ""
+	}
+
+	return realm + query
+}
+
 // serveIdent proxies token-acquisition requests to the upstream registry auth
 // endpoint.  URL format: /ident/<registry>/<path>?<query>
 func (s *Server) serveIdent(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, "/ident/")
-	slashIdx := strings.Index(rest, "/")
-	if slashIdx < 0 {
-		http.Error(w, "bad ident path: expected /ident/<registry>/<path>", http.StatusBadRequest)
-		return
-	}
-	registry := rest[:slashIdx]
-	upstreamPath := rest[slashIdx:] // starts with /
+	query := r.URL.Query()
 
-	target, err := url.Parse("https://" + registry)
-	if err != nil {
-		http.Error(w, "bad registry in ident path: "+err.Error(), http.StatusBadRequest)
+	scope, ok := query["scope"]
+	if !ok {
+		s.writeOCIError(w, http.StatusBadRequest, "UNSUPPORTED", "missing `scope=` paramter")
 		return
 	}
+
+	account, ok := query["account"]
+	if !ok {
+		account = []string{""}
+	}
+
+	match := scopeRe.FindStringSubmatch(scope[0])
+	if match == nil {
+		s.writeOCIError(w, http.StatusBadRequest, "UNSUPPORTED", "malformed `scope=` paramter")
+		return
+	}
+	logger.Printf("match | %+v", match)
+
+	wwwAuth := s.challengeRetrieve(match[1], match[2]+"/tags/list")
+	logger.Printf("wwwAuth | %s", wwwAuth)
+
+	challenge := challengeParse(wwwAuth, account[0])
+	if challenge == "" {
+		s.writeOCIError(w, http.StatusFailedDependency, "UNSUPPORTED", "could not retrieve auth challenge")
+		return
+	}
+	logger.Printf("challenge | %s", challenge)
+
+	target, err := url.Parse(challenge)
+	if err != nil {
+		s.writeOCIError(w, http.StatusFailedDependency, "UNSUPPORTED", "bad registry in ident path: "+err.Error())
+		return
+	}
+
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = "https"
-		req.URL.Host = registry
-		req.URL.Path = upstreamPath
-		req.Host = registry
+		req.URL.Host = target.Host
+		req.URL.Path = target.Path
+		req.URL.RawQuery = target.RawQuery
+		req.Host = target.Host
+		req.Header.Set("X-Forwarded-Proto", "https")
+		logger.Printf("upstream auth: %+v", req.URL)
+		logger.Printf("upstream auth headers: %+v", req.Header)
+	}
+	proxy.ModifyResponse = func(res *http.Response) error {
+		res.Header.Set("Docker-Distribution-API-Version", "registry/2.0")
+		return nil
 	}
 	proxy.ServeHTTP(w, r)
 }
@@ -254,6 +317,7 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 		if r.URL.RawQuery != "" {
 			dest += "?" + r.URL.RawQuery
 		}
+		logger.Printf("redirect url: %+v", dest)
 		http.Redirect(w, r, dest, http.StatusTemporaryRedirect)
 		return
 	}
@@ -265,8 +329,12 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 		origDirector(req)
 		req.URL.Path = upstreamPath
 		req.Host = registry
+		req.Header.Set("X-Forwarded-Proto", "https")
+		logger.Printf("upstream url: %+v", req.URL)
+		logger.Printf("upstream url headers: %+v", req.Header)
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		resp.Header.Set("Docker-Distribution-API-Version", "registry/2.0")
 		if wwwAuth := resp.Header.Get("WWW-Authenticate"); wwwAuth != "" {
 			resp.Header.Set("WWW-Authenticate", s.rewriteRealm(wwwAuth))
 		}
@@ -306,10 +374,10 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 type refKind int
 
 const (
-	refKindTag         refKind = iota // /manifests/<tag>
-	refKindDigest                     // /manifests/<digest>  ("sha256:…")
-	refKindTagAndDigest               // /manifests/<tag>@<digest>
-	refKindOther                      // any other /v2/… path
+	refKindTag          refKind = iota // /manifests/<tag>
+	refKindDigest                      // /manifests/<digest>  ("sha256:…")
+	refKindTagAndDigest                // /manifests/<tag>@<digest>
+	refKindOther                       // any other /v2/… path
 )
 
 type parsedPath struct {
