@@ -195,7 +195,7 @@ func (s *Server) challengeRetrieve(registry string, path string) string {
 	if err != nil {
 		return ""
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return resp.Header.Get("WWW-Authenticate")
 }
 
@@ -366,7 +366,7 @@ func (s *Server) writeOCIError(w http.ResponseWriter, status int, code, message 
 // ── health ────────────────────────────────────────────────────────────────────
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	fmt.Fprintln(w, "ok")
+	_, _ = fmt.Fprintln(w, "ok")
 }
 
 // ── path parsing ──────────────────────────────────────────────────────────────

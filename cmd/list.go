@@ -96,13 +96,13 @@ func outputTable(images []db.Image) error {
 		return s
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "REGISTRY\tREPOSITORY\tTAG\tOS\tARCH\tDIGEST\tSTATE\tUPDATED")
+	_, _ = fmt.Fprintln(w, "REGISTRY\tREPOSITORY\tTAG\tOS\tARCH\tDIGEST\tSTATE\tUPDATED")
 	for _, img := range images {
 		digest := img.Digest
 		if len(digest) > 19 {
 			digest = digest[:19] // "sha256:" + 12 hex chars
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			img.RegistryURL,
 			img.Repository,
 			img.TagName,

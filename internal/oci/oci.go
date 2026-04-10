@@ -122,7 +122,7 @@ func (c *Client) fetchContent(url string, authCfg *authn.AuthConfig, registry, r
 	if err != nil {
 		return nil, "", "", fmt.Errorf("GET %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Handle Bearer challenge (keychain path only — passthrough header callers get
 	// a propagated error on 401).
@@ -138,7 +138,7 @@ func (c *Client) fetchContent(url string, authCfg *authn.AuthConfig, registry, r
 		if err != nil {
 			return nil, "", "", fmt.Errorf("GET %s (authed): %w", url, err)
 		}
-		defer resp2.Body.Close()
+		defer func() { _ = resp2.Body.Close() }()
 		return readResponse(resp2)
 	}
 
@@ -199,7 +199,7 @@ func fetchBearerToken(challenge string, authCfg *authn.AuthConfig) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("token request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))

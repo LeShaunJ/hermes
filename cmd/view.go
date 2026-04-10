@@ -62,26 +62,26 @@ func runView(_ *cobra.Command, args []string) error {
 	line := strings.Repeat("─", 72)
 
 	for _, img := range images {
-		fmt.Fprintln(w, line)
-		fmt.Fprintf(w, "%-16s %s/%s:%s\n", "Image:", img.RegistryURL, img.Repository, img.TagName)
-		fmt.Fprintf(w, "%-16s %s/%s\n", "Platform:", img.OS, img.Arch)
-		fmt.Fprintf(w, "%-16s %s\n", "State:", img.State)
+		_, _ = fmt.Fprintln(w, line)
+		_, _ = fmt.Fprintf(w, "%-16s %s/%s:%s\n", "Image:", img.RegistryURL, img.Repository, img.TagName)
+		_, _ = fmt.Fprintf(w, "%-16s %s/%s\n", "Platform:", img.OS, img.Arch)
+		_, _ = fmt.Fprintf(w, "%-16s %s\n", "State:", img.State)
 		if img.Digest != "" {
-			fmt.Fprintf(w, "%-16s %s\n", "Digest:", img.Digest)
+			_, _ = fmt.Fprintf(w, "%-16s %s\n", "Digest:", img.Digest)
 		}
 		if img.CacheRegistry != "" {
-			fmt.Fprintf(w, "%-16s %s\n", "Cache registry:", img.CacheRegistry)
+			_, _ = fmt.Fprintf(w, "%-16s %s\n", "Cache registry:", img.CacheRegistry)
 		}
-		fmt.Fprintf(w, "%-16s %s\n", "Created:", img.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
-		fmt.Fprintf(w, "%-16s %s\n", "Updated:", img.UpdatedAt.Format("2006-01-02 15:04:05 UTC"))
+		_, _ = fmt.Fprintf(w, "%-16s %s\n", "Created:", img.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+		_, _ = fmt.Fprintf(w, "%-16s %s\n", "Updated:", img.UpdatedAt.Format("2006-01-02 15:04:05 UTC"))
 
 		if len(img.ScanReport) > 0 && string(img.ScanReport) != "null" {
-			fmt.Fprintln(w, line)
-			fmt.Fprintln(w, "Vulnerability Summary:")
+			_, _ = fmt.Fprintln(w, line)
+			_, _ = fmt.Fprintln(w, "Vulnerability Summary:")
 			printVulnSummary(w, img.ScanReport)
 
-			fmt.Fprintln(w, line)
-			fmt.Fprintln(w, "Scan Report:")
+			_, _ = fmt.Fprintln(w, line)
+			_, _ = fmt.Fprintln(w, "Scan Report:")
 			_ = printJSON(img.ScanReport)
 		}
 	}
@@ -99,7 +99,7 @@ func printVulnSummary(w *os.File, raw json.RawMessage) {
 		} `json:"Results"`
 	}
 	if err := json.Unmarshal(raw, &report); err != nil {
-		fmt.Fprintln(w, "  (could not parse scan report)")
+		_, _ = fmt.Fprintln(w, "  (could not parse scan report)")
 		return
 	}
 
@@ -116,14 +116,14 @@ func printVulnSummary(w *os.File, raw json.RawMessage) {
 		total += n
 	}
 	if total == 0 {
-		fmt.Fprintln(w, "  No vulnerabilities found.")
+		_, _ = fmt.Fprintln(w, "  No vulnerabilities found.")
 		return
 	}
 
 	for _, sev := range order {
 		if n := counts[sev]; n > 0 {
-			fmt.Fprintf(w, "  %-10s %d\n", sev+":", n)
+			_, _ = fmt.Fprintf(w, "  %-10s %d\n", sev+":", n)
 		}
 	}
-	fmt.Fprintf(w, "  %-10s %d\n", "TOTAL:", total)
+	_, _ = fmt.Fprintf(w, "  %-10s %d\n", "TOTAL:", total)
 }

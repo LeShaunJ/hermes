@@ -53,7 +53,7 @@ func Scan(imageRef string, cfg config.TrivyConfig) (*ScanResult, error) {
 
 	out, err := io.ReadAll(stdout)
 	if err != nil {
-		return nil, fmt.Errorf("Error reading stream: %v\n", err)
+		return nil, fmt.Errorf("read stdout: %w", err)
 	}
 
 	if err := cmd.Wait(); err != nil {

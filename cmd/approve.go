@@ -17,7 +17,6 @@ import (
 
 var (
 	approveCache    string
-	approveCacheSet bool
 	approvePlatform string
 )
 

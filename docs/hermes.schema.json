@@ -12,10 +12,20 @@
       "additionalProperties": false,
       "properties": {
         "addr": {
-          "description": "TCP address the API server listens on (e.g. ':8080', '0.0.0.0:8080').",
+          "description": "TCP address the gateway server listens on (e.g. ':8080', '0.0.0.0:8080').",
           "type": "string",
           "default": ":8080",
           "examples": [":8080", "0.0.0.0:9090"]
+        },
+        "url": {
+          "description": "Public base URL of the hermes gateway, used to rewrite WWW-Authenticate realm headers through /ident/. Defaults to http://<hostname>:<port> when not set.",
+          "type": "string",
+          "examples": ["http://hermes.internal:8080", "https://gateway.example.com"]
+        },
+        "redirect": {
+          "description": "When true, hermes sends HTTP 307 redirects for non-manifest upstream paths (blobs, tag lists, etc.) instead of reverse-proxying them. Approved manifest requests are always proxied.",
+          "type": "boolean",
+          "default": false
         }
       }
     },

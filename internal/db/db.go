@@ -157,7 +157,7 @@ func Open(dsn string) (*DB, error) {
 
 	d := &DB{db: sqlDB}
 	if err := d.migrate(); err != nil {
-		sqlDB.Close()
+		_ = sqlDB.Close()
 		return nil, fmt.Errorf("db: migrate: %w", err)
 	}
 	return d, nil
@@ -165,7 +165,7 @@ func Open(dsn string) (*DB, error) {
 
 // Close shuts down the connection pool.
 func (d *DB) Close() {
-	d.db.Close()
+	_ = d.db.Close()
 }
 
 // migrate creates tables if they don't already exist.
@@ -360,7 +360,7 @@ func (d *DB) imagesByTagID(tagID int64) ([]*Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	return scanImageRows(rows)
 }
 
@@ -702,7 +702,7 @@ func (d *DB) GetByRef(ref ImageRef) ([]*Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	return scanImageRows(rows)
 }
 
@@ -848,7 +848,7 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	ptrs, err := scanImageRows(rows)
 	if err != nil {
