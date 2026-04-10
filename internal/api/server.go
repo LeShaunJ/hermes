@@ -174,10 +174,6 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 		"latency_ms": time.Since(start).Milliseconds(),
 	})
 
-	// Build WWW-Authenticate challenge by probing the upstream registry.
-	if wwwAuth := s.challengeRetrieve(p.Registry, ""); wwwAuth != "" {
-		w.Header().Set("WWW-Authenticate", s.rewriteRealm(wwwAuth))
-	}
 	s.writeOCIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "approval required")
 }
 
@@ -197,23 +193,6 @@ func (s *Server) challengeRetrieve(registry string, path string) string {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	return resp.Header.Get("WWW-Authenticate")
-}
-
-// rewriteRealm replaces realm="https?://host/path" in a WWW-Authenticate
-// header so the Docker client routes token requests through /ident/.
-var realmRe = regexp.MustCompile(`realm="(https?://[^"]+)"`)
-
-func (s *Server) rewriteRealm(wwwAuth string) string {
-	return realmRe.ReplaceAllStringFunc(wwwAuth, func(match string) string {
-		sub := realmRe.FindStringSubmatch(match)
-		if len(sub) < 2 {
-			return match
-		}
-		origURL := sub[1]
-		// Strip scheme, build /ident/<host+path> through server URL.
-		noScheme := strings.TrimPrefix(strings.TrimPrefix(origURL, "https://"), "http://")
-		return fmt.Sprintf(`realm="%s/ident/%s"`, s.cfg.Server.URL, noScheme)
-	})
 }
 
 // ── identity proxy ────────────────────────────────────────────────────────────
@@ -335,9 +314,6 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		resp.Header.Set("Docker-Distribution-API-Version", "registry/2.0")
-		if wwwAuth := resp.Header.Get("WWW-Authenticate"); wwwAuth != "" {
-			resp.Header.Set("WWW-Authenticate", s.rewriteRealm(wwwAuth))
-		}
 		return nil
 	}
 	proxy.ServeHTTP(w, r)

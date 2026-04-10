@@ -120,43 +120,6 @@ func TestParseV2Path(t *testing.T) {
 	}
 }
 
-// ── rewriteRealm ──────────────────────────────────────────────────────────────
-
-func TestRewriteRealm(t *testing.T) {
-	s := newTestServer("http://hermes.internal:8080", false)
-
-	tests := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{
-			name:  "standard Bearer challenge",
-			input: `Bearer realm="https://auth.example.com/token",service="registry.example.com",scope="repository:myrepo:pull"`,
-			want:  `Bearer realm="http://hermes.internal:8080/ident/auth.example.com/token",service="registry.example.com",scope="repository:myrepo:pull"`,
-		},
-		{
-			name:  "http realm",
-			input: `Bearer realm="http://auth.example.com/oauth/token",service="example"`,
-			want:  `Bearer realm="http://hermes.internal:8080/ident/auth.example.com/oauth/token",service="example"`,
-		},
-		{
-			name:  "no realm",
-			input: `Basic charset="utf-8"`,
-			want:  `Basic charset="utf-8"`,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := s.rewriteRealm(tc.input)
-			if got != tc.want {
-				t.Errorf("rewriteRealm(%q)\n got  %q\n want %q", tc.input, got, tc.want)
-			}
-		})
-	}
-}
-
 // ── writeOCIError ─────────────────────────────────────────────────────────────
 
 func TestWriteOCIError(t *testing.T) {
