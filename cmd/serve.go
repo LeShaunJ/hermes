@@ -14,31 +14,8 @@ var serveAddr string
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start the REST API server",
-	Long: `serve starts the hermes HTTP server which acts as nginx auth_request
-middleware for OCI Distribution registry proxies.
-
-The server exposes:
-  GET /validate/v2/<registry>/<repo>/manifests/<tag>
-      Authorization check.  Returns 200 + X-HERMES-IMAGE-URI if approved.
-      Queues unknown images for later CLI review.
-
-  GET /healthz
-      Liveness probe.
-
-nginx configuration example (see dev/nginx.conf for a full example):
-
-  location ~ ^(?<path>/v2/.+)$ {
-      auth_request     /hermes-validate/$path;
-      auth_request_set $hermes_uri $upstream_http_x_hermes_image_uri;
-      proxy_pass       https://$hermes_uri;
-  }
-
-  location /hermes-validate/ {
-      internal;
-      proxy_pass              http://hermes:8080/validate/;
-      proxy_pass_request_body off;
-      proxy_set_header        Content-Length "";
-  }`,
+	Long: `serve starts the hermes HTTP server which acts as an
+authoritative gateway for OCI Distribution registries.`,
 	Args: cobra.NoArgs,
 	RunE: runServe,
 }

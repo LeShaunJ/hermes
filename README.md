@@ -36,28 +36,68 @@ before forwarding client requests to upstream registries.
 ## How it works
 
 ```mermaid
-flowchart TD
-    A[docker pull] --> B["hermes\n/v2/&lt;registry&gt;/…"]
-    B --> C{image state?}
-    C -- approved --> D[proxy / redirect]
-    D --> E[upstream registry]
-    C -- rejected --> F[403 DENIED]
-    C -- unknown --> G[401 UNAUTHORIZED]
-    G --> H[stub-register tag in DB]
-    G --> I["WWW-Authenticate realm\nrewritten through /ident/\nfor token fetch"]
+sequenceDiagram
+  participant Runtime as OCI Runtime
+  participant Hermes as Hermes Proxy
+  participant DB as Hermes DB
+  participant Upstream as Upstream Registry
+
+  Note over Runtime, Upstream: 1. Initial Connection & Auth
+  Runtime->>Hermes: GET /v2/
+  Hermes-->>Runtime: 401 Unauthorized (Www-Authenticate)
+  Runtime->>Hermes: Request Token
+  Hermes->>Upstream: Parse and Proxy Token Req
+  Upstream-->>Hermes: Token
+  Hermes-->>Runtime: Token
+
+  Note over Runtime, Upstream: 2. Manifest Request
+  Runtime->>Hermes: GET /v2/<registry>/<repo>/manifests/<ref>
+  Hermes->>DB: Check State (<registry>/<repo>:<ref>)
+
+  alt State: Unknown
+    DB-->>Hermes: Not Found
+    Hermes->>DB: Add tag to DB for verification
+    Hermes-->>Runtime: 401 Unauthorized (Action Required)
+    Note over Hermes, DB: Operator: hermes approve <image>
+    Note over Runtime, Hermes: Sequence restarts from Step 1
+
+  else State: Rejected
+    DB-->>Hermes: Rejected
+    Hermes-->>Runtime: 403 Forbidden
+    Note right of Hermes: Stop Sequence
+
+  else State: Approved
+    DB-->>Hermes: Approved
+    Hermes->>Upstream: Proxy/Redirect GET <registry>/v2/<repo>/manifests/<ref>
+    Upstream-->>Runtime: Manifest JSON
+
+    Note over Runtime, Upstream: 3. Blob Download
+    Runtime->>Hermes: GET /v2/<registry>/<repo>/blobs/<digest>
+    Hermes->>Upstream: Forward Request <registry>/v2/<repo>/blobs/<ref>
+    Upstream-->>Runtime: Blob Data
+    Note right of Hermes: Stop Sequence
+  end
 ```
 
-1. A container runtime targets hermes as its registry endpoint.
-2. hermes receives the OCI Distribution request.
-3. For manifest requests, hermes checks PostgreSQL:
-   - **Approved** → proxies or redirects the request to the upstream registry.
-   - **Rejected** → returns `403 DENIED`.
-   - **Unknown / not yet approved** → stub-registers the tag and returns
-     `401 UNAUTHORIZED` with a `WWW-Authenticate` challenge routed through
-     the `/ident/` token proxy.
-4. For non-manifest paths (blobs, tag lists, etc.), requests are forwarded
-   unconditionally to the upstream registry.
-5. An operator uses the CLI to `scan`, `approve`, or `reject` queued images.
+1. OCI runtime targets `<hermes>` as its registry endpoint, and `<registry>/<repo>` as the repository:
+   ```bash
+   #                <hermes>   <registry>   <repo>      <ref>
+   #           ┌───────┴───────┐ ┌──┴──┐ ┌─────┴─────┐ ┌──┴──┐
+   podman pull hermes.domain.tld/quay.io/cilium/cilium:v1.18.6
+   ```
+2. `hermes` receives OCI Distribution `/v2/` root request:
+   1. `hermes` responds `401 UNAUTHORIZED` with `Www-Authenticate` challenge.
+   2. OCI runtime requests token.
+   3. `hermes` parses request, proxies to and from `<registry>`.
+3. OCI runtime requests `/v2/<registry>/<repo>/manifest/<ref>`:
+4. `hermes` receives mainfest request, checks DB:
+   - **Unknown** → stub-registers the tag for approval and returns `401 UNAUTHORIZED`.
+     1. An operator uses the CLI to `scan`, `approve`, or `reject` queued images.
+     2. Once `approved`, the image can be pulled.
+   - **Approved** → proxies or redirects the request to the upstream registry:
+     1. OCI runtime requests `/v2/<registry>/<repo>/blobs/<ref>`.
+     2. `hermes` forwards request(s) to the upstream registry (stop sequence).
+   - **Rejected** → returns `403 DENIED` (stop sequence).
 
 ---
 
@@ -65,25 +105,45 @@ flowchart TD
 
 | State       | Group      | Description |
 |:-----------:|:----------:|:------------|
-| `queued`    | `pending`  | Metadata saved; not yet scanned. |
+| `queued`    | `pending`  | Metadata saved; no scan report. |
 | `scanned`   | `pending`  | Scan performed and stored. |
-| `approved`  | `verified` | Operator approved after reviewing the scan. |
-| `rescinded` | `pending`  | Approval withdrawn; effectively back to scanned. |
-| `rejected`  | `verified` | Operator deemed the image unusable. |
+| `rejected`  | `verified` | Operator deemed the image unsafe for use. |
+| `approved`  | `verified` | Operator reviewed and approved the scan, imaged optionally cached. |
+| `rescinded` | `pending`  | Operator withdrew for review; effectively back to `scanned`. |
+| `voided`    | `pending`  | Image not cached, no longer exists upstream; effectively back to `queued`. |
 | `errored`   |            | An error occurred during scanning or cache push. |
 
 State transitions:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> queued
-    queued --> scanned : scan
-    scanned --> approved : approve
-    approved --> rescinded : rescind
-    rescinded --> scanned : scan
-    queued --> rejected : reject
-    scanned --> rejected : reject
-    approved --> rejected : reject
+  direction LR;
+
+  [*] --> queued
+     queued --> scanned : scan
+     queued --> rejected : deny
+     scanned --> approved : review
+     scanned --> rejected : deny
+     rescinded --> approved : re-review
+     rescinded --> rejected : deny
+     approved --> rescinded : undo
+     approved --> voided: invalidate
+     approved --> rejected: deny
+     voided --> rejected : deny
+     voided --> scanned : rescan
+     rejected --> scanned : rescan
+
+  classDef queued fill:#277da1
+  classDef unverified fill:#f8961e
+  classDef rejected fill:#f94144
+  classDef approved fill:#43aa8b
+
+  class queued queued
+  class scanned unverified
+  class rejected rejected
+  class approved approved
+  class rescinded unverified
+  class voided unverified
 ```
 
 ---
@@ -109,7 +169,7 @@ podman build -t hermes -f Containerfile .
 docker build -t hermes -f Containerfile .
 ```
 
-Run (mounting the config and Docker socket for trivy):
+Run (_mounting the config and Docker socket for `trivy`_):
 
 ```bash
 docker run -d \
@@ -124,7 +184,7 @@ docker run -d \
 
 ## Configuration
 
-hermes reads `/etc/hermes.yaml` on startup (override with `--config`).
+hermes reads `/etc/hermes.yaml` on startup (_override with `--config`_).
 
 ```yaml
 server:
@@ -180,11 +240,11 @@ scan, saves the report, and prints the JSON to stdout.
 If the image already has a scan report, the existing report is printed unless
 `--force` is given.
 
-```bash
-hermes scan registry.example.com/myapp:v1.2.3
-hermes scan --force registry.example.com/myapp:v1.2.3
-hermes scan --platform linux/amd64 registry.example.com/myapp:v1.2.3
-```
+> ```bash
+> hermes scan registry.example.com/myapp:v1.2.3
+> hermes scan --force registry.example.com/myapp:v1.2.3
+> hermes scan --platform linux/amd64 registry.example.com/myapp:v1.2.3
+> ```
 
 ### approve
 
@@ -198,45 +258,47 @@ Shows the trivy scan report (scanning first if needed) and prompts:
 Approve this image? [YES / NO / REJECT] (default: NO):
 ```
 
-- **YES** — sets state to `approved`.
+- **YES** — sets state to `approved`; exits 0.
 - **NO** — no change; exits 0.
-- **REJECT** — sets state to `rejected`; exits non-zero.
+- **REJECT** — sets state to `rejected`; exits 0.
 
 If `--cache` is provided, the image is pushed to `URL` (or `cache_url` from the
 config if no URL is given) upon `YES`. A successful push records the cache
 registry in the database. A failed push sets the state to `errored`.
 
-```bash
-hermes approve registry.example.com/myapp:v1.2.3
-hermes approve --cache registry.example.com/myapp:v1.2.3
-hermes approve --cache cache.internal.example.com registry.example.com/myapp:v1.2.3
-```
+> ```bash
+> hermes approve registry.example.com/myapp:v1.2.3
+> hermes approve --cache registry.example.com/myapp:v1.2.3
+> hermes approve --cache cache.internal.example.com registry.example.com/myapp:v1.2.3
+> ```
 
 ### rescind
 
 ```
-hermes rescind IMAGE
+hermes rescind [--platform OS/ARCH] IMAGE
 ```
 
 Sets an `approved` image to `rescinded`, immediately blocking it from passing
 the gateway check. The image can be re-approved with `hermes approve`.
 
-```bash
-hermes rescind registry.example.com/myapp:v1.2.3
-```
+> ```bash
+> hermes rescind registry.example.com/myapp:v1.2.3
+> hermes rescind --platform linux/amd64 registry.example.com/myapp:v1.2.3
+> ```
 
 ### reject
 
 ```
-hermes reject IMAGE
+hermes reject [--platform OS/ARCH] IMAGE
 ```
 
 Prompts for confirmation then sets the image to `rejected`. Rejected images
 return `403 DENIED` at the gateway.
 
-```bash
-hermes reject registry.example.com/myapp:v1.2.3
-```
+> ```bash
+> hermes reject registry.example.com/myapp:v1.2.3
+> hermes reject--platform linux/amd64 registry.example.com/myapp:v1.2.3
+> ```
 
 ### view
 
@@ -247,15 +309,15 @@ hermes view [--platform OS/ARCH] IMAGE
 Prints all stored information for an image — state, digest, cache registry,
 timestamps, a vulnerability summary, and the full scan report.
 
-```bash
-hermes view registry.example.com/myapp:v1.2.3
-hermes view --platform linux/amd64 registry.example.com/myapp:v1.2.3
-```
+> ```bash
+> hermes view registry.example.com/myapp:v1.2.3
+> hermes view --platform linux/amd64 registry.example.com/myapp:v1.2.3
+> ```
 
 ### list
 
 ```
-hermes list [--state STATE[,...]] [--json] [REF ...]
+hermes list [--platform OS/ARCH] [--state STATE[,...]] [--json] [REF ...]
 ```
 
 Lists tracked images in a table. `--state` accepts individual states
@@ -266,12 +328,13 @@ as repeated flags. `REF` arguments filter by `[namespace/]name[:tag]`.
 Images that have been stub-registered (seen at the gateway but not yet scanned)
 show `-` for OS, arch, and digest.
 
-```bash
-hermes list
-hermes list --state approved
-hermes list --state pending,verified --json
-hermes list myapp:v1.2.3 otherapp
-```
+> ```bash
+> hermes list
+> hermes list --state approved
+> hermes list --platform linux/amd64 --state pending
+> hermes list --state verified --json
+> hermes list myapp:v1.2.3 otherapp
+> ```
 
 ### report
 
@@ -283,25 +346,36 @@ Retrieves the stored trivy JSON report and converts it using `trivy convert`.
 Supported formats: `table`, `json`, `sarif`, `cyclonedx`, `spdx`, `spdx-json`,
 `github`, `cosign-vuln`. Output goes to stdout or `FILE`.
 
-```bash
-hermes report registry.example.com/myapp:v1.2.3
-hermes report --format sarif --output report.sarif registry.example.com/myapp:v1.2.3
-hermes report --format cyclonedx registry.example.com/myapp:v1.2.3 | jq .
-```
+> ```bash
+> hermes report registry.example.com/myapp:v1.2.3
+> hermes report --format sarif --output report.sarif registry.example.com/myapp:v1.2.3
+> hermes report --format cyclonedx registry.example.com/myapp:v1.2.3 | jq .
+> ```
 
 ### serve
 
 ```
-hermes serve [--addr ADDR]
+hermes serve [--config PATH]
 ```
 
-Starts the OCI gateway server (default address from config, overridden by
-`--addr`).
+Starts the OCI gateway server.
 
-```bash
-hermes serve
-hermes serve --addr 0.0.0.0:9090
+> ```bash
+> hermes serve
+> hermes serve --config /path/to/hermes.yaml
+> ```
+
+### health
+
 ```
+hermes health
+```
+
+CLI version of the [`GET /healthz`](#get-healthz) endpoint.
+
+> [!NOTE]
+> This mostly exists to function as the `CMD` for `HEALTHCHECK` in the `Containerfile`, 
+> as it would otherwise be unsure of what [`server.addr`](#configuration) is.
 
 ---
 
@@ -313,9 +387,9 @@ container runtime or mirror tool to use hermes as its registry endpoint.
 ### `GET /v2/`
 
 Returns `401 UNAUTHORIZED` with a `WWW-Authenticate: Bearer` challenge pointing
-to `/ident/` and sets `Docker-Distribution-API-Version: registry/2.0`.
+to [`/ident`](#get-ident).
 
-This is the standard OCI v2 capability ping — all clients hit this first to
+This is the standard OCI v2 capability ping; all clients hit this first to
 negotiate auth.
 
 ### `GET /v2/<registry>/…`
@@ -326,9 +400,9 @@ All OCI Distribution sub-paths rooted at `/v2/<registry>/` are handled:
 
 | Image state | Response |
 |-------------|----------|
-| `approved`  | `200` proxied/redirected from upstream |
+| `approved`  | `200 OK` proxied/redirected from upstream |
 | `rejected`  | `403 DENIED` (CNCF JSON error body) |
-| unknown / not approved | `401 UNAUTHORIZED` + `WWW-Authenticate` challenge; tag stub-registered |
+| `pending`   | `401 UNAUTHORIZED`; tag stub-registered |
 
 **Non-manifest paths** (blobs, tag lists, uploads, etc.):
 
@@ -337,12 +411,16 @@ Forwarded unconditionally to `https://<registry>/v2/<repo>/…` via proxy or
 
 ### `GET /ident`
 
-Token-acquisition proxy. The Docker client sends its bearer-token request here;
-hermes proxies it verbatim to `https://<registry>/…`.
+Token-acquisition proxy. The OCI client sends its bearer-token request as:
 
-The realm URL in upstream `WWW-Authenticate` headers is automatically rewritten
-to route through `/ident/` so clients never need direct access to the upstream
-auth endpoint.
+```
+GET /ident?scope=repository:<registry>/<repo>:pull
+```
+
+hermes will:
+- Extract the `<registry>`, `<repo>` from the request.
+- Extract the genuine `<realm>`, `<service>` and `<scope>` from `GET <registry>/v2/<repo>/tags/list`.
+- Proxy to `GET <realm>?service=<service>&scope=<scope>`.
 
 ### `GET /healthz`
 
