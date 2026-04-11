@@ -22,7 +22,7 @@ const (
 	StateApproved  State = "approved"
 	StateRescinded State = "rescinded"
 	StateRejected  State = "rejected"
-	StateError     State = "error"
+	StateErrored   State = "errored"
 )
 
 // Group categorises states into coarser buckets for filtering.
@@ -49,7 +49,7 @@ func GroupOf(s State) Group {
 // Returns the matched states (multiple for a group), or an error.
 func ParseStateOrGroup(s string) ([]State, error) {
 	switch State(s) {
-	case StateQueued, StateScanned, StateApproved, StateRescinded, StateRejected, StateError:
+	case StateQueued, StateScanned, StateApproved, StateRescinded, StateRejected, StateErrored:
 		return []State{State(s)}, nil
 	}
 	switch Group(s) {
@@ -171,24 +171,6 @@ func (d *DB) Close() {
 // migrate creates tables if they don't already exist.
 func (d *DB) migrate() error {
 	stmts := []string{
-		// Drop v1 schema tables only when they exist with the old column layout
-		// (no 'tag' FK column on images).  This guard runs on every startup but
-		// is a no-op once the schema has been migrated or freshly created.
-		`DO $$ BEGIN
-			IF EXISTS (
-				SELECT 1 FROM information_schema.tables
-				 WHERE table_schema = 'public' AND table_name = 'images'
-			) AND NOT EXISTS (
-				SELECT 1 FROM information_schema.columns
-				 WHERE table_schema = 'public'
-				   AND table_name   = 'images'
-				   AND column_name  = 'tag'
-			) THEN
-				DROP TABLE IF EXISTS events CASCADE;
-				DROP TABLE IF EXISTS images CASCADE;
-			END IF;
-		END $$`,
-
 		// registries — unique registry base URLs
 		`CREATE TABLE IF NOT EXISTS registries (
 			id         BIGSERIAL PRIMARY KEY,
@@ -201,7 +183,7 @@ func (d *DB) migrate() error {
 		// state enum (PostgreSQL 16 supports IF NOT EXISTS on CREATE TYPE)
 		`DO $$ BEGIN
 			CREATE TYPE state AS ENUM
-				('queued','scanned','approved','rescinded','rejected','error');
+				('queued','scanned','approved','rescinded','rejected','errored');
 		EXCEPTION WHEN duplicate_object THEN NULL;
 		END $$`,
 
@@ -606,7 +588,7 @@ func (d *DB) Reject(imageID int64) error {
 
 // SetError sets a platform image's state to error.
 func (d *DB) SetError(imageID int64) error {
-	return d.setImageState(imageID, StateError)
+	return d.setImageState(imageID, StateErrored)
 }
 
 func (d *DB) setImageState(imageID int64, state State) error {

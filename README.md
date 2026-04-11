@@ -70,7 +70,7 @@ flowchart TD
 | `approved`  | `verified` | Operator approved after reviewing the scan. |
 | `rescinded` | `pending`  | Approval withdrawn; effectively back to scanned. |
 | `rejected`  | `verified` | Operator deemed the image unusable. |
-| `error`     |            | An error occurred during scanning or cache push. |
+| `errored`   |            | An error occurred during scanning or cache push. |
 
 State transitions:
 
@@ -204,7 +204,7 @@ Approve this image? [YES / NO / REJECT] (default: NO):
 
 If `--cache` is provided, the image is pushed to `URL` (or `cache_url` from the
 config if no URL is given) upon `YES`. A successful push records the cache
-registry in the database. A failed push sets the state to `error`.
+registry in the database. A failed push sets the state to `errored`.
 
 ```bash
 hermes approve registry.example.com/myapp:v1.2.3
@@ -259,7 +259,7 @@ hermes list [--state STATE[,...]] [--json] [REF ...]
 ```
 
 Lists tracked images in a table. `--state` accepts individual states
-(`queued`, `scanned`, `approved`, `rescinded`, `rejected`, `error`) or group
+(`queued`, `scanned`, `approved`, `rescinded`, `rejected`, `errored`) or group
 names (`pending`, `verified`). Multiple values can be comma-separated or given
 as repeated flags. `REF` arguments filter by `[namespace/]name[:tag]`.
 

@@ -36,7 +36,7 @@ If the image is multi-platform and --platform is omitted, you will be prompted.
 If --cache is provided the image is pushed to the specified URL upon YES
 (or to cache_url in hermes.yaml if the flag is given with no value).
 A successful push records the cache registry in the database.
-A failed push sets state to 'error' and exits non-zero.
+A failed push sets state to 'errored' and exits non-zero.
 
 Examples:
   hermes approve registry.example.com/myapp:v1.2.3

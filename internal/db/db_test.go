@@ -198,7 +198,7 @@ func TestReject(t *testing.T) {
 func TestSetError(t *testing.T) {
 	d, mock := newMockDB(t)
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET state`)).
-		WithArgs("error", int64(3)).
+		WithArgs("errored", int64(3)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	if err := d.SetError(3); err != nil {
 		t.Fatalf("SetError: %v", err)
@@ -788,7 +788,7 @@ func TestGroupOf(t *testing.T) {
 		{StateRescinded, GroupPending},
 		{StateApproved, GroupVerified},
 		{StateRejected, GroupVerified},
-		{StateError, ""},
+		{StateErrored, ""},
 	}
 	for _, tc := range tests {
 		got := GroupOf(tc.state)
@@ -811,7 +811,7 @@ func TestParseStateOrGroup(t *testing.T) {
 		{"approved", []State{StateApproved}, false},
 		{"rescinded", []State{StateRescinded}, false},
 		{"rejected", []State{StateRejected}, false},
-		{"error", []State{StateError}, false},
+		{"errored", []State{StateErrored}, false},
 		{"pending", []State{StateQueued, StateScanned, StateRescinded}, false},
 		{"verified", []State{StateApproved, StateRejected}, false},
 		{"unknown", nil, true},
