@@ -56,10 +56,20 @@ sequenceDiagram
 
   alt State: Unknown
     DB-->>Hermes: Not Found
-    Hermes->>DB: Add tag to DB for verification
-    Hermes-->>Runtime: 401 Unauthorized (Action Required)
-    Note over Hermes, DB: Operator: hermes approve <image>
-    Note over Runtime, Hermes: Sequence restarts from Step 1
+    Hermes->>Upstream: HEAD <registry>/v2/<repo>/manifests/<tag>
+    Upstream-->>Hermes: Docker-Content-Digest: <digest>
+    Hermes->>DB: Any approved image at <digest>?
+    alt Alternate-tag adoption
+      DB-->>Hermes: Yes — link new tag to existing image(s)
+      Hermes->>Upstream: Proxy/Redirect GET <registry>/v2/<repo>/manifests/<digest>
+      Upstream-->>Runtime: Manifest JSON
+    else No match
+      DB-->>Hermes: No
+      Hermes->>DB: Stub-register tag for verification
+      Hermes-->>Runtime: 401 Unauthorized (Action Required)
+      Note over Hermes, DB: Operator: hermes approve <image>
+      Note over Runtime, Hermes: Sequence restarts from Step 1
+    end
 
   else State: Rejected
     DB-->>Hermes: Rejected
@@ -73,8 +83,15 @@ sequenceDiagram
 
     Note over Runtime, Upstream: 3. Blob Download
     Runtime->>Hermes: GET /v2/<registry>/<repo>/blobs/<digest>
-    Hermes->>Upstream: Forward Request <registry>/v2/<repo>/blobs/<ref>
-    Upstream-->>Runtime: Blob Data
+    Hermes->>DB: Is <digest> a config or layer of an approved image?
+    alt Authorized
+      DB-->>Hermes: Yes
+      Hermes->>Upstream: Proxy/Redirect GET <registry>/v2/<repo>/blobs/<digest>
+      Upstream-->>Runtime: Blob Data
+    else Unauthorized
+      DB-->>Hermes: No
+      Hermes-->>Runtime: 401 Unauthorized
+    end
     Note right of Hermes: Stop Sequence
   end
 ```
@@ -90,13 +107,13 @@ sequenceDiagram
    2. OCI runtime requests token.
    3. `hermes` parses request, proxies to and from `<registry>`.
 3. OCI runtime requests `/v2/<registry>/<repo>/manifest/<ref>`:
-4. `hermes` receives mainfest request, checks DB:
-   - **Unknown** → stub-registers the tag for approval and returns `401 UNAUTHORIZED`.
+4. `hermes` receives manifest request, checks DB:
+   - **Unknown** → probes the upstream for the tag's content digest. If that digest is already linked to an approved image in the same repository (an "alternate tag"), the new tag is registered, linked to the existing image rows, and the request is forwarded. Otherwise the tag is stub-registered for review and `401 UNAUTHORIZED` is returned.
      1. An operator uses the CLI to `scan`, `approve`, or `reject` queued images.
      2. Once `approved`, the image can be pulled.
    - **Approved** → proxies or redirects the request to the upstream registry:
-     1. OCI runtime requests `/v2/<registry>/<repo>/blobs/<ref>`.
-     2. `hermes` forwards request(s) to the upstream registry (stop sequence).
+     1. OCI runtime requests `/v2/<registry>/<repo>/blobs/<digest>`.
+     2. `hermes` checks the database — only blobs that appear as the `config` or one of the `layers[]` of an approved image's manifest are forwarded; everything else returns `401 UNAUTHORIZED`.
    - **Rejected** → returns `403 DENIED` (stop sequence).
 
 ---
@@ -190,7 +207,7 @@ hermes reads `/etc/hermes.yaml` on startup (_override with `--config`_).
 server:
   addr: ":8080"          # listen address
   url:  ""               # public base URL (default: http://<hostname>:<port>)
-  redirect: false        # 307-redirect blobs instead of proxying
+  redirect: false        # 307-redirect upstream traffic instead of proxying
 
 db:
   host:     localhost
@@ -212,10 +229,10 @@ cache_url: ""            # default registry for `hermes approve --cache`
 clients obtain bearer tokens through the `/ident/` proxy. It defaults to
 `http://<hostname>:<port>` if not explicitly set.
 
-`server.redirect` controls how non-manifest upstream paths (blobs, tag lists)
-are forwarded. When `false` (default), hermes reverse-proxies the request.
-When `true`, hermes sends an HTTP 307 redirect to the upstream URL — useful when
-clients have direct access to the upstream registry.
+`server.redirect` controls how authorized upstream traffic (manifests, blobs,
+tag lists) is forwarded. When `false` (default), hermes reverse-proxies the
+request. When `true`, hermes sends an HTTP 307 redirect to the upstream URL —
+useful when clients have direct access to the upstream registry.
 
 A JSON Schema is provided at [`docs/hermes.schema.json`](docs/hermes.schema.json).
 
@@ -404,7 +421,26 @@ All OCI Distribution sub-paths rooted at `/v2/<registry>/` are handled:
 | `rejected`  | `403 DENIED` (CNCF JSON error body) |
 | `pending`   | `401 UNAUTHORIZED`; tag stub-registered |
 
-**Non-manifest paths** (blobs, tag lists, uploads, etc.):
+When `<ref>` is a digest (`sha256:…`), the lookup short-circuits any
+alternate-tag handling: a request for an approved digest is forwarded
+immediately, regardless of which tag the client may have used previously.
+
+When `<ref>` is a tag name and the tag is unknown, hermes probes the upstream
+for the tag's `Docker-Content-Digest`.  If that digest is already linked to an
+**approved** image in the same repository (an "alternate tag" — typical for
+floating tags such as `latest`), the new tag is registered, linked to the
+existing image rows, and the request is forwarded.  Otherwise the tag is
+stub-registered for operator review and `401 UNAUTHORIZED` is returned.
+
+**Blob paths** (`/v2/<registry>/<repo>/blobs/<digest>`):
+
+Blob downloads are gatekept by the database — they are forwarded **only** when
+`<digest>` appears as the `config` digest or one of the `layers[].digest`
+values of an `approved` image's manifest in the same repository.  Unauthorized
+blobs return `401 UNAUTHORIZED`.  This stops clients from streaming arbitrary
+content through the gateway by guessing or replaying digests.
+
+**Other paths** (tag lists, blob uploads, catalog, etc.):
 
 Forwarded unconditionally to `https://<registry>/v2/<repo>/…` via proxy or
 307 redirect (controlled by `server.redirect`).
@@ -461,35 +497,55 @@ hermes uses PostgreSQL and creates its tables automatically on first run via
 
 ### `tags`
 
+One row per `(registry, repository, name)` triple.  A tag with no rows in
+[`tag_images`](#tag_images) is a "stub" — seen at the gateway but not yet
+populated.  `digest` records the top-level manifest or index digest the tag
+last resolved to and is the lookup key for alternate-tag adoption.
+
 | Column       | Type          | Description |
 |--------------|---------------|-------------|
 | `id`         | `bigserial`   | Primary key |
 | `registry`   | `bigint`      | FK → `registries.id` |
 | `repository` | `text`        | e.g. `myorg/myapp` |
 | `name`       | `text`        | e.g. `v1.2.3` |
-| `digest`     | `text`        | Top-level manifest digest (`sha256:…`); NULL until first scan/approve |
+| `digest`     | `text`        | Top-level (manifest or index) digest; NULL for stubs until first populated |
 | `created_at` | `timestamptz` | |
 | `updated_at` | `timestamptz` | |
 
 ### `images`
 
-One row per tracked OCI platform image. Stub-registered images (seen at the
-gateway but not yet scanned) have a single placeholder row with NULL digest,
-arch, and os.
+One row per tracked OCI platform image, identified by `(registry, repository,
+digest)` independently of any tag.  Multiple tags may reference the same image
+via [`tag_images`](#tag_images), so an alternate tag (e.g. moving `latest` to
+an already-approved digest) does not duplicate manifests, scan reports, or
+approval state.
 
 | Column           | Type          | Description |
 |------------------|---------------|-------------|
 | `id`             | `bigserial`   | Primary key |
-| `tag`            | `bigint`      | FK → `tags.id` |
+| `registry`       | `bigint`      | FK → `registries.id` |
+| `repository`     | `text`        | e.g. `myorg/myapp` |
 | `cache_registry` | `bigint`      | FK → `registries.id`; set after a successful cache push |
-| `digest`         | `text`        | Platform-specific manifest digest; NULL for placeholders |
+| `digest`         | `text`        | Platform-specific manifest digest |
 | `arch`           | `text`        | e.g. `amd64`, `arm64` |
 | `os`             | `text`        | e.g. `linux`, `windows` |
-| `manifest`       | `jsonb`       | Raw platform manifest |
+| `manifest`       | `jsonb`       | Raw platform manifest (also the source of truth for blob gatekeeping via the GIN index on `manifest`) |
 | `scan_report`    | `jsonb`       | Raw trivy JSON report |
 | `state`          | `state`       | Current state (see [Image states](#image-states)) |
 | `created_at`     | `timestamptz` | |
 | `updated_at`     | `timestamptz` | |
+
+### `tag_images`
+
+Many-to-many link between [`tags`](#tags) and [`images`](#images).  A row in
+this table means "this tag currently resolves to (and shares the approval
+state of) this image".  Both foreign keys cascade on delete.
+
+| Column       | Type          | Description |
+|--------------|---------------|-------------|
+| `tag`        | `bigint`      | FK → `tags.id` (`ON DELETE CASCADE`) |
+| `image`      | `bigint`      | FK → `images.id` (`ON DELETE CASCADE`) |
+| `created_at` | `timestamptz` | |
 
 ### `events`
 
@@ -500,6 +556,6 @@ Append-only audit log of every CLI and API action.
 | `id`         | `bigserial`   | Primary key |
 | `image_id`   | `bigint`      | FK → `images.id` (nullable) |
 | `source`     | `text`        | `cli` or `api` |
-| `event_type` | `text`        | e.g. `scan`, `approve`, `validate_approved` |
+| `event_type` | `text`        | e.g. `scan`, `approve`, `validate_approved`, `validate_adopted`, `blob_approved`, `blob_denied` |
 | `details`    | `text`        | JSON with context-specific fields |
 | `created_at` | `timestamptz` | |
