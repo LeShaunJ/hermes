@@ -431,6 +431,25 @@ func TestGetApprovedByDigest(t *testing.T) {
 	}
 }
 
+func TestGetApprovedByDigest_indexFallback(t *testing.T) {
+	// First query (platform) misses, second (index/tag digest) hits.
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("registry.example.com", "myrepo", "sha256:idx").
+		WillReturnRows(sqlmock.NewRows(imageRowCols))
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("registry.example.com", "myrepo", "sha256:idx").
+		WillReturnRows(testImageRow(7, "approved"))
+
+	img, err := d.GetApprovedByDigest("registry.example.com", "myrepo", "sha256:idx")
+	if err != nil {
+		t.Fatalf("GetApprovedByDigest fallback: %v", err)
+	}
+	if img == nil {
+		t.Fatal("expected image, got nil")
+	}
+}
+
 // ── GetApprovedByTagAndDigest ─────────────────────────────────────────────────
 
 func TestGetApprovedByTagAndDigest(t *testing.T) {
@@ -442,6 +461,24 @@ func TestGetApprovedByTagAndDigest(t *testing.T) {
 	img, err := d.GetApprovedByTagAndDigest("registry.example.com", "myrepo", "v1.0", "sha256:abc")
 	if err != nil {
 		t.Fatalf("GetApprovedByTagAndDigest: %v", err)
+	}
+	if img == nil {
+		t.Fatal("expected image, got nil")
+	}
+}
+
+func TestGetApprovedByTagAndDigest_indexFallback(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("registry.example.com", "myrepo", "v1.0", "sha256:idx").
+		WillReturnRows(sqlmock.NewRows(imageRowCols))
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("registry.example.com", "myrepo", "v1.0", "sha256:idx").
+		WillReturnRows(testImageRow(8, "approved"))
+
+	img, err := d.GetApprovedByTagAndDigest("registry.example.com", "myrepo", "v1.0", "sha256:idx")
+	if err != nil {
+		t.Fatalf("GetApprovedByTagAndDigest fallback: %v", err)
 	}
 	if img == nil {
 		t.Fatal("expected image, got nil")

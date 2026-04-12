@@ -25,6 +25,16 @@ type mockStorage struct {
 	rejectedErr         error
 	queueStubErr        error
 	logEventErr         error
+
+	adoptResult bool
+	adoptErr    error
+	adoptCalls  int
+
+	blobAuthorized   bool
+	blobAuthErr      error
+	blobAuthRegistry string
+	blobAuthRepo     string
+	blobAuthDigest   string
 }
 
 func (m *mockStorage) GetApproved(_, _, _ string) (*db.Image, error) {
@@ -40,6 +50,16 @@ func (m *mockStorage) GetRejected(_, _, _ string) (*db.Image, error) {
 	return m.rejected, m.rejectedErr
 }
 func (m *mockStorage) QueueStub(_ db.ImageRef) error { return m.queueStubErr }
+func (m *mockStorage) AdoptTagByDigest(_ db.ImageRef, _ string) (bool, error) {
+	m.adoptCalls++
+	return m.adoptResult, m.adoptErr
+}
+func (m *mockStorage) BlobAuthorized(registry, repository, digest string) (bool, error) {
+	m.blobAuthRegistry = registry
+	m.blobAuthRepo = repository
+	m.blobAuthDigest = digest
+	return m.blobAuthorized, m.blobAuthErr
+}
 func (m *mockStorage) LogEvent(_ *int64, _ db.EventSource, _ string, _ map[string]interface{}) error {
 	return m.logEventErr
 }
@@ -141,6 +161,15 @@ func TestParseV2Path(t *testing.T) {
 		},
 		{
 			path: "/v2/registry.example.com/myrepo/blobs/sha256:abc123",
+			want: parsedPath{
+				Registry:   "registry.example.com",
+				Repository: "myrepo",
+				Digest:     "sha256:abc123",
+				Kind:       refKindBlob,
+			},
+		},
+		{
+			path: "/v2/registry.example.com/myrepo/blobs/uploads/abc",
 			want: parsedPath{
 				Registry: "registry.example.com",
 				Kind:     refKindOther,
@@ -369,6 +398,9 @@ func TestServeOCI_unknown_returns401(t *testing.T) {
 	// No approved, no rejected → 401 UNAUTHORIZED.
 	store := &mockStorage{}
 	s := newMockServer(store, "http://localhost:8080", false)
+	// Stub out the upstream digest probe so this test doesn't reach the
+	// alt-tag adoption path with a real HTTPS call.
+	s.upstreamDigestFn = func(_, _, _ string) string { return "" }
 
 	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/latest", nil)
 	rec := httptest.NewRecorder()
@@ -393,9 +425,25 @@ func TestServeOCI_dbError(t *testing.T) {
 }
 
 func TestServeOCI_otherPath_redirect(t *testing.T) {
-	// Blob/tag-list paths should redirect unconditionally.
+	// Tag-list paths (and other non-blob, non-manifest paths) should redirect
+	// unconditionally.
 	store := &mockStorage{}
 	s := newMockServer(store, "http://localhost:8080", true) // redirect=true
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/tags/list", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Errorf("status = %d, want 307", rec.Code)
+	}
+}
+
+// ── serveOCI blob gatekeeping ─────────────────────────────────────────────────
+
+func TestServeOCI_blob_authorized(t *testing.T) {
+	store := &mockStorage{blobAuthorized: true}
+	s := newMockServer(store, "http://localhost:8080", true)
 
 	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/blobs/sha256:abc", nil)
 	rec := httptest.NewRecorder()
@@ -403,6 +451,133 @@ func TestServeOCI_otherPath_redirect(t *testing.T) {
 
 	if rec.Code != http.StatusTemporaryRedirect {
 		t.Errorf("status = %d, want 307", rec.Code)
+	}
+	if store.blobAuthDigest != "sha256:abc" {
+		t.Errorf("BlobAuthorized digest = %q, want sha256:abc", store.blobAuthDigest)
+	}
+	if store.blobAuthRepo != "myrepo" {
+		t.Errorf("BlobAuthorized repo = %q, want myrepo", store.blobAuthRepo)
+	}
+}
+
+func TestServeOCI_blob_unauthorized(t *testing.T) {
+	store := &mockStorage{blobAuthorized: false}
+	s := newMockServer(store, "http://localhost:8080", false)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/blobs/sha256:abc", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+	var body ociErrorResponse
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Errors[0].Code != "UNAUTHORIZED" {
+		t.Errorf("code = %q, want UNAUTHORIZED", body.Errors[0].Code)
+	}
+}
+
+func TestServeOCI_blob_dbError(t *testing.T) {
+	store := &mockStorage{blobAuthErr: fmt.Errorf("connection refused")}
+	s := newMockServer(store, "http://localhost:8080", false)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/blobs/sha256:abc", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+}
+
+// ── serveOCI alt-tag adoption ─────────────────────────────────────────────────
+
+func TestServeOCI_altTag_adopted(t *testing.T) {
+	store := &mockStorage{adoptResult: true}
+	s := newMockServer(store, "http://localhost:8080", true)
+	s.upstreamDigestFn = func(_, _, _ string) string { return "sha256:adopted" }
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/v2.0", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Errorf("status = %d, want 307", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	want := "https://registry.example.com/v2/myrepo/manifests/sha256:adopted"
+	if loc != want {
+		t.Errorf("Location = %q, want %q", loc, want)
+	}
+	if store.adoptCalls != 1 {
+		t.Errorf("adoptCalls = %d, want 1", store.adoptCalls)
+	}
+}
+
+func TestServeOCI_altTag_notAdopted_falls_through(t *testing.T) {
+	// Adoption returns false → falls through to stub-register + 401.
+	store := &mockStorage{adoptResult: false}
+	s := newMockServer(store, "http://localhost:8080", false)
+	s.upstreamDigestFn = func(_, _, _ string) string { return "sha256:unknown" }
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/v2.0", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+	if store.adoptCalls != 1 {
+		t.Errorf("adoptCalls = %d, want 1", store.adoptCalls)
+	}
+}
+
+func TestUpstreamManifestDigest_override(t *testing.T) {
+	s := newTestServer("http://localhost:8080", false)
+	called := false
+	s.upstreamDigestFn = func(registry, repository, tag string) string {
+		called = true
+		if registry != "registry.example.com" || repository != "myrepo" || tag != "v1.0" {
+			t.Errorf("unexpected args: %q %q %q", registry, repository, tag)
+		}
+		return "sha256:fromfn"
+	}
+	got := s.upstreamManifestDigest("registry.example.com", "myrepo", "v1.0")
+	if !called {
+		t.Error("upstreamDigestFn was not called")
+	}
+	if got != "sha256:fromfn" {
+		t.Errorf("got = %q", got)
+	}
+}
+
+func TestUpstreamManifestDigest_unreachable(t *testing.T) {
+	// No override and an unresolvable host → returns empty string.
+	s := newTestServer("http://localhost:8080", false)
+	got := s.upstreamManifestDigest("invalid.invalid.invalid.invalid.example", "myrepo", "v1.0")
+	if got != "" {
+		t.Errorf("got = %q, want empty", got)
+	}
+}
+
+func TestServeOCI_altTag_noUpstreamDigest(t *testing.T) {
+	// Upstream returns no digest → no adoption attempt; stub + 401.
+	store := &mockStorage{}
+	s := newMockServer(store, "http://localhost:8080", false)
+	s.upstreamDigestFn = func(_, _, _ string) string { return "" }
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/v2.0", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+	if store.adoptCalls != 0 {
+		t.Errorf("adoptCalls = %d, want 0", store.adoptCalls)
 	}
 }
 

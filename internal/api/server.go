@@ -55,6 +55,8 @@ type storage interface {
 	GetApprovedByTagAndDigest(registry, repository, tag, digest string) (*db.Image, error)
 	GetRejected(registry, repository, tag string) (*db.Image, error)
 	QueueStub(ref db.ImageRef) error
+	AdoptTagByDigest(ref db.ImageRef, digest string) (bool, error)
+	BlobAuthorized(registry, repository, digest string) (bool, error)
 	LogEvent(imageID *int64, source db.EventSource, eventType string, details map[string]interface{}) error
 }
 
@@ -67,6 +69,10 @@ type Server struct {
 	// challengeRetrieveFn overrides challengeRetrieve in tests to avoid
 	// outbound HTTPS calls.
 	challengeRetrieveFn func(registry, path string) string
+
+	// upstreamDigestFn overrides upstreamManifestDigest in tests so unit
+	// tests don't perform real outbound HTTPS calls.
+	upstreamDigestFn func(registry, repository, tag string) string
 
 	// transport overrides the HTTP transport used by the ident proxy in tests.
 	transport http.RoundTripper
@@ -113,12 +119,21 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Non-manifest paths (blobs, tag lists, etc.) — proxy/redirect unconditionally.
+	// Non-manifest, non-blob paths (tag lists, uploads, catalog, etc.) — proxy/
+	// redirect unconditionally.
 	if p.Kind == refKindOther {
 		// Upstream path: strip "/v2/<registry>" prefix, keep "/v2/..." structure.
 		registryPrefix := "/v2/" + p.Registry
 		upstreamPath := "/v2" + path[len(registryPrefix):]
 		s.proxyOrRedirect(w, r, p.Registry, upstreamPath)
+		return
+	}
+
+	// Blob downloads — only forward if the digest belongs to the config or one
+	// of the layers of an approved image in the same repository.  This stops
+	// clients from pulling arbitrary blobs through the gateway.
+	if p.Kind == refKindBlob {
+		s.serveBlob(w, r, p, start)
 		return
 	}
 
@@ -175,6 +190,32 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Tag manifest miss — try alternate-tag adoption.  Probe the upstream for
+	// the requested tag's content digest; if it matches an already-approved
+	// image in the same repository, adopt the tag and forward the request.
+	if p.Kind == refKindTag {
+		if digest := s.upstreamManifestDigest(p.Registry, p.Repository, p.Tag); digest != "" {
+			adopted, aErr := s.db.AdoptTagByDigest(
+				db.ImageRef{Registry: p.Registry, Repository: p.Repository, Tag: p.Tag},
+				digest,
+			)
+			if aErr != nil {
+				logger.Printf("WARN adopt %s/%s:%s — %v", p.Registry, p.Repository, p.Tag, aErr)
+			}
+			if adopted {
+				_ = s.db.LogEvent(nil, db.SourceAPI, "validate_adopted", map[string]interface{}{
+					"registry":   p.Registry,
+					"repository": p.Repository,
+					"tag":        p.Tag,
+					"digest":     digest,
+					"latency_ms": time.Since(start).Milliseconds(),
+				})
+				s.proxyOrRedirect(w, r, p.Registry, "/v2/"+p.Repository+"/manifests/"+digest)
+				return
+			}
+		}
+	}
+
 	// Unknown / not yet approved — stub-register the tag and return 401.
 	var queuedID *int64
 	if p.Tag != "" {
@@ -193,6 +234,66 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 	})
 
 	s.writeOCIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "approval required")
+}
+
+// serveBlob authorizes a /v2/<registry>/<repo>/blobs/<digest> download against
+// the database and either forwards it to the upstream registry or denies it.
+func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath, start time.Time) {
+	ok, err := s.db.BlobAuthorized(p.Registry, p.Repository, p.Digest)
+	if err != nil {
+		logger.Printf("ERROR blob authz %s/%s %s — %v", p.Registry, p.Repository, p.Digest, err)
+		s.writeOCIError(w, http.StatusInternalServerError, "UNKNOWN", "internal error")
+		return
+	}
+	if !ok {
+		_ = s.db.LogEvent(nil, db.SourceAPI, "blob_denied", map[string]interface{}{
+			"registry":   p.Registry,
+			"repository": p.Repository,
+			"digest":     p.Digest,
+			"latency_ms": time.Since(start).Milliseconds(),
+		})
+		s.writeOCIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "blob not part of an approved image")
+		return
+	}
+	_ = s.db.LogEvent(nil, db.SourceAPI, "blob_approved", map[string]interface{}{
+		"registry":   p.Registry,
+		"repository": p.Repository,
+		"digest":     p.Digest,
+		"latency_ms": time.Since(start).Milliseconds(),
+	})
+	s.proxyOrRedirect(w, r, p.Registry, "/v2/"+p.Repository+"/blobs/"+p.Digest)
+}
+
+// upstreamManifestDigest issues a HEAD against the upstream registry for the
+// given tag and returns the Docker-Content-Digest header value, or "" on any
+// failure.  It is overridden in tests via upstreamDigestFn so unit tests do
+// not perform real HTTPS calls.
+func (s *Server) upstreamManifestDigest(registry, repository, tag string) string {
+	if s.upstreamDigestFn != nil {
+		return s.upstreamDigestFn(registry, repository, tag)
+	}
+	client := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 5 * time.Second,
+	}
+	req, err := http.NewRequest(http.MethodHead, "https://"+registry+"/v2/"+repository+"/manifests/"+tag, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Accept", strings.Join([]string{
+		"application/vnd.oci.image.manifest.v1+json",
+		"application/vnd.docker.distribution.manifest.v2+json",
+		"application/vnd.docker.distribution.manifest.list.v2+json",
+		"application/vnd.oci.image.index.v1+json",
+	}, ", "))
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return resp.Header.Get("Docker-Content-Digest")
 }
 
 // challengeRetrieve probes GET https://<registry>/v2/<path> and returns the
@@ -382,6 +483,7 @@ const (
 	refKindTag          refKind = iota // /manifests/<tag>
 	refKindDigest                      // /manifests/<digest>  ("sha256:…")
 	refKindTagAndDigest                // /manifests/<tag>@<digest>
+	refKindBlob                        // /blobs/<digest> (downloads, not uploads)
 	refKindOther                       // any other /v2/… path
 )
 
@@ -394,9 +496,12 @@ type parsedPath struct {
 }
 
 // parseV2Path extracts registry, repository, and reference information from a
-// /v2/<registry>/<repo>/manifests/<ref> URL path.
+// /v2/<registry>/<repo>/manifests/<ref> or /v2/<registry>/<repo>/blobs/<digest>
+// URL path.
 //
-// Paths without a /manifests/ component return refKindOther with Registry set.
+// Paths without a /manifests/ or /blobs/<digest> component return refKindOther
+// with Registry set.  Blob upload paths (/blobs/uploads/...) are also reported
+// as refKindOther so they pass through unconditionally.
 func parseV2Path(path string) (parsedPath, error) {
 	const prefix = "/v2/"
 	if !strings.HasPrefix(path, prefix) {
@@ -411,6 +516,27 @@ func parseV2Path(path string) (parsedPath, error) {
 		return parsedPath{Kind: refKindOther, Registry: rest}, nil
 	}
 	registry := rest[:slashIdx]
+
+	// Recognise blob downloads — /blobs/sha256:… or /blobs/sha512:… — and
+	// extract the digest so the gateway can gatekeep them.  Upload paths
+	// (/blobs/uploads/…) and any other shape pass through as refKindOther.
+	const blobSep = "/blobs/"
+	if blobIdx := strings.Index(rest, blobSep); blobIdx >= 0 {
+		regRepo := rest[:blobIdx]
+		reference := rest[blobIdx+len(blobSep):]
+		repoSlashIdx := strings.Index(regRepo, "/")
+		if repoSlashIdx >= 0 && (strings.HasPrefix(reference, "sha256:") || strings.HasPrefix(reference, "sha512:")) {
+			repo := regRepo[repoSlashIdx+1:]
+			if repo != "" {
+				return parsedPath{
+					Kind:       refKindBlob,
+					Registry:   registry,
+					Repository: repo,
+					Digest:     reference,
+				}, nil
+			}
+		}
+	}
 
 	const sep = "/manifests/"
 	manifIdx := strings.Index(rest, sep)
