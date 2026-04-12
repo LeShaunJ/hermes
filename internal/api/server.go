@@ -29,15 +29,18 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,11 +73,10 @@ type Server struct {
 	// outbound HTTPS calls.
 	challengeRetrieveFn func(registry, path string) string
 
-	// upstreamDigestFn overrides upstreamManifestDigest in tests so unit
-	// tests don't perform real outbound HTTPS calls.
-	upstreamDigestFn func(registry, repository, tag string) string
-
-	// transport overrides the HTTP transport used by the ident proxy in tests.
+	// transport overrides the HTTP transport used by the ident and
+	// manifest/blob proxies in tests.  When non-nil, proxyOrRedirect uses
+	// "http://" instead of "https://" for upstream URLs so tests can point
+	// at an httptest backend.
 	transport http.RoundTripper
 }
 
@@ -190,33 +192,21 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Tag manifest miss — try alternate-tag adoption.  Probe the upstream for
-	// the requested tag's content digest; if it matches an already-approved
-	// image in the same repository, adopt the tag and forward the request.
+	// Tag manifest miss — proxy the client's request to the upstream and
+	// intercept the response.  The hook reads the upstream-returned
+	// Docker-Content-Digest and either adopts the tag (alternate-tag case,
+	// existing approved image at the same digest) or stub-registers it and
+	// rewrites the response to 401 UNAUTHORIZED.  This reuses the client's
+	// own bearer token so no server-side re-auth is required.
 	if p.Kind == refKindTag {
-		if digest := s.upstreamManifestDigest(p.Registry, p.Repository, p.Tag); digest != "" {
-			adopted, aErr := s.db.AdoptTagByDigest(
-				db.ImageRef{Registry: p.Registry, Repository: p.Repository, Tag: p.Tag},
-				digest,
-			)
-			if aErr != nil {
-				logger.Printf("WARN adopt %s/%s:%s — %v", p.Registry, p.Repository, p.Tag, aErr)
-			}
-			if adopted {
-				_ = s.db.LogEvent(nil, db.SourceAPI, "validate_adopted", map[string]interface{}{
-					"registry":   p.Registry,
-					"repository": p.Repository,
-					"tag":        p.Tag,
-					"digest":     digest,
-					"latency_ms": time.Since(start).Milliseconds(),
-				})
-				s.proxyOrRedirect(w, r, p.Registry, "/v2/"+p.Repository+"/manifests/"+digest)
-				return
-			}
-		}
+		ref := db.ImageRef{Registry: p.Registry, Repository: p.Repository, Tag: p.Tag}
+		hook := s.adoptTagResponseHook(ref, start)
+		s.proxyOrRedirect(w, r, p.Registry, "/v2/"+p.Repository+"/manifests/"+p.Tag, hook)
+		return
 	}
 
-	// Unknown / not yet approved — stub-register the tag and return 401.
+	// Digest or tag+digest miss — no adoption path; stub-register if possible
+	// and deny.
 	var queuedID *int64
 	if p.Tag != "" {
 		ref := db.ImageRef{Registry: p.Registry, Repository: p.Repository, Tag: p.Tag}
@@ -234,6 +224,79 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 	})
 
 	s.writeOCIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "approval required")
+}
+
+// adoptTagResponseHook returns a responseHook that inspects a manifest
+// response returned by the upstream registry and either:
+//
+//   - adopts the tag when the upstream Docker-Content-Digest matches an
+//     existing approved image in the same repository (alternate-tag case),
+//     letting the response pass through unchanged; or
+//   - stub-registers the tag and rewrites the response to a CNCF-format
+//     401 UNAUTHORIZED error so the client never sees the raw manifest.
+//
+// Upstream non-success responses are also rewritten to 401 so hermes does
+// not leak upstream errors (e.g. auth retries, redirects) to the client.
+func (s *Server) adoptTagResponseHook(ref db.ImageRef, start time.Time) responseHook {
+	return func(resp *http.Response) error {
+		if resp.StatusCode == http.StatusOK {
+			digest := resp.Header.Get("Docker-Content-Digest")
+			if digest != "" {
+				adopted, err := s.db.AdoptTagByDigest(ref, digest)
+				if err != nil {
+					logger.Printf("WARN adopt %s/%s:%s — %v", ref.Registry, ref.Repository, ref.Tag, err)
+				}
+				if adopted {
+					_ = s.db.LogEvent(nil, db.SourceAPI, "validate_adopted", map[string]interface{}{
+						"registry":   ref.Registry,
+						"repository": ref.Repository,
+						"tag":        ref.Tag,
+						"digest":     digest,
+						"latency_ms": time.Since(start).Milliseconds(),
+					})
+					return nil
+				}
+			}
+		}
+
+		// Not adopted — stub-register and replace the response body with a
+		// hermes-owned 401 so the approval workflow kicks in.
+		if qErr := s.db.QueueStub(ref); qErr != nil {
+			logger.Printf("WARN queue stub %s/%s:%s — %v", ref.Registry, ref.Repository, ref.Tag, qErr)
+		}
+		_ = s.db.LogEvent(nil, db.SourceAPI, "validate_denied", map[string]interface{}{
+			"registry":      ref.Registry,
+			"repository":    ref.Repository,
+			"tag":           ref.Tag,
+			"upstream_code": resp.StatusCode,
+			"latency_ms":    time.Since(start).Milliseconds(),
+		})
+		return rewriteResponseOCIError(resp, http.StatusUnauthorized, "UNAUTHORIZED", "approval required")
+	}
+}
+
+// rewriteResponseOCIError replaces a proxied response body with a CNCF OCI
+// error document and sets the appropriate headers.  Used by responseHooks
+// that need to turn upstream content into a hermes-owned error.
+func rewriteResponseOCIError(resp *http.Response, status int, code, message string) error {
+	body, err := json.Marshal(ociErrorResponse{
+		Errors: []ociError{{Code: code, Message: message}},
+	})
+	if err != nil {
+		return err
+	}
+	// Drop upstream payload headers that no longer describe the body.
+	resp.Header.Del("Docker-Content-Digest")
+	resp.Header.Del("Etag")
+	resp.Header.Del("Last-Modified")
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Header.Set("Docker-Distribution-API-Version", "registry/2.0")
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	resp.StatusCode = status
+	resp.Status = http.StatusText(status)
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return nil
 }
 
 // serveBlob authorizes a /v2/<registry>/<repo>/blobs/<digest> download against
@@ -262,38 +325,6 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath,
 		"latency_ms": time.Since(start).Milliseconds(),
 	})
 	s.proxyOrRedirect(w, r, p.Registry, "/v2/"+p.Repository+"/blobs/"+p.Digest)
-}
-
-// upstreamManifestDigest issues a HEAD against the upstream registry for the
-// given tag and returns the Docker-Content-Digest header value, or "" on any
-// failure.  It is overridden in tests via upstreamDigestFn so unit tests do
-// not perform real HTTPS calls.
-func (s *Server) upstreamManifestDigest(registry, repository, tag string) string {
-	if s.upstreamDigestFn != nil {
-		return s.upstreamDigestFn(registry, repository, tag)
-	}
-	client := &http.Client{
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Timeout: 5 * time.Second,
-	}
-	req, err := http.NewRequest(http.MethodHead, "https://"+registry+"/v2/"+repository+"/manifests/"+tag, nil)
-	if err != nil {
-		return ""
-	}
-	req.Header.Set("Accept", strings.Join([]string{
-		"application/vnd.oci.image.manifest.v1+json",
-		"application/vnd.docker.distribution.manifest.v2+json",
-		"application/vnd.docker.distribution.manifest.list.v2+json",
-		"application/vnd.oci.image.index.v1+json",
-	}, ", "))
-	resp, err := client.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer func() { _ = resp.Body.Close() }()
-	return resp.Header.Get("Docker-Content-Digest")
 }
 
 // challengeRetrieve probes GET https://<registry>/v2/<path> and returns the
@@ -417,11 +448,18 @@ func (s *Server) serveIdent(w http.ResponseWriter, r *http.Request) {
 
 // ── proxy / redirect ──────────────────────────────────────────────────────────
 
+// responseHook is invoked from httputil.ReverseProxy.ModifyResponse, in order,
+// so callers can inspect or rewrite the upstream response before it reaches
+// the client.  Returning an error aborts the proxy write with a 502.
+type responseHook func(resp *http.Response) error
+
 // proxyOrRedirect either reverse-proxies the request to the upstream registry
-// or sends an HTTP 307 redirect, depending on cfg.Server.Redirect.
-// WWW-Authenticate realm headers in proxied responses are rewritten through /ident/.
-func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registry, upstreamPath string) {
-	if s.cfg.Server.Redirect {
+// or sends an HTTP 307 redirect, depending on cfg.Server.Redirect.  If any
+// responseHook is supplied the redirect fast-path is skipped — hooks can only
+// run when hermes actually sees the upstream response, so proxy mode is forced.
+// Hooks run after the default Docker-Distribution-API-Version header is set.
+func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registry, upstreamPath string, hooks ...responseHook) {
+	if s.cfg.Server.Redirect && len(hooks) == 0 {
 		dest := "https://" + registry + upstreamPath
 		if r.URL.RawQuery != "" {
 			dest += "?" + r.URL.RawQuery
@@ -431,8 +469,16 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 		return
 	}
 
-	target, _ := url.Parse("https://" + registry)
+	scheme := "https"
+	if s.transport != nil {
+		// Tests inject an HTTP transport pointing at an httptest backend.
+		scheme = "http"
+	}
+	target, _ := url.Parse(scheme + "://" + registry)
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	if s.transport != nil {
+		proxy.Transport = s.transport
+	}
 	origDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		origDirector(req)
@@ -444,6 +490,11 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		resp.Header.Set("Docker-Distribution-API-Version", "registry/2.0")
+		for _, h := range hooks {
+			if err := h(resp); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	proxy.ServeHTTP(w, r)

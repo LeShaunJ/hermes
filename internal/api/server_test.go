@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -395,14 +396,17 @@ func TestServeOCI_rejected(t *testing.T) {
 }
 
 func TestServeOCI_unknown_returns401(t *testing.T) {
-	// No approved, no rejected → 401 UNAUTHORIZED.
+	// No approved, no rejected, upstream returns 404 → our 401 UNAUTHORIZED.
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	defer srv.Close()
+
 	store := &mockStorage{}
 	s := newMockServer(store, "http://localhost:8080", false)
-	// Stub out the upstream digest probe so this test doesn't reach the
-	// alt-tag adoption path with a real HTTPS call.
-	s.upstreamDigestFn = func(_, _, _ string) string { return "" }
+	s.transport = http.DefaultTransport
 
-	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/latest", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v2/"+host+"/myrepo/manifests/latest", nil)
 	rec := httptest.NewRecorder()
 	s.mux.ServeHTTP(rec, req)
 
@@ -495,81 +499,127 @@ func TestServeOCI_blob_dbError(t *testing.T) {
 
 // ── serveOCI alt-tag adoption ─────────────────────────────────────────────────
 
-func TestServeOCI_altTag_adopted(t *testing.T) {
-	store := &mockStorage{adoptResult: true}
-	s := newMockServer(store, "http://localhost:8080", true)
-	s.upstreamDigestFn = func(_, _, _ string) string { return "sha256:adopted" }
+// newUpstreamBackend returns an httptest.Server that pretends to be the
+// upstream registry.  The handler is supplied by the caller so each test can
+// control the status code, headers, and body returned for the manifest
+// request.  The returned base host (without scheme) should be used as the
+// registry segment of the request path.
+func newUpstreamBackend(handler http.HandlerFunc) (*httptest.Server, string) {
+	srv := httptest.NewServer(handler)
+	// httptest URLs are "http://127.0.0.1:<port>" — strip the scheme.
+	return srv, strings.TrimPrefix(srv.URL, "http://")
+}
 
-	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/v2.0", nil)
+func TestServeOCI_altTag_adopted(t *testing.T) {
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/v2/myrepo/manifests/v2.0" {
+			t.Errorf("upstream path = %q, want /v2/myrepo/manifests/v2.0", got)
+		}
+		w.Header().Set("Docker-Content-Digest", "sha256:adopted")
+		w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"manifests":[]}`))
+	})
+	defer srv.Close()
+
+	store := &mockStorage{adoptResult: true}
+	s := newMockServer(store, "http://localhost:8080", false) // redirect forced off by hook
+	s.transport = http.DefaultTransport
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/"+host+"/myrepo/manifests/v2.0", nil)
 	rec := httptest.NewRecorder()
 	s.mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusTemporaryRedirect {
-		t.Errorf("status = %d, want 307", rec.Code)
-	}
-	loc := rec.Header().Get("Location")
-	want := "https://registry.example.com/v2/myrepo/manifests/sha256:adopted"
-	if loc != want {
-		t.Errorf("Location = %q, want %q", loc, want)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
 	if store.adoptCalls != 1 {
 		t.Errorf("adoptCalls = %d, want 1", store.adoptCalls)
 	}
+	if got := rec.Header().Get("Docker-Content-Digest"); got != "sha256:adopted" {
+		t.Errorf("Docker-Content-Digest = %q, want sha256:adopted", got)
+	}
 }
 
-func TestServeOCI_altTag_notAdopted_falls_through(t *testing.T) {
-	// Adoption returns false → falls through to stub-register + 401.
+func TestServeOCI_altTag_notAdopted_rewritesTo401(t *testing.T) {
+	// Upstream returns 200 with a digest that doesn't match anything
+	// approved — hook should rewrite to 401 and stub-register.
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Docker-Content-Digest", "sha256:unknown")
+		w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"manifests":[]}`))
+	})
+	defer srv.Close()
+
 	store := &mockStorage{adoptResult: false}
 	s := newMockServer(store, "http://localhost:8080", false)
-	s.upstreamDigestFn = func(_, _, _ string) string { return "sha256:unknown" }
+	s.transport = http.DefaultTransport
 
-	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/v2.0", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v2/"+host+"/myrepo/manifests/v2.0", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if store.adoptCalls != 1 {
+		t.Errorf("adoptCalls = %d, want 1", store.adoptCalls)
+	}
+	if got := rec.Header().Get("Docker-Content-Digest"); got != "" {
+		t.Errorf("Docker-Content-Digest should be stripped, got %q", got)
+	}
+	var body ociErrorResponse
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Errors[0].Code != "UNAUTHORIZED" {
+		t.Errorf("code = %q, want UNAUTHORIZED", body.Errors[0].Code)
+	}
+}
+
+func TestServeOCI_altTag_upstreamError_rewritesTo401(t *testing.T) {
+	// Upstream returns a 401 (auth failure) or 404 (not found).  Hermes
+	// should still return its own 401 so the client's approval workflow
+	// kicks in rather than retrying upstream auth.
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"errors":[{"code":"MANIFEST_UNKNOWN"}]}`))
+	})
+	defer srv.Close()
+
+	store := &mockStorage{}
+	s := newMockServer(store, "http://localhost:8080", false)
+	s.transport = http.DefaultTransport
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/"+host+"/myrepo/manifests/v2.0", nil)
 	rec := httptest.NewRecorder()
 	s.mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", rec.Code)
 	}
-	if store.adoptCalls != 1 {
-		t.Errorf("adoptCalls = %d, want 1", store.adoptCalls)
+	if store.adoptCalls != 0 {
+		t.Errorf("adoptCalls = %d, want 0 (upstream non-200 must not trigger adoption)", store.adoptCalls)
 	}
 }
 
-func TestUpstreamManifestDigest_override(t *testing.T) {
-	s := newTestServer("http://localhost:8080", false)
-	called := false
-	s.upstreamDigestFn = func(registry, repository, tag string) string {
-		called = true
-		if registry != "registry.example.com" || repository != "myrepo" || tag != "v1.0" {
-			t.Errorf("unexpected args: %q %q %q", registry, repository, tag)
-		}
-		return "sha256:fromfn"
-	}
-	got := s.upstreamManifestDigest("registry.example.com", "myrepo", "v1.0")
-	if !called {
-		t.Error("upstreamDigestFn was not called")
-	}
-	if got != "sha256:fromfn" {
-		t.Errorf("got = %q", got)
-	}
-}
+func TestServeOCI_altTag_missingDigestHeader_rewritesTo401(t *testing.T) {
+	// Upstream returns 200 but no Docker-Content-Digest header — no adoption
+	// should be attempted; hook rewrites to 401.
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"schemaVersion":2}`))
+	})
+	defer srv.Close()
 
-func TestUpstreamManifestDigest_unreachable(t *testing.T) {
-	// No override and an unresolvable host → returns empty string.
-	s := newTestServer("http://localhost:8080", false)
-	got := s.upstreamManifestDigest("invalid.invalid.invalid.invalid.example", "myrepo", "v1.0")
-	if got != "" {
-		t.Errorf("got = %q, want empty", got)
-	}
-}
-
-func TestServeOCI_altTag_noUpstreamDigest(t *testing.T) {
-	// Upstream returns no digest → no adoption attempt; stub + 401.
 	store := &mockStorage{}
 	s := newMockServer(store, "http://localhost:8080", false)
-	s.upstreamDigestFn = func(_, _, _ string) string { return "" }
+	s.transport = http.DefaultTransport
 
-	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/v2.0", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v2/"+host+"/myrepo/manifests/v2.0", nil)
 	rec := httptest.NewRecorder()
 	s.mux.ServeHTTP(rec, req)
 
@@ -578,6 +628,36 @@ func TestServeOCI_altTag_noUpstreamDigest(t *testing.T) {
 	}
 	if store.adoptCalls != 0 {
 		t.Errorf("adoptCalls = %d, want 0", store.adoptCalls)
+	}
+}
+
+// ── proxyOrRedirect with hooks ────────────────────────────────────────────────
+
+func TestProxyOrRedirect_hookForcesProxyMode(t *testing.T) {
+	// Even in redirect mode, supplying a responseHook forces proxy so the
+	// hook can see the upstream response.
+	called := false
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	defer srv.Close()
+
+	s := newTestServer("http://localhost:8080", true) // redirect=true
+	s.transport = http.DefaultTransport
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/"+host+"/foo", nil)
+	rec := httptest.NewRecorder()
+	s.proxyOrRedirect(rec, req, host, "/v2/foo", func(_ *http.Response) error {
+		called = true
+		return nil
+	})
+
+	if !called {
+		t.Error("responseHook was not invoked — redirect mode was not overridden")
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
 	}
 }
 
