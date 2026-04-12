@@ -438,9 +438,26 @@ hermes uses PostgreSQL and creates its tables automatically on first run via
 | Column       | Type          | Description |
 |--------------|---------------|-------------|
 | `id`         | `bigserial`   | Primary key |
+| `mask`       | `bigint`      | FK → `registries.id` (nullable), cascades on delete |
 | `url`        | `text`        | Registry base URL (e.g. `registry.example.com`) |
 | `created_at` | `timestamptz` | |
 | `updated_at` | `timestamptz` | |
+
+> [!NOTE]
+> The optional `registries.mask` foreign key is a `registries.id` whose
+> `registries.url` should be used during display purposes.
+> For instance, with:
+> 
+> | id | mask |         url          | created_at | updated_at |
+> |----|------|----------------------|------------|------------|
+> |  1 |      | docker.io            | ...        | ...        |
+> |  2 |    1 | index.docker.io      | ...        | ...        |
+> |  3 |    1 | registry-1.docker.io | ...        | ...        |
+> 
+> `docker.io` is the registry the user will see in commands like `hermes list`,
+> when the actual registry is `registry-1.docker.io` or `index.docker.io`.
+> Additionally, API requests to `/v2/docker.io/...` will resolve to
+> `/v2/registry-1.docker.io/...` (_the last of any rows with this mask_).
 
 ### `tags`
 

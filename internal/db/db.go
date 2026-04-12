@@ -174,11 +174,28 @@ func (d *DB) migrate() error {
 		// registries — unique registry base URLs
 		`CREATE TABLE IF NOT EXISTS registries (
 			id         BIGSERIAL PRIMARY KEY,
+			mask       BIGINT REFERENCES registries(id),
 			url        TEXT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			UNIQUE (url)
 		)`,
+
+		// seed docker.io mask
+		`INSERT INTO registries (url)
+			VALUES ('docker.io')
+			ON CONFLICT (url) DO NOTHING
+		`,
+		// seed and mask Docker registries
+		`INSERT INTO registries (url, mask)
+			SELECT new_data.url, r.id
+			FROM (
+				VALUES ('index.docker.io'), ('registry-1.docker.io')
+			) AS new_data(url)
+			CROSS JOIN registries r
+			WHERE r.url = 'docker.io'
+			ON CONFLICT (url) DO NOTHING
+		`,
 
 		// state enum (PostgreSQL 16 supports IF NOT EXISTS on CREATE TYPE)
 		`DO $$ BEGIN
