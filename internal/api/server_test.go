@@ -96,7 +96,7 @@ func newMockServer(store storage, url string, redirect bool) *Server {
 	s.mux.HandleFunc("/v2", s.serveOCI)
 	s.mux.HandleFunc("/ident/", s.serveIdent)
 	s.mux.HandleFunc("/ident", s.serveIdent)
-	s.mux.HandleFunc("GET /healthz", s.healthz)
+	s.mux.HandleFunc("GET /healthz", s.serveHealthz)
 	return s
 }
 
@@ -272,7 +272,7 @@ func TestWriteOCIError(t *testing.T) {
 
 func TestHealthz(t *testing.T) {
 	s := newTestServer("http://localhost:8080", false)
-	s.mux.HandleFunc("GET /healthz", s.healthz)
+	s.mux.HandleFunc("GET /healthz", s.serveHealthz)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()

@@ -1,31 +1,33 @@
-// Package api implements the hermes OCI Distribution gateway server.
-//
-// The server acts as a full reverse-proxy gateway for OCI Distribution
-// registries, enforcing image approval policy before forwarding requests.
-//
-// Routes:
-//
-//	GET  /v2/
-//	    Returns 200 with Docker-Distribution-API-Version to signal a v2-capable
-//	    registry.
-//
-//	*   /v2/<registry>/<repo>/manifests/<ref>
-//	    Manifest requests.  Approved images are proxied/redirected to upstream.
-//	    Rejected images return 403 DENIED.  Unknown/unapproved images return
-//	    401 UNAUTHORIZED with a WWW-Authenticate challenge pointing through the
-//	    /ident/ token proxy, and are stub-registered for operator review.
-//
-//	*   /v2/<registry>/...  (non-manifest paths)
-//	    Blobs, tag lists, and other OCI sub-paths are forwarded unconditionally
-//	    to the upstream registry (proxy or 307 redirect per cfg.Server.Redirect).
-//
-//	*   /ident/<registry><path>
-//	    Token-acquisition proxy.  Requests are forwarded verbatim to
-//	    https://<registry><path> so the Docker client can obtain bearer tokens
-//	    through hermes without direct access to the upstream auth endpoint.
-//
-//	GET /healthz
-//	    Liveness probe — returns "ok\n".
+/*
+Package api implements the hermes OCI Distribution gateway server.
+
+The server acts as a full reverse-proxy gateway for OCI Distribution
+registries, enforcing image approval policy before forwarding requests.
+
+Routes:
+
+	GET  /v2/
+		Returns 200 with Docker-Distribution-API-Version to signal a v2-capable
+		registry.
+
+	*   /v2/<registry>/<repo>/manifests/<ref>
+		Manifest requests.  Approved images are proxied/redirected to upstream.
+		Rejected images return 403 DENIED.  Unknown/unapproved images return
+		401 UNAUTHORIZED with a WWW-Authenticate challenge pointing through the
+		/ident/ token proxy, and are stub-registered for operator review.
+
+	*   /v2/<registry>/...  (non-manifest paths)
+		Blobs, tag lists, and other OCI sub-paths are forwarded unconditionally
+		to the upstream registry (proxy or 307 redirect per cfg.Server.Redirect).
+
+	*   /ident/<registry><path>
+		Token-acquisition proxy.  Requests are forwarded verbatim to
+		https://<registry><path> so the Docker client can obtain bearer tokens
+		through hermes without direct access to the upstream auth endpoint.
+
+	GET /healthz
+		Liveness probe — returns "ok\n".
+*/
 package api
 
 import (
@@ -91,7 +93,7 @@ func New(database storage, cfg *config.Config) *Server {
 	s.mux.HandleFunc("/v2", s.serveOCI)
 	s.mux.HandleFunc("/ident/", s.serveIdent)
 	s.mux.HandleFunc("/ident", s.serveIdent)
-	s.mux.HandleFunc("GET /healthz", s.healthz)
+	s.mux.HandleFunc("GET /healthz", s.serveHealthz)
 	return s
 }
 
@@ -385,6 +387,8 @@ func challengeParse(header string, account string) string {
 // serveIdent proxies token-acquisition requests to the upstream registry auth
 // endpoint.  URL format: /ident/<registry>/<path>?<query>
 func (s *Server) serveIdent(w http.ResponseWriter, r *http.Request) {
+	var sessionID *int64
+	start := time.Now()
 	query := r.URL.Query()
 
 	scope, ok := query["scope"]
@@ -436,8 +440,12 @@ func (s *Server) serveIdent(w http.ResponseWriter, r *http.Request) {
 		req.URL.RawQuery = target.RawQuery
 		req.Host = target.Host
 		req.Header.Set("X-Forwarded-Proto", "https")
-		logger.Printf("upstream auth: %+v", req.URL)
-		logger.Printf("upstream auth headers: %+v", req.Header)
+
+		_ = s.db.LogEvent(sessionID, db.SourceAPI, "token_proxied", map[string]interface{}{
+			"downstream": r.URL.String(),
+			"upstream":   req.URL.String(),
+			"latency_ms": time.Since(start).Milliseconds(),
+		})
 	}
 	proxy.ModifyResponse = func(res *http.Response) error {
 		res.Header.Set("Docker-Distribution-API-Version", "registry/2.0")
@@ -458,13 +466,20 @@ type responseHook func(resp *http.Response) error
 // responseHook is supplied the redirect fast-path is skipped — hooks can only
 // run when hermes actually sees the upstream response, so proxy mode is forced.
 // Hooks run after the default Docker-Distribution-API-Version header is set.
-func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registry, upstreamPath string, hooks ...responseHook) {
+func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registry, path string, hooks ...responseHook) {
+	var sessionID *int64
+	start := time.Now()
+
 	if s.cfg.Server.Redirect && len(hooks) == 0 {
-		dest := "https://" + registry + upstreamPath
+		dest := "https://" + registry + path
 		if r.URL.RawQuery != "" {
 			dest += "?" + r.URL.RawQuery
 		}
-		logger.Printf("redirect url: %+v", dest)
+		_ = s.db.LogEvent(sessionID, db.SourceAPI, "content_redirected", map[string]interface{}{
+			"downstream": r.URL.String(),
+			"upstream":   dest,
+			"latency_ms": time.Since(start).Milliseconds(),
+		})
 		http.Redirect(w, r, dest, http.StatusTemporaryRedirect)
 		return
 	}
@@ -482,11 +497,15 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 	origDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		origDirector(req)
-		req.URL.Path = upstreamPath
+		req.URL.Path = path
 		req.Host = registry
 		req.Header.Set("X-Forwarded-Proto", "https")
-		logger.Printf("upstream url: %+v", req.URL)
-		logger.Printf("upstream url headers: %+v", req.Header)
+
+		_ = s.db.LogEvent(sessionID, db.SourceAPI, "content_proxied", map[string]interface{}{
+			"downstream": r.URL.String(),
+			"upstream":   req.URL.String(),
+			"latency_ms": time.Since(start).Milliseconds(),
+		})
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		resp.Header.Set("Docker-Distribution-API-Version", "registry/2.0")
@@ -522,7 +541,7 @@ func (s *Server) writeOCIError(w http.ResponseWriter, status int, code, message 
 
 // ── health ────────────────────────────────────────────────────────────────────
 
-func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) serveHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprintln(w, "ok")
 }
 

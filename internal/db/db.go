@@ -208,7 +208,7 @@ func (d *DB) migrate() error {
 		// digest holds the top-level (manifest or index) digest the tag resolved to.
 		`CREATE TABLE IF NOT EXISTS tags (
 			id         BIGSERIAL PRIMARY KEY,
-			registry   BIGINT NOT NULL REFERENCES registries(id),
+			registry   BIGINT NOT NULL REFERENCES registries(id) ON DELETE CASCADE,
 			repository TEXT NOT NULL,
 			name       TEXT NOT NULL,
 			digest     TEXT,
@@ -221,9 +221,9 @@ func (d *DB) migrate() error {
 		// tag.  Multiple tags may reference the same image via tag_images.
 		`CREATE TABLE IF NOT EXISTS images (
 			id              BIGSERIAL PRIMARY KEY,
-			registry        BIGINT NOT NULL REFERENCES registries(id),
+			registry        BIGINT NOT NULL REFERENCES registries(id) ON DELETE CASCADE,
 			repository      TEXT NOT NULL,
-			cache_registry  BIGINT REFERENCES registries(id),
+			cache_registry  BIGINT REFERENCES registries(id) ON DELETE SET NULL,
 			digest          TEXT NOT NULL,
 			arch            TEXT,
 			os              TEXT,
