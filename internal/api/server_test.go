@@ -644,6 +644,7 @@ func TestProxyOrRedirect_hookForcesProxyMode(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestServer("http://localhost:8080", true) // redirect=true
+	s.db = &mockStorage{}
 	s.transport = http.DefaultTransport
 
 	req := httptest.NewRequest(http.MethodGet, "/v2/"+host+"/foo", nil)
@@ -784,7 +785,7 @@ func TestServeIdent_success(t *testing.T) {
 	}))
 	defer tokenSrv.Close()
 
-	s := newMockServer(nil, "http://localhost:8080", false)
+	s := newMockServer(&mockStorage{}, "http://localhost:8080", false)
 	// Use an identity transport so the proxy uses HTTP (not forced-HTTPS).
 	s.transport = http.DefaultTransport
 	s.challengeRetrieveFn = func(_, _ string) string {
@@ -831,6 +832,7 @@ func TestChallengeRetrieve_usesOverride(t *testing.T) {
 
 func TestProxyOrRedirect_redirect(t *testing.T) {
 	s := newTestServer("http://localhost:8080", true) // redirect=true
+	s.db = &mockStorage{}
 
 	req := httptest.NewRequest(http.MethodGet, "/v2/repo/manifests/latest", nil)
 	rec := httptest.NewRecorder()
@@ -848,6 +850,7 @@ func TestProxyOrRedirect_redirect(t *testing.T) {
 
 func TestProxyOrRedirect_redirect_withQuery(t *testing.T) {
 	s := newTestServer("http://localhost:8080", true)
+	s.db = &mockStorage{}
 
 	req := httptest.NewRequest(http.MethodGet, "/v2/repo/tags/list?n=10&last=foo", nil)
 	rec := httptest.NewRecorder()
