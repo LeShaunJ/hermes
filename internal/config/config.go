@@ -19,7 +19,16 @@ type Config struct {
 	Server   ServerConfig `mapstructure:"server"`
 	DB       DBConfig     `mapstructure:"db"`
 	Trivy    TrivyConfig  `mapstructure:"trivy"`
+	Log      LogConfig    `mapstructure:"log"`
 	CacheURL string       `mapstructure:"cache_url"`
+}
+
+// LogConfig configures the global logger.  Format is one of "json" (standard
+// slog JSON, Loki-compatible) or "journald" (JSON with journald MESSAGE /
+// PRIORITY fields).  Level is one of "debug", "info", "warn", or "error".
+type LogConfig struct {
+	Format string `mapstructure:"format"`
+	Level  string `mapstructure:"level"`
 }
 
 // ServerConfig configures the HTTP API server.
@@ -72,6 +81,8 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("db.name", "hermes")
 	v.SetDefault("db.sslmode", "disable")
 	v.SetDefault("trivy.image", "aquasec/trivy:latest")
+	v.SetDefault("log.format", "json")
+	v.SetDefault("log.level", "info")
 
 	// HERMES_DB_HOST, HERMES_DB_PASSWORD, HERMES_SERVER_ADDR, …
 	v.SetEnvPrefix("hermes")

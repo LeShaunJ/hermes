@@ -222,6 +222,10 @@ trivy:
   args:         []                     # extra args for `trivy image`
   convert_args: []                     # extra args for `trivy convert`
 
+log:
+  format: json           # json (Loki-compatible) | journald (systemd fields)
+  level:  info           # debug | info | warn | error
+
 cache_url: ""            # default registry for `hermes approve --cache`
 ```
 
@@ -233,6 +237,19 @@ clients obtain bearer tokens through the `/ident/` proxy. It defaults to
 tag lists) is forwarded. When `false` (default), hermes reverse-proxies the
 request. When `true`, hermes sends an HTTP 307 redirect to the upstream URL —
 useful when clients have direct access to the upstream registry.
+
+`log.format` selects the global logger wire format:
+
+- `json` (default) emits standard `slog` JSON — `time`, `level` (slog label),
+  `msg`, and attributes at the top level. Suitable for Loki, Promtail, Vector,
+  and similar pipelines.
+- `journald` emits JSON using systemd-journal field conventions: `MESSAGE`
+  replaces `msg`, `PRIORITY` replaces `level` as a syslog priority digit
+  (`0`-`7`), and `time` is dropped (journald stamps its own).
+
+Every CLI and API event persisted to the `events` table is also mirrored to
+the global logger, so operators can tail audit activity through `journalctl`
+or a Loki query without reading the database.
 
 A JSON Schema is provided at [`docs/hermes.schema.json`](docs/hermes.schema.json).
 

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -1035,6 +1036,10 @@ func (d *DB) AdoptTagByDigest(ref ImageRef, digest string) (bool, error) {
 // ── event logging ─────────────────────────────────────────────────────────────
 
 // LogEvent records an event. imageID may be nil for non-image events.
+//
+// In addition to the events-table insert, the same payload is mirrored to
+// slog.Default() so operators can tail audit activity through the global
+// hermes logger (journald, Loki, etc.).
 func (d *DB) LogEvent(imageID *int64, source EventSource, eventType string, details map[string]interface{}) error {
 	var detailsJSON interface{}
 	if len(details) > 0 {
@@ -1048,5 +1053,26 @@ func (d *DB) LogEvent(imageID *int64, source EventSource, eventType string, deta
 		VALUES ($1, $2, $3, $4)`,
 		imageID, string(source), eventType, detailsJSON,
 	)
+
+	attrs := []any{
+		slog.String("source", string(source)),
+		slog.String("event_type", eventType),
+	}
+	if imageID != nil {
+		attrs = append(attrs, slog.Int64("image_id", *imageID))
+	}
+	if len(details) > 0 {
+		detailAttrs := make([]any, 0, len(details))
+		for k, v := range details {
+			detailAttrs = append(detailAttrs, slog.Any(k, v))
+		}
+		attrs = append(attrs, slog.Group("details", detailAttrs...))
+	}
+	if err != nil {
+		attrs = append(attrs, slog.String("persist_err", err.Error()))
+		slog.Warn("event", attrs...)
+	} else {
+		slog.Info("event", attrs...)
+	}
 	return err
 }

@@ -36,11 +36,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -49,8 +48,6 @@ import (
 	"github.com/leshaunj/hermes/internal/config"
 	"github.com/leshaunj/hermes/internal/db"
 )
-
-var logger = log.New(os.Stderr, "INFO: ", log.Ldate|log.Ltime)
 
 // storage is the subset of db.DB operations used by Server.
 // *db.DB satisfies this interface automatically.
@@ -99,7 +96,7 @@ func New(database storage, cfg *config.Config) *Server {
 
 // ListenAndServe starts the HTTP server.
 func (s *Server) ListenAndServe() error {
-	logger.Printf("hermes gateway listening on %s", s.cfg.Server.Addr)
+	slog.Info("hermes gateway listening", "addr", s.cfg.Server.Addr)
 	return http.ListenAndServe(s.cfg.Server.Addr, s.mux)
 }
 
@@ -152,7 +149,7 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 		img, err = s.db.GetApprovedByTagAndDigest(p.Registry, p.Repository, p.Tag, p.Digest)
 	}
 	if err != nil {
-		logger.Printf("ERROR db lookup %s/%s — %v", p.Registry, p.Repository, err)
+		slog.Error("db lookup", "registry", p.Registry, "repository", p.Repository, "err", err)
 		s.writeOCIError(w, http.StatusInternalServerError, "UNKNOWN", "internal error")
 		return
 	}
@@ -179,7 +176,7 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 		var rejected *db.Image
 		rejected, err = s.db.GetRejected(p.Registry, p.Repository, p.Tag)
 		if err != nil {
-			logger.Printf("WARN rejected lookup %s/%s:%s — %v", p.Registry, p.Repository, p.Tag, err)
+			slog.Warn("rejected lookup", "registry", p.Registry, "repository", p.Repository, "tag", p.Tag, "err", err)
 		}
 		if rejected != nil {
 			_ = s.db.LogEvent(&rejected.ID, db.SourceAPI, "validate_rejected", map[string]interface{}{
@@ -213,7 +210,7 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 	if p.Tag != "" {
 		ref := db.ImageRef{Registry: p.Registry, Repository: p.Repository, Tag: p.Tag}
 		if qErr := s.db.QueueStub(ref); qErr != nil {
-			logger.Printf("WARN queue stub %s/%s:%s — %v", p.Registry, p.Repository, p.Tag, qErr)
+			slog.Warn("queue stub", "registry", p.Registry, "repository", p.Repository, "tag", p.Tag, "err", qErr)
 		}
 	}
 
@@ -246,7 +243,7 @@ func (s *Server) adoptTagResponseHook(ref db.ImageRef, start time.Time) response
 			if digest != "" {
 				adopted, err := s.db.AdoptTagByDigest(ref, digest)
 				if err != nil {
-					logger.Printf("WARN adopt %s/%s:%s — %v", ref.Registry, ref.Repository, ref.Tag, err)
+					slog.Warn("adopt tag", "registry", ref.Registry, "repository", ref.Repository, "tag", ref.Tag, "err", err)
 				}
 				if adopted {
 					_ = s.db.LogEvent(nil, db.SourceAPI, "validate_adopted", map[string]interface{}{
@@ -264,7 +261,7 @@ func (s *Server) adoptTagResponseHook(ref db.ImageRef, start time.Time) response
 		// Not adopted — stub-register and replace the response body with a
 		// hermes-owned 401 so the approval workflow kicks in.
 		if qErr := s.db.QueueStub(ref); qErr != nil {
-			logger.Printf("WARN queue stub %s/%s:%s — %v", ref.Registry, ref.Repository, ref.Tag, qErr)
+			slog.Warn("queue stub", "registry", ref.Registry, "repository", ref.Repository, "tag", ref.Tag, "err", qErr)
 		}
 		_ = s.db.LogEvent(nil, db.SourceAPI, "validate_denied", map[string]interface{}{
 			"registry":      ref.Registry,
@@ -306,7 +303,7 @@ func rewriteResponseOCIError(resp *http.Response, status int, code, message stri
 func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath, start time.Time) {
 	ok, err := s.db.BlobAuthorized(p.Registry, p.Repository, p.Digest)
 	if err != nil {
-		logger.Printf("ERROR blob authz %s/%s %s — %v", p.Registry, p.Repository, p.Digest, err)
+		slog.Error("blob authz", "registry", p.Registry, "repository", p.Repository, "digest", p.Digest, "err", err)
 		s.writeOCIError(w, http.StatusInternalServerError, "UNKNOWN", "internal error")
 		return
 	}
@@ -407,17 +404,17 @@ func (s *Server) serveIdent(w http.ResponseWriter, r *http.Request) {
 		s.writeOCIError(w, http.StatusBadRequest, "UNSUPPORTED", "malformed `scope=` paramter")
 		return
 	}
-	logger.Printf("match | %+v", match)
+	slog.Debug("ident scope match", "match", match)
 
 	wwwAuth := s.challengeRetrieve(match[1], match[2]+"/tags/list")
-	logger.Printf("wwwAuth | %s", wwwAuth)
+	slog.Debug("ident challenge retrieved", "www_authenticate", wwwAuth)
 
 	challenge := challengeParse(wwwAuth, account[0])
 	if challenge == "" {
 		s.writeOCIError(w, http.StatusFailedDependency, "UNSUPPORTED", "could not retrieve auth challenge")
 		return
 	}
-	logger.Printf("challenge | %s", challenge)
+	slog.Debug("ident challenge parsed", "challenge", challenge)
 
 	target, err := url.Parse(challenge)
 	if err != nil {

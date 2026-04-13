@@ -99,6 +99,25 @@
         }
       }
     },
+    "log": {
+      "description": "Global logger settings.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "description": "Logger wire format. 'json' emits standard slog JSON (Loki-compatible). 'journald' emits JSON using journald field conventions (MESSAGE, PRIORITY as syslog 0-7).",
+          "type": "string",
+          "enum": ["json", "journald"],
+          "default": "json"
+        },
+        "level": {
+          "description": "Minimum log level.",
+          "type": "string",
+          "enum": ["debug", "info", "warn", "error"],
+          "default": "info"
+        }
+      }
+    },
     "cache_url": {
       "description": "Default registry URL for 'hermes approve --cache'. Used when --cache is given without a URL.",
       "type": "string",
