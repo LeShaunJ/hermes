@@ -22,7 +22,7 @@ const (
 	StateApproved  State = "approved"
 	StateRescinded State = "rescinded"
 	StateRejected  State = "rejected"
-	StateError     State = "error"
+	StateErrored   State = "errored"
 )
 
 // Group categorises states into coarser buckets for filtering.
@@ -49,7 +49,7 @@ func GroupOf(s State) Group {
 // Returns the matched states (multiple for a group), or an error.
 func ParseStateOrGroup(s string) ([]State, error) {
 	switch State(s) {
-	case StateQueued, StateScanned, StateApproved, StateRescinded, StateRejected, StateError:
+	case StateQueued, StateScanned, StateApproved, StateRescinded, StateRejected, StateErrored:
 		return []State{State(s)}, nil
 	}
 	switch Group(s) {
@@ -171,44 +171,44 @@ func (d *DB) Close() {
 // migrate creates tables if they don't already exist.
 func (d *DB) migrate() error {
 	stmts := []string{
-		// Drop v1 schema tables only when they exist with the old column layout
-		// (no 'tag' FK column on images).  This guard runs on every startup but
-		// is a no-op once the schema has been migrated or freshly created.
-		`DO $$ BEGIN
-			IF EXISTS (
-				SELECT 1 FROM information_schema.tables
-				 WHERE table_schema = 'public' AND table_name = 'images'
-			) AND NOT EXISTS (
-				SELECT 1 FROM information_schema.columns
-				 WHERE table_schema = 'public'
-				   AND table_name   = 'images'
-				   AND column_name  = 'tag'
-			) THEN
-				DROP TABLE IF EXISTS events CASCADE;
-				DROP TABLE IF EXISTS images CASCADE;
-			END IF;
-		END $$`,
-
 		// registries — unique registry base URLs
 		`CREATE TABLE IF NOT EXISTS registries (
 			id         BIGSERIAL PRIMARY KEY,
+			mask       BIGINT REFERENCES registries(id),
 			url        TEXT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			UNIQUE (url)
 		)`,
 
+		// seed docker.io mask
+		`INSERT INTO registries (url)
+			VALUES ('docker.io')
+			ON CONFLICT (url) DO NOTHING
+		`,
+		// seed and mask Docker registries
+		`INSERT INTO registries (url, mask)
+			SELECT new_data.url, r.id
+			FROM (
+				VALUES ('index.docker.io'), ('registry-1.docker.io')
+			) AS new_data(url)
+			CROSS JOIN registries r
+			WHERE r.url = 'docker.io'
+			ON CONFLICT (url) DO NOTHING
+		`,
+
 		// state enum (PostgreSQL 16 supports IF NOT EXISTS on CREATE TYPE)
 		`DO $$ BEGIN
 			CREATE TYPE state AS ENUM
-				('queued','scanned','approved','rescinded','rejected','error');
+				('queued','scanned','approved','rescinded','rejected','errored');
 		EXCEPTION WHEN duplicate_object THEN NULL;
 		END $$`,
 
-		// tags — one row per (registry, repository, name) triple
+		// tags — one row per (registry, repository, name) triple.
+		// digest holds the top-level (manifest or index) digest the tag resolved to.
 		`CREATE TABLE IF NOT EXISTS tags (
 			id         BIGSERIAL PRIMARY KEY,
-			registry   BIGINT NOT NULL REFERENCES registries(id),
+			registry   BIGINT NOT NULL REFERENCES registries(id) ON DELETE CASCADE,
 			repository TEXT NOT NULL,
 			name       TEXT NOT NULL,
 			digest     TEXT,
@@ -217,12 +217,14 @@ func (d *DB) migrate() error {
 			UNIQUE (registry, repository, name)
 		)`,
 
-		// images — one row per platform image
+		// images — one row per platform image, identified independently of any
+		// tag.  Multiple tags may reference the same image via tag_images.
 		`CREATE TABLE IF NOT EXISTS images (
 			id              BIGSERIAL PRIMARY KEY,
-			cache_registry  BIGINT REFERENCES registries(id),
-			tag             BIGINT NOT NULL REFERENCES tags(id),
-			digest          TEXT,
+			registry        BIGINT NOT NULL REFERENCES registries(id) ON DELETE CASCADE,
+			repository      TEXT NOT NULL,
+			cache_registry  BIGINT REFERENCES registries(id) ON DELETE SET NULL,
+			digest          TEXT NOT NULL,
 			arch            TEXT,
 			os              TEXT,
 			manifest        jsonb,
@@ -230,7 +232,16 @@ func (d *DB) migrate() error {
 			state           state NOT NULL DEFAULT 'queued',
 			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			UNIQUE (tag, digest)
+			UNIQUE (registry, repository, digest)
+		)`,
+
+		// tag_images — many-to-many link between tags and images.
+		// A tag with no rows in this table is a "stub" (seen but not yet populated).
+		`CREATE TABLE IF NOT EXISTS tag_images (
+			tag        BIGINT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+			image      BIGINT NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (tag, image)
 		)`,
 
 		// events — audit log
@@ -243,41 +254,45 @@ func (d *DB) migrate() error {
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 
-		// images_before_insert trigger — suppresses duplicate NULL-digest placeholder
-		// rows and auto-removes any placeholder when a real image row is inserted.
-		`CREATE OR REPLACE FUNCTION images_before_insert()
-		RETURNS TRIGGER LANGUAGE plpgsql AS $$
-		BEGIN
-			IF NEW.digest IS NULL THEN
-				IF EXISTS (SELECT 1 FROM images WHERE tag = NEW.tag AND digest IS NULL) THEN
-					RETURN NULL;
-				END IF;
-			ELSE
-				DELETE FROM images WHERE tag = NEW.tag AND digest IS NULL;
-			END IF;
-			RETURN NEW;
-		END;
-		$$`,
-
-		`DO $$ BEGIN
-			IF NOT EXISTS (
-				SELECT 1 FROM pg_trigger WHERE tgname = 'images_before_insert'
-			) THEN
-				CREATE TRIGGER images_before_insert
-				BEFORE INSERT ON images
-				FOR EACH ROW EXECUTE FUNCTION images_before_insert();
-			END IF;
-		END $$`,
-
 		// indexes
 		`CREATE INDEX IF NOT EXISTS idx_tags_registry       ON tags(registry)`,
-		`CREATE INDEX IF NOT EXISTS idx_tags_digest         ON tags(digest)`,
-		`CREATE INDEX IF NOT EXISTS idx_images_tag          ON images(tag)`,
+		`CREATE INDEX IF NOT EXISTS idx_tags_digest         ON tags(registry, repository, digest)`,
 		`CREATE INDEX IF NOT EXISTS idx_images_state        ON images(state)`,
-		`CREATE INDEX IF NOT EXISTS idx_images_digest       ON images(digest)`,
+		`CREATE INDEX IF NOT EXISTS idx_images_lookup       ON images(registry, repository, digest)`,
 		`CREATE INDEX IF NOT EXISTS idx_images_manifest_gin ON images USING gin(manifest)`,
 		`CREATE INDEX IF NOT EXISTS idx_images_scanrpt_gin  ON images USING gin(scan_report)`,
+		`CREATE INDEX IF NOT EXISTS idx_tag_images_image    ON tag_images(image)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_image_id     ON events(image_id)`,
+
+		// tag_image_rows — canonical SELECT shape for every image query.
+		// A LEFT JOIN through tag_images lets stub tags (no linked image)
+		// appear as synthesised rows with image_id = 0 and state = 'queued',
+		// so callers do not need to duplicate the COALESCE column list.
+		// Both image_digest (platform-specific) and tag_digest (top-level
+		// manifest or index digest) are exposed so approval queries can
+		// select whichever is appropriate for upstream forwarding.
+		`CREATE OR REPLACE VIEW tag_image_rows AS
+			SELECT
+				COALESCE(i.id, 0)                     AS image_id,
+				t.id                                  AS tag_id,
+				r.url                                 AS registry_url,
+				t.repository                          AS repository,
+				t.name                                AS tag_name,
+				COALESCE(cr.url, '')                  AS cache_registry_url,
+				COALESCE(i.digest, '')                AS image_digest,
+				COALESCE(t.digest, '')                AS tag_digest,
+				COALESCE(i.arch, '')                  AS arch,
+				COALESCE(i.os, '')                    AS os,
+				COALESCE(i.manifest::text, 'null')    AS manifest,
+				COALESCE(i.scan_report::text, 'null') AS scan_report,
+				COALESCE(i.state::text, 'queued')     AS state,
+				COALESCE(i.created_at, t.created_at)  AS created_at,
+				COALESCE(i.updated_at, t.updated_at)  AS updated_at
+			FROM tags t
+			JOIN registries r       ON r.id  = t.registry
+			LEFT JOIN tag_images ti ON ti.tag = t.id
+			LEFT JOIN images i      ON i.id  = ti.image
+			LEFT JOIN registries cr ON cr.id = i.cache_registry`,
 	}
 	for _, s := range stmts {
 		if _, err := d.db.Exec(s); err != nil {
@@ -334,27 +349,42 @@ func (d *DB) insertTag(registryID int64, repository, tagName, digest string) (in
 	return id, err
 }
 
-// insertImage inserts a platform image row; skips silently on conflict.
-func (d *DB) insertImage(tagID int64, digest, arch, os string, manifest []byte) error {
+// insertImage inserts a platform image row keyed on (registry, repository,
+// digest) and returns its id.  Empty arch/os values are stored as NULL so an
+// upsert never overwrites better data with blanks.  Existing rows are left
+// unchanged (state, scan_report, etc. are preserved) and their id is returned.
+func (d *DB) insertImage(registryID int64, repository, digest, arch, os string, manifest []byte) (int64, error) {
+	var id int64
+	err := d.db.QueryRow(`
+		INSERT INTO images (registry, repository, digest, arch, os, manifest)
+		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), $6)
+		ON CONFLICT (registry, repository, digest) DO UPDATE
+			SET updated_at = NOW()
+		RETURNING id`,
+		registryID, repository, digest, arch, os, manifest,
+	).Scan(&id)
+	return id, err
+}
+
+// linkTagImage adds a (tag, image) pair to tag_images.  Idempotent.
+func (d *DB) linkTagImage(tagID, imageID int64) error {
 	_, err := d.db.Exec(`
-		INSERT INTO images (tag, digest, arch, os, manifest, state)
-		VALUES ($1, $2, $3, $4, $5, 'queued')
-		ON CONFLICT (tag, digest) DO NOTHING`,
-		tagID, digest, arch, os, manifest,
+		INSERT INTO tag_images (tag, image)
+		VALUES ($1, $2)
+		ON CONFLICT DO NOTHING`,
+		tagID, imageID,
 	)
 	return err
 }
 
-// imagesByTagID returns all image rows for a tag, with joined registry URL.
+// imagesByTagID returns all real image rows linked to the given tag.  Returns
+// an empty slice for stub tags (no tag_images entries).
 func (d *DB) imagesByTagID(tagID int64) ([]*Image, error) {
 	rows, err := d.db.Query(`
-		SELECT `+imageColumns+`
-		FROM images i
-		JOIN tags    t  ON t.id  = i.tag
-		JOIN registries r ON r.id = t.registry
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE i.tag = $1
-		ORDER BY i.id`,
+		SELECT `+imageCols+`
+		FROM tag_image_rows
+		WHERE tag_id = $1 AND image_id <> 0
+		ORDER BY image_id`,
 		tagID,
 	)
 	if err != nil {
@@ -366,12 +396,12 @@ func (d *DB) imagesByTagID(tagID int64) ([]*Image, error) {
 
 // ── Queue ─────────────────────────────────────────────────────────────────────
 
-// QueueStub ensures the registry, tag, and a placeholder image row exist
-// without making any outbound registry calls.  It is used by the API server
-// to register a first-seen tag so operators can see it in 'hermes list'.
-// The trigger images_before_insert suppresses duplicate NULL-digest rows and
-// auto-removes the placeholder when real image rows are inserted.
-// Manifest fetching happens lazily the first time the operator runs scan/approve.
+// QueueStub ensures the registry and tag rows exist without making any
+// outbound registry calls.  It is used by the API server to register a
+// first-seen tag so operators can see it in 'hermes list'.  A stub tag has no
+// linked image rows; manifest fetching and image insertion happen lazily the
+// first time the operator runs scan/approve (or when the API later adopts the
+// tag via AdoptTagByDigest).
 func (d *DB) QueueStub(ref ImageRef) error {
 	registryID, err := d.upsertRegistry(ref.Registry)
 	if err != nil {
@@ -382,27 +412,21 @@ func (d *DB) QueueStub(ref ImageRef) error {
 		return fmt.Errorf("get tag: %w", err)
 	}
 	if tagID == 0 {
-		tagID, err = d.insertTag(registryID, ref.Repository, ref.Tag, "")
-		if err != nil {
+		if _, err := d.insertTag(registryID, ref.Repository, ref.Tag, ""); err != nil {
 			return fmt.Errorf("insert stub tag: %w", err)
 		}
-	}
-	// Insert a NULL-digest placeholder image row so the tag appears in
-	// 'hermes list'.  The trigger suppresses this silently if one already exists.
-	_, err = d.db.Exec(`
-		INSERT INTO images (tag, state) VALUES ($1, 'queued')`,
-		tagID,
-	)
-	if err != nil {
-		return fmt.Errorf("insert placeholder: %w", err)
 	}
 	return nil
 }
 
 // Queue ensures the registry, tag, and per-platform image rows exist in the DB.
-// If the tag has no image rows yet (including when stub-registered by the API)
-// it fetches the manifest via fetcher and inserts one image row per platform.
-// Returns all image rows for the tag.
+// If the tag has no linked image rows yet (including when stub-registered by
+// the API) it fetches the manifest via fetcher and either:
+//   - adopts existing image rows when another tag in the same repository
+//     already references the upstream-returned digest (alternate-tag case), or
+//   - inserts new image rows per platform.
+//
+// Returns all image rows linked to the tag.
 func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 	// 1. Upsert registry.
 	registryID, err := d.upsertRegistry(ref.Registry)
@@ -410,7 +434,7 @@ func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 		return nil, fmt.Errorf("upsert registry: %w", err)
 	}
 
-	// 2. Check whether the tag already exists.
+	// 2. Check whether the tag already exists and is fully populated.
 	tagID, err := d.getTagID(registryID, ref.Repository, ref.Tag)
 	if err != nil {
 		return nil, fmt.Errorf("get tag: %w", err)
@@ -420,18 +444,10 @@ func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 		if err != nil {
 			return nil, fmt.Errorf("get images: %w", err)
 		}
-		// Filter out NULL-digest placeholder rows inserted by QueueStub.
-		var real []*Image
-		for _, img := range imgs {
-			if img.Digest != "" {
-				real = append(real, img)
-			}
+		if len(imgs) > 0 {
+			return imgs, nil
 		}
-		if len(real) > 0 {
-			return real, nil // already fully populated with real platform images
-		}
-		// Only placeholder rows exist (stub-registered by API).
-		// Fall through to fetch manifests and populate.
+		// Stub tag (no linked images) — fall through to populate.
 	}
 
 	// 3. Fetch the top-level manifest.
@@ -440,53 +456,99 @@ func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 		return nil, fmt.Errorf("fetch manifest for %s/%s:%s: %w", ref.Registry, ref.Repository, ref.Tag, err)
 	}
 
-	// 4. Insert tag row (with the top-level digest).
+	// 4. Look for existing images already known at this digest (alt-tag case).
+	existingIDs, err := d.findImageIDsByTagDigest(registryID, ref.Repository, digest)
+	if err != nil {
+		return nil, fmt.Errorf("find images by digest: %w", err)
+	}
+
+	// 5. Upsert the tag row with the resolved digest.
 	tagID, err = d.insertTag(registryID, ref.Repository, ref.Tag, digest)
 	if err != nil {
 		return nil, fmt.Errorf("insert tag: %w", err)
 	}
 
+	if len(existingIDs) > 0 {
+		// Adopt — link existing images to the new tag and skip refetching.
+		for _, imgID := range existingIDs {
+			if err := d.linkTagImage(tagID, imgID); err != nil {
+				return nil, fmt.Errorf("link tag→image: %w", err)
+			}
+		}
+		return d.imagesByTagID(tagID)
+	}
+
+	// 6. No alt-tag match — populate normally.
 	switch {
 	case isImageManifest(mediaType):
-		// Single-platform image.
-		if err := d.queueSingleImage(tagID, digest, ref.Registry, ref.Repository, manifest, fetcher); err != nil {
+		if err := d.queueSingleImage(tagID, registryID, ref.Registry, ref.Repository, digest, manifest, fetcher); err != nil {
 			return nil, err
 		}
-
 	case isImageIndex(mediaType):
-		// Multi-platform image index.
-		if err := d.queueIndexImages(tagID, ref.Registry, ref.Repository, manifest, fetcher); err != nil {
+		if err := d.queueIndexImages(tagID, registryID, ref.Registry, ref.Repository, manifest, fetcher); err != nil {
 			return nil, err
 		}
-
 	default:
-		// Unknown media type — insert a placeholder row so the tag is tracked.
-		if err := d.insertImage(tagID, digest, "", "", manifest); err != nil {
+		// Unknown media type — insert a minimal image row so the tag is tracked.
+		imgID, err := d.insertImage(registryID, ref.Repository, digest, "", "", manifest)
+		if err != nil {
 			return nil, fmt.Errorf("insert image (unknown media type): %w", err)
+		}
+		if err := d.linkTagImage(tagID, imgID); err != nil {
+			return nil, fmt.Errorf("link image: %w", err)
 		}
 	}
 
 	return d.imagesByTagID(tagID)
 }
 
-// queueSingleImage fetches the config for a single-platform manifest and inserts
-// an image row.
-func (d *DB) queueSingleImage(tagID int64, digest, registry, repository string, manifest []byte, fetcher Fetcher) error {
-	configDigest, err := extractConfigDigest(manifest)
+// findImageIDsByTagDigest returns the distinct ids of all images currently
+// linked to any tag in (registryID, repository) whose digest equals the given
+// value.  This drives the alternate-tag adoption path.
+func (d *DB) findImageIDsByTagDigest(registryID int64, repository, digest string) ([]int64, error) {
+	rows, err := d.db.Query(`
+		SELECT DISTINCT ti.image
+		FROM tags t
+		JOIN tag_images ti ON ti.tag = t.id
+		WHERE t.registry = $1 AND t.repository = $2 AND t.digest = $3`,
+		registryID, repository, digest,
+	)
 	if err != nil {
-		// Insert without arch/os if config extraction fails.
-		return d.insertImage(tagID, digest, "", "", manifest)
+		return nil, err
 	}
-	arch, os, err := fetcher.FetchConfig(registry, repository, configDigest)
+	defer func() { _ = rows.Close() }()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// queueSingleImage inserts a row for a single-platform manifest, best-effort
+// resolving arch/os from the image config, then links it to the tag.
+func (d *DB) queueSingleImage(tagID, registryID int64, registry, repository, digest string, manifest []byte, fetcher Fetcher) error {
+	var arch, os string
+	if configDigest, err := extractConfigDigest(manifest); err == nil {
+		if a, o, err := fetcher.FetchConfig(registry, repository, configDigest); err == nil {
+			arch, os = a, o
+		}
+	}
+	imgID, err := d.insertImage(registryID, repository, digest, arch, os, manifest)
 	if err != nil {
-		return d.insertImage(tagID, digest, "", "", manifest)
+		return fmt.Errorf("insert image: %w", err)
 	}
-	return d.insertImage(tagID, digest, arch, os, manifest)
+	return d.linkTagImage(tagID, imgID)
 }
 
 // queueIndexImages iterates the manifests in an image index, fetches each
-// known platform's manifest + config, and inserts image rows.
-func (d *DB) queueIndexImages(tagID int64, registry, repository string, indexManifest []byte, fetcher Fetcher) error {
+// known platform's manifest + config, inserts image rows, and links them to
+// the tag.
+func (d *DB) queueIndexImages(tagID, registryID int64, registry, repository string, indexManifest []byte, fetcher Fetcher) error {
 	var idx struct {
 		Manifests []struct {
 			MediaType string `json:"mediaType"`
@@ -529,8 +591,12 @@ func (d *DB) queueIndexImages(tagID int64, registry, repository string, indexMan
 			}
 		}
 
-		if err := d.insertImage(tagID, mDigest, arch, os, mBody); err != nil {
+		imgID, err := d.insertImage(registryID, repository, mDigest, arch, os, mBody)
+		if err != nil {
 			return fmt.Errorf("insert image %s: %w", mDigest, err)
+		}
+		if err := d.linkTagImage(tagID, imgID); err != nil {
+			return fmt.Errorf("link image %s: %w", mDigest, err)
 		}
 	}
 	return nil
@@ -606,7 +672,7 @@ func (d *DB) Reject(imageID int64) error {
 
 // SetError sets a platform image's state to error.
 func (d *DB) SetError(imageID int64) error {
-	return d.setImageState(imageID, StateError)
+	return d.setImageState(imageID, StateErrored)
 }
 
 func (d *DB) setImageState(imageID int64, state State) error {
@@ -620,14 +686,23 @@ func (d *DB) setImageState(imageID int64, state State) error {
 
 // ── image queries ─────────────────────────────────────────────────────────────
 
-// imageColumns is the SELECT column list for all image queries (requires joins
-// with aliases i, t, r, cr).
-const imageColumns = `
-	i.id, i.tag, r.url, t.repository, t.name,
-	COALESCE(cr.url, ''),
-	COALESCE(i.digest, ''), COALESCE(i.arch, ''), COALESCE(i.os, ''),
-	COALESCE(i.manifest::text, 'null'), COALESCE(i.scan_report::text, 'null'),
-	i.state::text, i.created_at, i.updated_at`
+// imageCols is the default SELECT column list for queries against the
+// tag_image_rows view.  It returns the platform image digest (image_digest)
+// as the .Digest field, which is what callers want for digest-addressed
+// lookups and general listing.
+const imageCols = `
+	image_id, tag_id, registry_url, repository, tag_name,
+	cache_registry_url, image_digest, arch, os,
+	manifest, scan_report, state, created_at, updated_at`
+
+// imageColsTagDigest is the column list for queries that want the tag's
+// top-level (manifest or index) digest as the .Digest field — used by
+// GetApproved so the gateway forwards tag requests pinned to the resolved
+// upstream digest.
+const imageColsTagDigest = `
+	image_id, tag_id, registry_url, repository, tag_name,
+	cache_registry_url, tag_digest, arch, os,
+	manifest, scan_report, state, created_at, updated_at`
 
 func scanImageRow(row *sql.Row) (*Image, error) {
 	img := &Image{}
@@ -673,30 +748,29 @@ func scanImageRows(rows *sql.Rows) ([]*Image, error) {
 	return out, rows.Err()
 }
 
-// GetByID returns the Image with the given id, or nil if not found.
+// GetByID returns the Image with the given id, or nil if not found.  When the
+// image is linked to multiple tags the row from the lowest-id tag is returned.
 func (d *DB) GetByID(id int64) (*Image, error) {
 	row := d.db.QueryRow(`
-		SELECT `+imageColumns+`
-		FROM images i
-		JOIN tags    t  ON t.id  = i.tag
-		JOIN registries r ON r.id = t.registry
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE i.id = $1`,
+		SELECT `+imageCols+`
+		FROM tag_image_rows
+		WHERE image_id = $1
+		ORDER BY tag_id
+		LIMIT 1`,
 		id,
 	)
 	return scanImageRow(row)
 }
 
-// GetByRef returns all platform images for the given tag reference.
+// GetByRef returns all platform images linked to the given tag reference.
+// Stub tags (no linked images) yield a single synthesised row with empty
+// digest/arch/os and state 'queued', so callers can still discover the tag.
 func (d *DB) GetByRef(ref ImageRef) ([]*Image, error) {
 	rows, err := d.db.Query(`
-		SELECT `+imageColumns+`
-		FROM images i
-		JOIN tags    t  ON t.id  = i.tag
-		JOIN registries r ON r.id = t.registry
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
-		ORDER BY i.id`,
+		SELECT `+imageCols+`
+		FROM tag_image_rows
+		WHERE registry_url = $1 AND repository = $2 AND tag_name = $3
+		ORDER BY image_id`,
 		ref.Registry, ref.Repository, ref.Tag,
 	)
 	if err != nil {
@@ -706,74 +780,73 @@ func (d *DB) GetByRef(ref ImageRef) ([]*Image, error) {
 	return scanImageRows(rows)
 }
 
-// GetApproved returns the first approved platform image for the given tag, or nil.
+// GetApproved returns the first approved platform image linked to the given
+// tag, or nil.  The returned image's Digest is the tag's top-level digest
+// (manifest or index) so callers can pin the upstream request.
 func (d *DB) GetApproved(registry, repository, tag string) (*Image, error) {
 	row := d.db.QueryRow(`
-		SELECT
-			i.id, i.tag, r.url, t.repository, t.name,
-			COALESCE(cr.url, ''),
-			COALESCE(t.digest, ''), COALESCE(i.arch, ''), COALESCE(i.os, ''),
-			COALESCE(i.manifest::text, 'null'), COALESCE(i.scan_report::text, 'null'),
-			i.state::text, i.created_at, i.updated_at
-		FROM images i
-		JOIN tags    t  ON t.id  = i.tag
-		JOIN registries r ON r.id = t.registry
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
-		  AND i.state = 'approved'
-		ORDER BY i.id
+		SELECT `+imageColsTagDigest+`
+		FROM tag_image_rows
+		WHERE registry_url = $1 AND repository = $2 AND tag_name = $3
+		  AND state = 'approved'
+		ORDER BY image_id
 		LIMIT 1`,
 		registry, repository, tag,
 	)
 	return scanImageRow(row)
 }
 
-// GetApprovedByDigest returns an approved image matching the given digest, or nil.
+// GetApprovedByDigest returns an approved image matching the given digest, or
+// nil.  The lookup matches both platform-manifest digests (images.digest) and
+// top-level/index digests (tags.digest with at least one approved linked
+// image).  The returned image's Digest field echoes the requested digest so
+// callers may forward the request unchanged.
 func (d *DB) GetApprovedByDigest(registry, repository, digest string) (*Image, error) {
 	row := d.db.QueryRow(`
-		SELECT `+imageColumns+`
-		FROM images i
-		JOIN tags    t  ON t.id  = i.tag
-		JOIN registries r ON r.id = t.registry
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND t.repository = $2
-		  AND i.digest = $3
-		  AND i.state = 'approved'
+		SELECT
+			image_id, tag_id, registry_url, repository, tag_name,
+			cache_registry_url, $3::text, arch, os,
+			manifest, scan_report, state, created_at, updated_at
+		FROM tag_image_rows
+		WHERE registry_url = $1 AND repository = $2
+		  AND (image_digest = $3 OR tag_digest = $3)
+		  AND state = 'approved'
+		ORDER BY CASE WHEN image_digest = $3 THEN 0 ELSE 1 END, image_id
 		LIMIT 1`,
 		registry, repository, digest,
 	)
 	return scanImageRow(row)
 }
 
-// GetApprovedByTagAndDigest returns an approved image matching digest whose tag
-// name also equals tag, or nil.
+// GetApprovedByTagAndDigest returns an approved image matching the given
+// digest whose tag name also equals tag, or nil.  Like GetApprovedByDigest the
+// lookup considers both platform and top-level digests.
 func (d *DB) GetApprovedByTagAndDigest(registry, repository, tag, digest string) (*Image, error) {
 	row := d.db.QueryRow(`
-		SELECT `+imageColumns+`
-		FROM images i
-		JOIN tags    t  ON t.id  = i.tag
-		JOIN registries r ON r.id = t.registry
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
-		  AND i.digest = $4
-		  AND i.state = 'approved'
+		SELECT
+			image_id, tag_id, registry_url, repository, tag_name,
+			cache_registry_url, $4::text, arch, os,
+			manifest, scan_report, state, created_at, updated_at
+		FROM tag_image_rows
+		WHERE registry_url = $1 AND repository = $2 AND tag_name = $3
+		  AND (image_digest = $4 OR tag_digest = $4)
+		  AND state = 'approved'
+		ORDER BY CASE WHEN image_digest = $4 THEN 0 ELSE 1 END, image_id
 		LIMIT 1`,
 		registry, repository, tag, digest,
 	)
 	return scanImageRow(row)
 }
 
-// GetRejected returns the first rejected platform image for the given tag, or nil.
+// GetRejected returns the first rejected platform image linked to the given
+// tag, or nil.
 func (d *DB) GetRejected(registry, repository, tag string) (*Image, error) {
 	row := d.db.QueryRow(`
-		SELECT `+imageColumns+`
-		FROM images i
-		JOIN tags    t  ON t.id  = i.tag
-		JOIN registries r ON r.id = t.registry
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
-		  AND i.state = 'rejected'
-		ORDER BY i.id
+		SELECT `+imageCols+`
+		FROM tag_image_rows
+		WHERE registry_url = $1 AND repository = $2 AND tag_name = $3
+		  AND state = 'rejected'
+		ORDER BY image_id
 		LIMIT 1`,
 		registry, repository, tag,
 	)
@@ -789,6 +862,8 @@ type ListFilter struct {
 }
 
 // List returns images ordered by updated_at DESC, with optional filtering.
+// Stub tags (no linked images) are included as synthesised rows with state
+// 'queued' and empty digest/arch/os fields.
 func (d *DB) List(f ListFilter) ([]Image, error) {
 	var (
 		conditions []string
@@ -801,7 +876,7 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 		for i, s := range f.States {
 			stateStrs[i] = string(s)
 		}
-		conditions = append(conditions, fmt.Sprintf("i.state::text = ANY($%d)", argIdx))
+		conditions = append(conditions, fmt.Sprintf("state = ANY($%d)", argIdx))
 		args = append(args, pq.Array(stateStrs))
 		argIdx++
 	}
@@ -816,13 +891,13 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 			}
 			if tag != "" {
 				refConds = append(refConds, fmt.Sprintf(
-					"(t.repository = $%d AND t.name = $%d)",
+					"(repository = $%d AND tag_name = $%d)",
 					argIdx, argIdx+1,
 				))
 				args = append(args, r, tag)
 				argIdx += 2
 			} else {
-				refConds = append(refConds, fmt.Sprintf("t.repository = $%d", argIdx))
+				refConds = append(refConds, fmt.Sprintf("repository = $%d", argIdx))
 				args = append(args, r)
 				argIdx++
 			}
@@ -836,13 +911,10 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 	}
 
 	query := fmt.Sprintf(`
-		SELECT `+imageColumns+`
-		FROM images i
-		JOIN tags    t  ON t.id  = i.tag
-		JOIN registries r ON r.id = t.registry
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
+		SELECT `+imageCols+`
+		FROM tag_image_rows
 		%s
-		ORDER BY i.updated_at DESC`, where)
+		ORDER BY updated_at DESC`, where)
 
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
@@ -859,6 +931,105 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 		out[i] = *p
 	}
 	return out, nil
+}
+
+// ── blob authorization ────────────────────────────────────────────────────────
+
+// BlobAuthorized reports whether the given blob digest belongs to an approved
+// image in (registry, repository).  A blob is authorized when it appears as
+// either the config digest or one of the layer digests of an approved image's
+// manifest.  The check uses jsonb containment so the GIN index on images.manifest
+// can answer it without scanning rows.
+func (d *DB) BlobAuthorized(registry, repository, digest string) (bool, error) {
+	configContains, err := json.Marshal(map[string]any{
+		"config": map[string]string{"digest": digest},
+	})
+	if err != nil {
+		return false, fmt.Errorf("marshal config containment: %w", err)
+	}
+	layersContains, err := json.Marshal(map[string]any{
+		"layers": []map[string]string{{"digest": digest}},
+	})
+	if err != nil {
+		return false, fmt.Errorf("marshal layers containment: %w", err)
+	}
+
+	var ok bool
+	err = d.db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM images i
+			JOIN registries r ON r.id = i.registry
+			WHERE r.url = $1 AND i.repository = $2
+			  AND i.state = 'approved'
+			  AND (i.manifest @> $3::jsonb OR i.manifest @> $4::jsonb)
+		)`,
+		registry, repository, string(configContains), string(layersContains),
+	).Scan(&ok)
+	return ok, err
+}
+
+// ── alternate-tag adoption ────────────────────────────────────────────────────
+
+// AdoptTagByDigest looks for image rows already linked to any tag in
+// (registry, repository) whose digest equals the given value, and links them
+// to a (newly created if needed) tag with the supplied name.  It returns true
+// when at least one of the adopted images is in the approved state, signalling
+// to the caller that the new tag may be served immediately.
+//
+// This is the alternate-tag detection helper used by the API server: when an
+// unknown tag is requested but the upstream returns a manifest digest that is
+// already known and approved in the DB, the new tag inherits the existing
+// approval state without re-fetching or re-scanning.
+func (d *DB) AdoptTagByDigest(ref ImageRef, digest string) (bool, error) {
+	registryID, err := d.upsertRegistry(ref.Registry)
+	if err != nil {
+		return false, fmt.Errorf("upsert registry: %w", err)
+	}
+
+	rows, err := d.db.Query(`
+		SELECT DISTINCT ti.image, i.state::text
+		FROM tags t
+		JOIN tag_images ti ON ti.tag = t.id
+		JOIN images i      ON i.id  = ti.image
+		WHERE t.registry = $1 AND t.repository = $2 AND t.digest = $3`,
+		registryID, ref.Repository, digest,
+	)
+	if err != nil {
+		return false, fmt.Errorf("lookup digest: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var imageIDs []int64
+	hasApproved := false
+	for rows.Next() {
+		var id int64
+		var state string
+		if err := rows.Scan(&id, &state); err != nil {
+			return false, err
+		}
+		imageIDs = append(imageIDs, id)
+		if state == string(StateApproved) {
+			hasApproved = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+
+	if len(imageIDs) == 0 {
+		return false, nil
+	}
+
+	tagID, err := d.insertTag(registryID, ref.Repository, ref.Tag, digest)
+	if err != nil {
+		return false, fmt.Errorf("insert tag: %w", err)
+	}
+	for _, imgID := range imageIDs {
+		if err := d.linkTagImage(tagID, imgID); err != nil {
+			return false, fmt.Errorf("link tag→image: %w", err)
+		}
+	}
+	return hasApproved, nil
 }
 
 // ── event logging ─────────────────────────────────────────────────────────────
