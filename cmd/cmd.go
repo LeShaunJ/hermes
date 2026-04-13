@@ -53,8 +53,10 @@ authoritative gateway for OCI Distribution registries.`,
 			Level:  cfg.Log.Level,
 		}, os.Stderr)
 
-		// serve opens its own DB connection; skip here.
-		if cmd.Name() == "serve" {
+		// serve opens its own DB connection, and health doesn't need one at
+		// all — skip the connect for both so a dead DB doesn't block either.
+		switch cmd.Name() {
+		case "serve", "health":
 			return nil
 		}
 
