@@ -1068,42 +1068,70 @@ func TestExtractConfigDigest_invalidJSON(t *testing.T) {
 
 // ── BlobAuthorized ────────────────────────────────────────────────────────────
 
-func TestBlobAuthorized_true(t *testing.T) {
+func TestBlobAuthorized_originForward(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT EXISTS`)).
+	// Authorized without a cache_registry → empty string, forward to origin.
+	mock.ExpectQuery(`SELECT COALESCE\(cr\.url, ''\)`).
 		WithArgs("registry.example.com", "myrepo",
 			sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		WillReturnRows(sqlmock.NewRows([]string{"cache_url"}).AddRow(""))
 
-	ok, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
+	ok, cache, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
 	if err != nil {
 		t.Fatalf("BlobAuthorized: %v", err)
 	}
 	if !ok {
-		t.Error("expected true")
+		t.Error("expected authorized=true")
+	}
+	if cache != "" {
+		t.Errorf("cache = %q, want empty", cache)
 	}
 }
 
-func TestBlobAuthorized_false(t *testing.T) {
+func TestBlobAuthorized_cacheForward(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT EXISTS`)).
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectQuery(`SELECT COALESCE\(cr\.url, ''\)`).
+		WithArgs("registry.example.com", "myrepo",
+			sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"cache_url"}).
+			AddRow("cache.internal.example.com"))
 
-	ok, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
+	ok, cache, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
+	if err != nil {
+		t.Fatalf("BlobAuthorized: %v", err)
+	}
+	if !ok {
+		t.Error("expected authorized=true")
+	}
+	if cache != "cache.internal.example.com" {
+		t.Errorf("cache = %q, want cache.internal.example.com", cache)
+	}
+}
+
+func TestBlobAuthorized_noOwner(t *testing.T) {
+	d, mock := newMockDB(t)
+	// No rows → unauthorized.
+	mock.ExpectQuery(`SELECT COALESCE\(cr\.url, ''\)`).
+		WillReturnRows(sqlmock.NewRows([]string{"cache_url"}))
+
+	ok, cache, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
 	if err != nil {
 		t.Fatalf("BlobAuthorized: %v", err)
 	}
 	if ok {
-		t.Error("expected false")
+		t.Error("expected authorized=false")
+	}
+	if cache != "" {
+		t.Errorf("cache = %q, want empty on unauthorized", cache)
 	}
 }
 
 func TestBlobAuthorized_dbError(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT EXISTS`)).
+	mock.ExpectQuery(`SELECT COALESCE\(cr\.url, ''\)`).
 		WillReturnError(fmt.Errorf("connection refused"))
 
-	_, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
+	_, _, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
 	if err == nil {
 		t.Error("expected error, got nil")
 	}

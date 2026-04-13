@@ -58,7 +58,7 @@ type storage interface {
 	GetRejected(registry, repository, tag string) (*db.Image, error)
 	QueueStub(ref db.ImageRef) error
 	AdoptTagByDigest(ref db.ImageRef, digest string) (bool, error)
-	BlobAuthorized(registry, repository, digest string) (bool, error)
+	BlobAuthorized(registry, repository, digest string) (authorized bool, cacheRegistry string, err error)
 	LogEvent(imageID *int64, source db.EventSource, eventType string, details map[string]interface{}) error
 }
 
@@ -156,18 +156,26 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 
 	if img != nil {
 		// Approved — proxy/redirect to upstream using the pinned digest ref.
+		// When the image has been cached, the cache registry is the forward
+		// target instead of the origin; a cached image keeps serving even if
+		// the origin later removes or rewrites the digest.
 		ref := img.Digest
 		if ref == "" {
 			ref = p.Tag
 		}
+		forwardRegistry := p.Registry
+		if img.CacheRegistry != "" {
+			forwardRegistry = img.CacheRegistry
+		}
 		_ = s.db.LogEvent(&img.ID, db.SourceAPI, "validate_approved", map[string]interface{}{
-			"registry":   p.Registry,
-			"repository": p.Repository,
-			"tag":        p.Tag,
-			"digest":     p.Digest,
-			"latency_ms": time.Since(start).Milliseconds(),
+			"registry":         p.Registry,
+			"repository":       p.Repository,
+			"tag":              p.Tag,
+			"digest":           p.Digest,
+			"forward_registry": forwardRegistry,
+			"latency_ms":       time.Since(start).Milliseconds(),
 		})
-		s.proxyOrRedirect(w, r, p.Registry, "/v2/"+p.Repository+"/manifests/"+ref)
+		s.proxyOrRedirect(w, r, forwardRegistry, "/v2/"+p.Repository+"/manifests/"+ref)
 		return
 	}
 
@@ -300,8 +308,10 @@ func rewriteResponseOCIError(resp *http.Response, status int, code, message stri
 
 // serveBlob authorizes a /v2/<registry>/<repo>/blobs/<digest> download against
 // the database and either forwards it to the upstream registry or denies it.
+// When any owning approved image has been cached, the blob is served from the
+// cache registry so it stays available even if the origin has removed it.
 func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath, start time.Time) {
-	ok, err := s.db.BlobAuthorized(p.Registry, p.Repository, p.Digest)
+	ok, cacheRegistry, err := s.db.BlobAuthorized(p.Registry, p.Repository, p.Digest)
 	if err != nil {
 		slog.Error("blob authz", "registry", p.Registry, "repository", p.Repository, "digest", p.Digest, "err", err)
 		s.writeOCIError(w, http.StatusInternalServerError, "UNKNOWN", "internal error")
@@ -317,13 +327,18 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath,
 		s.writeOCIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "blob not part of an approved image")
 		return
 	}
+	forwardRegistry := p.Registry
+	if cacheRegistry != "" {
+		forwardRegistry = cacheRegistry
+	}
 	_ = s.db.LogEvent(nil, db.SourceAPI, "blob_approved", map[string]interface{}{
-		"registry":   p.Registry,
-		"repository": p.Repository,
-		"digest":     p.Digest,
-		"latency_ms": time.Since(start).Milliseconds(),
+		"registry":         p.Registry,
+		"repository":       p.Repository,
+		"digest":           p.Digest,
+		"forward_registry": forwardRegistry,
+		"latency_ms":       time.Since(start).Milliseconds(),
 	})
-	s.proxyOrRedirect(w, r, p.Registry, "/v2/"+p.Repository+"/blobs/"+p.Digest)
+	s.proxyOrRedirect(w, r, forwardRegistry, "/v2/"+p.Repository+"/blobs/"+p.Digest)
 }
 
 // challengeRetrieve probes GET https://<registry>/v2/<path> and returns the

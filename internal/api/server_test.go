@@ -32,6 +32,7 @@ type mockStorage struct {
 	adoptCalls  int
 
 	blobAuthorized   bool
+	blobAuthCache    string
 	blobAuthErr      error
 	blobAuthRegistry string
 	blobAuthRepo     string
@@ -55,11 +56,11 @@ func (m *mockStorage) AdoptTagByDigest(_ db.ImageRef, _ string) (bool, error) {
 	m.adoptCalls++
 	return m.adoptResult, m.adoptErr
 }
-func (m *mockStorage) BlobAuthorized(registry, repository, digest string) (bool, error) {
+func (m *mockStorage) BlobAuthorized(registry, repository, digest string) (bool, string, error) {
 	m.blobAuthRegistry = registry
 	m.blobAuthRepo = repository
 	m.blobAuthDigest = digest
-	return m.blobAuthorized, m.blobAuthErr
+	return m.blobAuthorized, m.blobAuthCache, m.blobAuthErr
 }
 func (m *mockStorage) LogEvent(_ *int64, _ db.EventSource, _ string, _ map[string]interface{}) error {
 	return m.logEventErr
@@ -374,6 +375,49 @@ func TestServeOCI_approved_emptyDigest(t *testing.T) {
 	}
 }
 
+func TestServeOCI_approved_forwardsToCacheRegistry(t *testing.T) {
+	// Approved image with a cache registry: the redirect Location must point
+	// at the cache host, not the origin (p.Registry).
+	img := makeTestImage(db.StateApproved)
+	img.CacheRegistry = "cache.internal.example.com"
+	store := &mockStorage{approved: img}
+	s := newMockServer(store, "http://localhost:8080", true)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/latest", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want 307", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.Contains(loc, "cache.internal.example.com") {
+		t.Errorf("Location = %q, want cache host", loc)
+	}
+	if strings.Contains(loc, "registry.example.com") {
+		t.Errorf("Location = %q, must not reference origin", loc)
+	}
+}
+
+func TestServeOCI_approved_uncachedForwardsToOrigin(t *testing.T) {
+	img := makeTestImage(db.StateApproved)
+	img.CacheRegistry = "" // uncached
+	store := &mockStorage{approved: img}
+	s := newMockServer(store, "http://localhost:8080", true)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/latest", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want 307", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.Contains(loc, "registry.example.com") {
+		t.Errorf("Location = %q, want origin host", loc)
+	}
+}
+
 func TestServeOCI_rejected(t *testing.T) {
 	img := makeTestImage(db.StateRejected)
 	store := &mockStorage{rejected: img}
@@ -461,6 +505,29 @@ func TestServeOCI_blob_authorized(t *testing.T) {
 	}
 	if store.blobAuthRepo != "myrepo" {
 		t.Errorf("BlobAuthorized repo = %q, want myrepo", store.blobAuthRepo)
+	}
+}
+
+func TestServeOCI_blob_authorized_forwardsToCache(t *testing.T) {
+	store := &mockStorage{
+		blobAuthorized: true,
+		blobAuthCache:  "cache.internal.example.com",
+	}
+	s := newMockServer(store, "http://localhost:8080", true)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/blobs/sha256:abc", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want 307", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.Contains(loc, "cache.internal.example.com") {
+		t.Errorf("Location = %q, want cache host", loc)
+	}
+	if strings.Contains(loc, "registry.example.com") {
+		t.Errorf("Location = %q, must not reference origin", loc)
 	}
 }
 

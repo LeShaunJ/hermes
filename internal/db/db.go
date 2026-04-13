@@ -954,32 +954,46 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 // either the config digest or one of the layer digests of an approved image's
 // manifest.  The check uses jsonb containment so the GIN index on images.manifest
 // can answer it without scanning rows.
-func (d *DB) BlobAuthorized(registry, repository, digest string) (bool, error) {
+//
+// The second return is the cache registry URL to forward the blob request to:
+// when at least one owning image has cache_registry set hermes serves the blob
+// from cache (protecting against upstream removal), preferring cached owners
+// over uncached ones and breaking ties by the smallest image id.  An empty
+// string means "forward to origin".
+func (d *DB) BlobAuthorized(registry, repository, digest string) (bool, string, error) {
 	configContains, err := json.Marshal(map[string]any{
 		"config": map[string]string{"digest": digest},
 	})
 	if err != nil {
-		return false, fmt.Errorf("marshal config containment: %w", err)
+		return false, "", fmt.Errorf("marshal config containment: %w", err)
 	}
 	layersContains, err := json.Marshal(map[string]any{
 		"layers": []map[string]string{{"digest": digest}},
 	})
 	if err != nil {
-		return false, fmt.Errorf("marshal layers containment: %w", err)
+		return false, "", fmt.Errorf("marshal layers containment: %w", err)
 	}
 
-	var ok bool
+	var cacheURL sql.NullString
 	err = d.db.QueryRow(`
-		SELECT EXISTS (
-			SELECT 1 FROM images i
-			JOIN registries r ON r.id = i.registry
-			WHERE r.url = $1 AND i.repository = $2
-			  AND i.state = 'approved'
-			  AND (i.manifest @> $3::jsonb OR i.manifest @> $4::jsonb)
-		)`,
+		SELECT COALESCE(cr.url, '')
+		FROM images i
+		JOIN registries r        ON r.id  = i.registry
+		LEFT JOIN registries cr  ON cr.id = i.cache_registry
+		WHERE r.url = $1 AND i.repository = $2
+		  AND i.state = 'approved'
+		  AND (i.manifest @> $3::jsonb OR i.manifest @> $4::jsonb)
+		ORDER BY (i.cache_registry IS NULL), i.id
+		LIMIT 1`,
 		registry, repository, string(configContains), string(layersContains),
-	).Scan(&ok)
-	return ok, err
+	).Scan(&cacheURL)
+	if err == sql.ErrNoRows {
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", err
+	}
+	return true, cacheURL.String, nil
 }
 
 // ── alternate-tag adoption ────────────────────────────────────────────────────
