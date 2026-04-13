@@ -59,6 +59,8 @@ type storage interface {
 	QueueStub(ref db.ImageRef) error
 	AdoptTagByDigest(ref db.ImageRef, digest string) (bool, error)
 	BlobAuthorized(registry, repository, digest string) (authorized bool, cacheRegistry string, err error)
+	Void(imageID int64) error
+	VoidByBlob(registry, repository, digest string) ([]int64, error)
 	LogEvent(imageID *int64, source db.EventSource, eventType string, details map[string]interface{}) error
 }
 
@@ -175,7 +177,18 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 			"forward_registry": forwardRegistry,
 			"latency_ms":       time.Since(start).Milliseconds(),
 		})
-		s.proxyOrRedirect(w, r, forwardRegistry, "/v2/"+p.Repository+"/manifests/"+ref)
+		// Only attach the void hook when forwarding to the origin for a
+		// digest-addressed request: cached images stay servable from the
+		// cache registry, and tag-only requests cannot distinguish "tag
+		// moved" from "digest gone" — that's what the adoption path is for.
+		// Redirect mode also skips voiding because hermes never sees the
+		// upstream response.
+		var hooks []responseHook
+		if !s.cfg.Server.Redirect && img.CacheRegistry == "" &&
+			(p.Kind == refKindDigest || p.Kind == refKindTagAndDigest) {
+			hooks = append(hooks, s.voidManifestHook(img, p, start))
+		}
+		s.proxyOrRedirect(w, r, forwardRegistry, "/v2/"+p.Repository+"/manifests/"+ref, hooks...)
 		return
 	}
 
@@ -282,6 +295,99 @@ func (s *Server) adoptTagResponseHook(ref db.ImageRef, start time.Time) response
 	}
 }
 
+// voidCodes are the OCI Distribution error codes that unambiguously mean
+// "this digest no longer exists upstream".  Any other 404 body — NAME_UNKNOWN,
+// DENIED, UNAUTHORIZED, a Docker-Hub private-repo masquerade, etc. — is
+// treated as a transient or auth-level failure and does not trigger voiding.
+var voidCodes = map[string]bool{
+	"MANIFEST_UNKNOWN": true,
+	"BLOB_UNKNOWN":     true,
+}
+
+// shouldVoid reports whether an upstream response means the addressed
+// digest is gone.  It is true for 410 Gone unconditionally and for 404
+// Not Found with a CNCF error body carrying a code in voidCodes.  The
+// response body is read into memory and then replaced with an identical
+// io.NopCloser so the client still receives the bytes unchanged.
+func shouldVoid(resp *http.Response) bool {
+	switch resp.StatusCode {
+	case http.StatusGone:
+		return true
+	case http.StatusNotFound:
+		// fall through
+	default:
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil || len(body) == 0 {
+		return false
+	}
+	var doc ociErrorResponse
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return false
+	}
+	for _, e := range doc.Errors {
+		if voidCodes[e.Code] {
+			return true
+		}
+	}
+	return false
+}
+
+// voidManifestHook returns a responseHook that voids the given image when
+// the upstream response indicates its digest no longer exists.  The hook
+// never rewrites the response — the client still sees the upstream 404/410.
+func (s *Server) voidManifestHook(img *db.Image, p parsedPath, start time.Time) responseHook {
+	return func(resp *http.Response) error {
+		if !shouldVoid(resp) {
+			return nil
+		}
+		if err := s.db.Void(img.ID); err != nil {
+			slog.Error("void image", "image_id", img.ID, "err", err)
+			return nil
+		}
+		_ = s.db.LogEvent(&img.ID, db.SourceAPI, "validate_voided", map[string]interface{}{
+			"registry":      p.Registry,
+			"repository":    p.Repository,
+			"tag":           p.Tag,
+			"digest":        p.Digest,
+			"upstream_code": resp.StatusCode,
+			"latency_ms":    time.Since(start).Milliseconds(),
+		})
+		return nil
+	}
+}
+
+// voidBlobHook returns a responseHook that voids every uncached approved
+// image whose manifest references digest when the upstream indicates the
+// blob is gone.
+func (s *Server) voidBlobHook(p parsedPath, start time.Time) responseHook {
+	return func(resp *http.Response) error {
+		if !shouldVoid(resp) {
+			return nil
+		}
+		ids, err := s.db.VoidByBlob(p.Registry, p.Repository, p.Digest)
+		if err != nil {
+			slog.Error("void by blob", "registry", p.Registry, "repository", p.Repository, "digest", p.Digest, "err", err)
+			return nil
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		_ = s.db.LogEvent(nil, db.SourceAPI, "blob_voided", map[string]interface{}{
+			"registry":         p.Registry,
+			"repository":       p.Repository,
+			"digest":           p.Digest,
+			"voided_image_ids": ids,
+			"upstream_code":    resp.StatusCode,
+			"latency_ms":       time.Since(start).Milliseconds(),
+		})
+		return nil
+	}
+}
+
 // rewriteResponseOCIError replaces a proxied response body with a CNCF OCI
 // error document and sets the appropriate headers.  Used by responseHooks
 // that need to turn upstream content into a hermes-owned error.
@@ -338,7 +444,14 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath,
 		"forward_registry": forwardRegistry,
 		"latency_ms":       time.Since(start).Milliseconds(),
 	})
-	s.proxyOrRedirect(w, r, forwardRegistry, "/v2/"+p.Repository+"/blobs/"+p.Digest)
+	// Void hook runs only on the origin-forward branch — cached blobs live
+	// in the cache registry and cannot meaningfully "disappear" upstream.
+	// Redirect mode also skips voiding since hermes never sees the response.
+	var hooks []responseHook
+	if !s.cfg.Server.Redirect && cacheRegistry == "" {
+		hooks = append(hooks, s.voidBlobHook(p, start))
+	}
+	s.proxyOrRedirect(w, r, forwardRegistry, "/v2/"+p.Repository+"/blobs/"+p.Digest, hooks...)
 }
 
 // challengeRetrieve probes GET https://<registry>/v2/<path> and returns the

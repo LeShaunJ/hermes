@@ -235,6 +235,47 @@ func TestSetError(t *testing.T) {
 	}
 }
 
+func TestVoid(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET state`)).
+		WithArgs("voided", int64(4)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := d.Void(4); err != nil {
+		t.Fatalf("Void: %v", err)
+	}
+}
+
+func TestVoidByBlob_voidsUncachedOwners(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE images`)).
+		WithArgs("registry.example.com", "myrepo",
+			sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).
+			AddRow(int64(7)).AddRow(int64(8)))
+
+	ids, err := d.VoidByBlob("registry.example.com", "myrepo", "sha256:abc")
+	if err != nil {
+		t.Fatalf("VoidByBlob: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != 7 || ids[1] != 8 {
+		t.Errorf("ids = %v, want [7 8]", ids)
+	}
+}
+
+func TestVoidByBlob_noMatches(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE images`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+	ids, err := d.VoidByBlob("registry.example.com", "myrepo", "sha256:abc")
+	if err != nil {
+		t.Fatalf("VoidByBlob: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("ids = %v, want empty", ids)
+	}
+}
+
 // ── Approve ───────────────────────────────────────────────────────────────────
 
 func TestApprove_noCacheRegistry(t *testing.T) {
@@ -924,6 +965,7 @@ func TestGroupOf(t *testing.T) {
 		{StateQueued, GroupPending},
 		{StateScanned, GroupPending},
 		{StateRescinded, GroupPending},
+		{StateVoided, GroupPending},
 		{StateApproved, GroupVerified},
 		{StateRejected, GroupVerified},
 		{StateErrored, ""},
@@ -948,9 +990,10 @@ func TestParseStateOrGroup(t *testing.T) {
 		{"scanned", []State{StateScanned}, false},
 		{"approved", []State{StateApproved}, false},
 		{"rescinded", []State{StateRescinded}, false},
+		{"voided", []State{StateVoided}, false},
 		{"rejected", []State{StateRejected}, false},
 		{"errored", []State{StateErrored}, false},
-		{"pending", []State{StateQueued, StateScanned, StateRescinded}, false},
+		{"pending", []State{StateQueued, StateScanned, StateRescinded, StateVoided}, false},
 		{"verified", []State{StateApproved, StateRejected}, false},
 		{"unknown", nil, true},
 		{"", nil, true},

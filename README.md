@@ -236,7 +236,10 @@ clients obtain bearer tokens through the `/ident/` proxy. It defaults to
 `server.redirect` controls how authorized upstream traffic (manifests, blobs,
 tag lists) is forwarded. When `false` (default), hermes reverse-proxies the
 request. When `true`, hermes sends an HTTP 307 redirect to the upstream URL —
-useful when clients have direct access to the upstream registry.
+useful when clients have direct access to the upstream registry. Automatic
+voiding of approved-but-disappeared digests (see [Image states](#image-states))
+requires proxy mode, because hermes never observes the upstream response in
+redirect mode.
 
 `log.format` selects the global logger wire format:
 
@@ -299,7 +302,10 @@ Approve this image? [YES / NO / REJECT] (default: NO):
 
 If `--cache` is provided, the image is pushed to `URL` (or `cache_url` from the
 config if no URL is given) upon `YES`. A successful push records the cache
-registry in the database. A failed push sets the state to `errored`.
+registry in the database and the gateway forwards future manifest and blob
+requests for the image to the cache registry instead of the origin — so the
+image stays pullable even if the origin later removes or rewrites its digest.
+A failed push sets the state to `errored`.
 
 > ```bash
 > hermes approve registry.example.com/myapp:v1.2.3
@@ -574,6 +580,6 @@ Append-only audit log of every CLI and API action.
 | `id`         | `bigserial`   | Primary key |
 | `image_id`   | `bigint`      | FK → `images.id` (nullable) |
 | `source`     | `text`        | `cli` or `api` |
-| `event_type` | `text`        | e.g. `scan`, `approve`, `validate_approved`, `validate_adopted`, `blob_approved`, `blob_denied` |
+| `event_type` | `text`        | e.g. `scan`, `approve`, `validate_approved`, `validate_adopted`, `validate_voided`, `blob_approved`, `blob_denied`, `blob_voided` |
 | `details`    | `text`        | JSON with context-specific fields |
 | `created_at` | `timestamptz` | |

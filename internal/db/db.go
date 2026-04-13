@@ -22,6 +22,7 @@ const (
 	StateScanned   State = "scanned"
 	StateApproved  State = "approved"
 	StateRescinded State = "rescinded"
+	StateVoided    State = "voided"
 	StateRejected  State = "rejected"
 	StateErrored   State = "errored"
 )
@@ -37,7 +38,7 @@ const (
 // GroupOf returns the Group for the given State, or "" for StateError.
 func GroupOf(s State) Group {
 	switch s {
-	case StateQueued, StateScanned, StateRescinded:
+	case StateQueued, StateScanned, StateRescinded, StateVoided:
 		return GroupPending
 	case StateApproved, StateRejected:
 		return GroupVerified
@@ -50,12 +51,12 @@ func GroupOf(s State) Group {
 // Returns the matched states (multiple for a group), or an error.
 func ParseStateOrGroup(s string) ([]State, error) {
 	switch State(s) {
-	case StateQueued, StateScanned, StateApproved, StateRescinded, StateRejected, StateErrored:
+	case StateQueued, StateScanned, StateApproved, StateRescinded, StateVoided, StateRejected, StateErrored:
 		return []State{State(s)}, nil
 	}
 	switch Group(s) {
 	case GroupPending:
-		return []State{StateQueued, StateScanned, StateRescinded}, nil
+		return []State{StateQueued, StateScanned, StateRescinded, StateVoided}, nil
 	case GroupVerified:
 		return []State{StateApproved, StateRejected}, nil
 	}
@@ -201,7 +202,7 @@ func (d *DB) migrate() error {
 		// state enum (PostgreSQL 16 supports IF NOT EXISTS on CREATE TYPE)
 		`DO $$ BEGIN
 			CREATE TYPE state AS ENUM
-				('queued','scanned','approved','rescinded','rejected','errored');
+				('queued','scanned','approved','rescinded','voided','rejected','errored');
 		EXCEPTION WHEN duplicate_object THEN NULL;
 		END $$`,
 
@@ -664,6 +665,62 @@ func (d *DB) Approve(imageID int64, cacheRegistry string) error {
 // Rescind sets a platform image's state to rescinded.
 func (d *DB) Rescind(imageID int64) error {
 	return d.setImageState(imageID, StateRescinded)
+}
+
+// Void sets a platform image's state to voided — its digest no longer
+// exists upstream and the image was not cached, so it cannot be served.
+func (d *DB) Void(imageID int64) error {
+	return d.setImageState(imageID, StateVoided)
+}
+
+// VoidByBlob flips every approved, uncached image in (registry, repository)
+// whose manifest references digest (as the config or one of the layers) to
+// the voided state.  Cached images are left alone — they remain servable
+// from the cache registry regardless of upstream state.  Returns the IDs of
+// the images that were voided so the caller can log them in an audit event.
+func (d *DB) VoidByBlob(registry, repository, digest string) ([]int64, error) {
+	configContains, err := json.Marshal(map[string]any{
+		"config": map[string]string{"digest": digest},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal config containment: %w", err)
+	}
+	layersContains, err := json.Marshal(map[string]any{
+		"layers": []map[string]string{{"digest": digest}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal layers containment: %w", err)
+	}
+
+	rows, err := d.db.Query(`
+		UPDATE images
+		SET state = 'voided', updated_at = NOW()
+		WHERE id IN (
+			SELECT i.id
+			FROM images i
+			JOIN registries r ON r.id = i.registry
+			WHERE r.url = $1 AND i.repository = $2
+			  AND i.state = 'approved'
+			  AND i.cache_registry IS NULL
+			  AND (i.manifest @> $3::jsonb OR i.manifest @> $4::jsonb)
+		)
+		RETURNING id`,
+		registry, repository, string(configContains), string(layersContains),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // Reject sets a platform image's state to rejected.
