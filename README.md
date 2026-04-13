@@ -294,7 +294,8 @@ Approve this image? [YES / NO / REJECT] (default: NO):
 
 - **YES** — sets state to `approved`; exits 0.
 - **NO** — no change; exits 0.
-- **REJECT** — sets state to `rejected`; exits 0.
+- **REJECT** — sets state to `rejected`; exits non-zero so the operator's shell
+  pipeline can treat it as a hard deny.
 
 If `--cache` is provided, the image is pushed to `URL` (or `cache_url` from the
 config if no URL is given) upon `YES`. A successful push records the cache
@@ -377,8 +378,8 @@ hermes report [--format FORMAT] [--output FILE] [--platform OS/ARCH] IMAGE
 ```
 
 Retrieves the stored trivy JSON report and converts it using `trivy convert`.
-Supported formats: `table`, `json`, `sarif`, `cyclonedx`, `spdx`, `spdx-json`,
-`github`, `cosign-vuln`. Output goes to stdout or `FILE`.
+Supported formats: `table`, `json`, `template`, `sarif`, `cyclonedx`, `spdx`,
+`spdx-json`, `github`, `cosign-vuln`. Output goes to stdout or `FILE`.
 
 > ```bash
 > hermes report registry.example.com/myapp:v1.2.3
