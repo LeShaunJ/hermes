@@ -860,6 +860,8 @@ func (d *DB) GetRejected(registry, repository, tag string) (*Image, error) {
 type ListFilter struct {
 	States []State  // empty = all
 	Refs   []string // "namespace/name[:tag]" patterns; empty = all
+	OS     string   // exact match, "" = any
+	Arch   string   // exact match, "" = any
 }
 
 // List returns images ordered by updated_at DESC, with optional filtering.
@@ -879,6 +881,17 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 		}
 		conditions = append(conditions, fmt.Sprintf("state = ANY($%d)", argIdx))
 		args = append(args, pq.Array(stateStrs))
+		argIdx++
+	}
+
+	if f.OS != "" {
+		conditions = append(conditions, fmt.Sprintf("os = $%d", argIdx))
+		args = append(args, f.OS)
+		argIdx++
+	}
+	if f.Arch != "" {
+		conditions = append(conditions, fmt.Sprintf("arch = $%d", argIdx))
+		args = append(args, f.Arch)
 		argIdx++
 	}
 

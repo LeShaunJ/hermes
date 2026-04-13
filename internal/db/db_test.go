@@ -590,6 +590,34 @@ func TestList_withRefFilter_noTag(t *testing.T) {
 	}
 }
 
+func TestList_withPlatformFilter(t *testing.T) {
+	d, mock := newMockDB(t)
+	// os + arch both bound as query args in that order.
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("linux", "arm64").
+		WillReturnRows(testImageRow(4, "approved"))
+
+	imgs, err := d.List(ListFilter{OS: "linux", Arch: "arm64"})
+	if err != nil {
+		t.Fatalf("List with platform: %v", err)
+	}
+	if len(imgs) != 1 {
+		t.Errorf("len = %d, want 1", len(imgs))
+	}
+}
+
+func TestList_withPlatformFilter_osOnly(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("linux").
+		WillReturnRows(sqlmock.NewRows(imageRowCols))
+
+	_, err := d.List(ListFilter{OS: "linux"})
+	if err != nil {
+		t.Fatalf("List os-only: %v", err)
+	}
+}
+
 // ── QueueStub ─────────────────────────────────────────────────────────────────
 
 func TestQueueStub_newTag(t *testing.T) {
