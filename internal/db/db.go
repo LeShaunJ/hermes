@@ -263,6 +263,36 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_images_scanrpt_gin  ON images USING gin(scan_report)`,
 		`CREATE INDEX IF NOT EXISTS idx_tag_images_image    ON tag_images(image)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_image_id     ON events(image_id)`,
+
+		// tag_image_rows — canonical SELECT shape for every image query.
+		// A LEFT JOIN through tag_images lets stub tags (no linked image)
+		// appear as synthesised rows with image_id = 0 and state = 'queued',
+		// so callers do not need to duplicate the COALESCE column list.
+		// Both image_digest (platform-specific) and tag_digest (top-level
+		// manifest or index digest) are exposed so approval queries can
+		// select whichever is appropriate for upstream forwarding.
+		`CREATE OR REPLACE VIEW tag_image_rows AS
+			SELECT
+				COALESCE(i.id, 0)                     AS image_id,
+				t.id                                  AS tag_id,
+				r.url                                 AS registry_url,
+				t.repository                          AS repository,
+				t.name                                AS tag_name,
+				COALESCE(cr.url, '')                  AS cache_registry_url,
+				COALESCE(i.digest, '')                AS image_digest,
+				COALESCE(t.digest, '')                AS tag_digest,
+				COALESCE(i.arch, '')                  AS arch,
+				COALESCE(i.os, '')                    AS os,
+				COALESCE(i.manifest::text, 'null')    AS manifest,
+				COALESCE(i.scan_report::text, 'null') AS scan_report,
+				COALESCE(i.state::text, 'queued')     AS state,
+				COALESCE(i.created_at, t.created_at)  AS created_at,
+				COALESCE(i.updated_at, t.updated_at)  AS updated_at
+			FROM tags t
+			JOIN registries r       ON r.id  = t.registry
+			LEFT JOIN tag_images ti ON ti.tag = t.id
+			LEFT JOIN images i      ON i.id  = ti.image
+			LEFT JOIN registries cr ON cr.id = i.cache_registry`,
 	}
 	for _, s := range stmts {
 		if _, err := d.db.Exec(s); err != nil {
@@ -351,14 +381,10 @@ func (d *DB) linkTagImage(tagID, imageID int64) error {
 // an empty slice for stub tags (no tag_images entries).
 func (d *DB) imagesByTagID(tagID int64) ([]*Image, error) {
 	rows, err := d.db.Query(`
-		SELECT `+imageColumns+`
-		FROM tags t
-		JOIN registries r  ON r.id  = t.registry
-		JOIN tag_images ti ON ti.tag = t.id
-		JOIN images i      ON i.id  = ti.image
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE t.id = $1
-		ORDER BY i.id`,
+		SELECT `+imageCols+`
+		FROM tag_image_rows
+		WHERE tag_id = $1 AND image_id <> 0
+		ORDER BY image_id`,
 		tagID,
 	)
 	if err != nil {
@@ -660,24 +686,23 @@ func (d *DB) setImageState(imageID int64, state State) error {
 
 // ── image queries ─────────────────────────────────────────────────────────────
 
-// imageColumns is the SELECT column list for all image queries.  It expects
-// table aliases t (tags), r (registries via t.registry), i (images, may be
-// LEFT JOINed for stub tags), and cr (registries via i.cache_registry).
-//
-// All image-side fields are wrapped in COALESCE so a stub tag (no linked
-// image) yields a synthesised row with id 0, empty digest/arch/os, and a
-// state of 'queued'.
-const imageColumns = `
-	COALESCE(i.id, 0),
-	t.id,
-	r.url, t.repository, t.name,
-	COALESCE(cr.url, ''),
-	COALESCE(i.digest, ''), COALESCE(i.arch, ''), COALESCE(i.os, ''),
-	COALESCE(i.manifest::text, 'null'),
-	COALESCE(i.scan_report::text, 'null'),
-	COALESCE(i.state::text, 'queued'),
-	COALESCE(i.created_at, t.created_at),
-	COALESCE(i.updated_at, t.updated_at)`
+// imageCols is the default SELECT column list for queries against the
+// tag_image_rows view.  It returns the platform image digest (image_digest)
+// as the .Digest field, which is what callers want for digest-addressed
+// lookups and general listing.
+const imageCols = `
+	image_id, tag_id, registry_url, repository, tag_name,
+	cache_registry_url, image_digest, arch, os,
+	manifest, scan_report, state, created_at, updated_at`
+
+// imageColsTagDigest is the column list for queries that want the tag's
+// top-level (manifest or index) digest as the .Digest field — used by
+// GetApproved so the gateway forwards tag requests pinned to the resolved
+// upstream digest.
+const imageColsTagDigest = `
+	image_id, tag_id, registry_url, repository, tag_name,
+	cache_registry_url, tag_digest, arch, os,
+	manifest, scan_report, state, created_at, updated_at`
 
 func scanImageRow(row *sql.Row) (*Image, error) {
 	img := &Image{}
@@ -727,14 +752,10 @@ func scanImageRows(rows *sql.Rows) ([]*Image, error) {
 // image is linked to multiple tags the row from the lowest-id tag is returned.
 func (d *DB) GetByID(id int64) (*Image, error) {
 	row := d.db.QueryRow(`
-		SELECT `+imageColumns+`
-		FROM images i
-		JOIN tag_images ti ON ti.image = i.id
-		JOIN tags t        ON t.id    = ti.tag
-		JOIN registries r  ON r.id    = t.registry
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE i.id = $1
-		ORDER BY ti.tag
+		SELECT `+imageCols+`
+		FROM tag_image_rows
+		WHERE image_id = $1
+		ORDER BY tag_id
 		LIMIT 1`,
 		id,
 	)
@@ -746,14 +767,10 @@ func (d *DB) GetByID(id int64) (*Image, error) {
 // digest/arch/os and state 'queued', so callers can still discover the tag.
 func (d *DB) GetByRef(ref ImageRef) ([]*Image, error) {
 	rows, err := d.db.Query(`
-		SELECT `+imageColumns+`
-		FROM tags t
-		JOIN registries r  ON r.id  = t.registry
-		LEFT JOIN tag_images ti ON ti.tag = t.id
-		LEFT JOIN images i      ON i.id  = ti.image
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
-		ORDER BY i.id NULLS LAST`,
+		SELECT `+imageCols+`
+		FROM tag_image_rows
+		WHERE registry_url = $1 AND repository = $2 AND tag_name = $3
+		ORDER BY image_id`,
 		ref.Registry, ref.Repository, ref.Tag,
 	)
 	if err != nil {
@@ -768,21 +785,11 @@ func (d *DB) GetByRef(ref ImageRef) ([]*Image, error) {
 // (manifest or index) so callers can pin the upstream request.
 func (d *DB) GetApproved(registry, repository, tag string) (*Image, error) {
 	row := d.db.QueryRow(`
-		SELECT
-			i.id, t.id, r.url, t.repository, t.name,
-			COALESCE(cr.url, ''),
-			COALESCE(t.digest, ''), COALESCE(i.arch, ''), COALESCE(i.os, ''),
-			COALESCE(i.manifest::text, 'null'),
-			COALESCE(i.scan_report::text, 'null'),
-			i.state::text, i.created_at, i.updated_at
-		FROM tags t
-		JOIN registries r  ON r.id  = t.registry
-		JOIN tag_images ti ON ti.tag = t.id
-		JOIN images i      ON i.id  = ti.image
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
-		  AND i.state = 'approved'
-		ORDER BY i.id
+		SELECT `+imageColsTagDigest+`
+		FROM tag_image_rows
+		WHERE registry_url = $1 AND repository = $2 AND tag_name = $3
+		  AND state = 'approved'
+		ORDER BY image_id
 		LIMIT 1`,
 		registry, repository, tag,
 	)
@@ -792,52 +799,19 @@ func (d *DB) GetApproved(registry, repository, tag string) (*Image, error) {
 // GetApprovedByDigest returns an approved image matching the given digest, or
 // nil.  The lookup matches both platform-manifest digests (images.digest) and
 // top-level/index digests (tags.digest with at least one approved linked
-// image).  The returned image's Digest field is set to the requested digest so
+// image).  The returned image's Digest field echoes the requested digest so
 // callers may forward the request unchanged.
 func (d *DB) GetApprovedByDigest(registry, repository, digest string) (*Image, error) {
-	// Platform manifest digest match.
 	row := d.db.QueryRow(`
 		SELECT
-			i.id, t.id, r.url, t.repository, t.name,
-			COALESCE(cr.url, ''),
-			i.digest, COALESCE(i.arch, ''), COALESCE(i.os, ''),
-			COALESCE(i.manifest::text, 'null'),
-			COALESCE(i.scan_report::text, 'null'),
-			i.state::text, i.created_at, i.updated_at
-		FROM images i
-		JOIN registries r  ON r.id  = i.registry
-		JOIN tag_images ti ON ti.image = i.id
-		JOIN tags t        ON t.id  = ti.tag
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND i.repository = $2
-		  AND i.digest = $3
-		  AND i.state = 'approved'
-		ORDER BY t.id
-		LIMIT 1`,
-		registry, repository, digest,
-	)
-	if img, err := scanImageRow(row); err != nil || img != nil {
-		return img, err
-	}
-
-	// Top-level / index digest match — return the requested digest verbatim.
-	row = d.db.QueryRow(`
-		SELECT
-			i.id, t.id, r.url, t.repository, t.name,
-			COALESCE(cr.url, ''),
-			$3, COALESCE(i.arch, ''), COALESCE(i.os, ''),
-			COALESCE(i.manifest::text, 'null'),
-			COALESCE(i.scan_report::text, 'null'),
-			i.state::text, i.created_at, i.updated_at
-		FROM tags t
-		JOIN registries r  ON r.id  = t.registry
-		JOIN tag_images ti ON ti.tag = t.id
-		JOIN images i      ON i.id  = ti.image
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND t.repository = $2
-		  AND t.digest = $3
-		  AND i.state = 'approved'
-		ORDER BY i.id
+			image_id, tag_id, registry_url, repository, tag_name,
+			cache_registry_url, $3::text, arch, os,
+			manifest, scan_report, state, created_at, updated_at
+		FROM tag_image_rows
+		WHERE registry_url = $1 AND repository = $2
+		  AND (image_digest = $3 OR tag_digest = $3)
+		  AND state = 'approved'
+		ORDER BY CASE WHEN image_digest = $3 THEN 0 ELSE 1 END, image_id
 		LIMIT 1`,
 		registry, repository, digest,
 	)
@@ -850,43 +824,14 @@ func (d *DB) GetApprovedByDigest(registry, repository, digest string) (*Image, e
 func (d *DB) GetApprovedByTagAndDigest(registry, repository, tag, digest string) (*Image, error) {
 	row := d.db.QueryRow(`
 		SELECT
-			i.id, t.id, r.url, t.repository, t.name,
-			COALESCE(cr.url, ''),
-			i.digest, COALESCE(i.arch, ''), COALESCE(i.os, ''),
-			COALESCE(i.manifest::text, 'null'),
-			COALESCE(i.scan_report::text, 'null'),
-			i.state::text, i.created_at, i.updated_at
-		FROM tags t
-		JOIN registries r  ON r.id  = t.registry
-		JOIN tag_images ti ON ti.tag = t.id
-		JOIN images i      ON i.id  = ti.image
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
-		  AND i.digest = $4
-		  AND i.state = 'approved'
-		LIMIT 1`,
-		registry, repository, tag, digest,
-	)
-	if img, err := scanImageRow(row); err != nil || img != nil {
-		return img, err
-	}
-
-	row = d.db.QueryRow(`
-		SELECT
-			i.id, t.id, r.url, t.repository, t.name,
-			COALESCE(cr.url, ''),
-			$4, COALESCE(i.arch, ''), COALESCE(i.os, ''),
-			COALESCE(i.manifest::text, 'null'),
-			COALESCE(i.scan_report::text, 'null'),
-			i.state::text, i.created_at, i.updated_at
-		FROM tags t
-		JOIN registries r  ON r.id  = t.registry
-		JOIN tag_images ti ON ti.tag = t.id
-		JOIN images i      ON i.id  = ti.image
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
-		  AND t.digest = $4
-		  AND i.state = 'approved'
+			image_id, tag_id, registry_url, repository, tag_name,
+			cache_registry_url, $4::text, arch, os,
+			manifest, scan_report, state, created_at, updated_at
+		FROM tag_image_rows
+		WHERE registry_url = $1 AND repository = $2 AND tag_name = $3
+		  AND (image_digest = $4 OR tag_digest = $4)
+		  AND state = 'approved'
+		ORDER BY CASE WHEN image_digest = $4 THEN 0 ELSE 1 END, image_id
 		LIMIT 1`,
 		registry, repository, tag, digest,
 	)
@@ -897,15 +842,11 @@ func (d *DB) GetApprovedByTagAndDigest(registry, repository, tag, digest string)
 // tag, or nil.
 func (d *DB) GetRejected(registry, repository, tag string) (*Image, error) {
 	row := d.db.QueryRow(`
-		SELECT `+imageColumns+`
-		FROM tags t
-		JOIN registries r  ON r.id  = t.registry
-		JOIN tag_images ti ON ti.tag = t.id
-		JOIN images i      ON i.id  = ti.image
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND t.repository = $2 AND t.name = $3
-		  AND i.state = 'rejected'
-		ORDER BY i.id
+		SELECT `+imageCols+`
+		FROM tag_image_rows
+		WHERE registry_url = $1 AND repository = $2 AND tag_name = $3
+		  AND state = 'rejected'
+		ORDER BY image_id
 		LIMIT 1`,
 		registry, repository, tag,
 	)
@@ -935,8 +876,7 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 		for i, s := range f.States {
 			stateStrs[i] = string(s)
 		}
-		conditions = append(conditions, fmt.Sprintf(
-			"COALESCE(i.state::text, 'queued') = ANY($%d)", argIdx))
+		conditions = append(conditions, fmt.Sprintf("state = ANY($%d)", argIdx))
 		args = append(args, pq.Array(stateStrs))
 		argIdx++
 	}
@@ -951,13 +891,13 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 			}
 			if tag != "" {
 				refConds = append(refConds, fmt.Sprintf(
-					"(t.repository = $%d AND t.name = $%d)",
+					"(repository = $%d AND tag_name = $%d)",
 					argIdx, argIdx+1,
 				))
 				args = append(args, r, tag)
 				argIdx += 2
 			} else {
-				refConds = append(refConds, fmt.Sprintf("t.repository = $%d", argIdx))
+				refConds = append(refConds, fmt.Sprintf("repository = $%d", argIdx))
 				args = append(args, r)
 				argIdx++
 			}
@@ -971,14 +911,10 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 	}
 
 	query := fmt.Sprintf(`
-		SELECT `+imageColumns+`
-		FROM tags t
-		JOIN registries r  ON r.id  = t.registry
-		LEFT JOIN tag_images ti ON ti.tag = t.id
-		LEFT JOIN images i      ON i.id  = ti.image
-		LEFT JOIN registries cr ON cr.id = i.cache_registry
+		SELECT `+imageCols+`
+		FROM tag_image_rows
 		%s
-		ORDER BY COALESCE(i.updated_at, t.updated_at) DESC`, where)
+		ORDER BY updated_at DESC`, where)
 
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
