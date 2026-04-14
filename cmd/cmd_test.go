@@ -367,19 +367,37 @@ type trivyExecRecorder struct {
 	calls []trivyCall
 }
 
-// use installs the recorder on trivy's execCommand var for the duration of
-// the test, returning the recorder for inline assertions.  Each invocation
-// records (name, args) and then runs realName/realArgs as the actual
-// subprocess so cmd.Stdin/Output/etc. behave normally.
+// use installs the recorder on trivy's execCommand var with a single fixed
+// backend that every captured call routes through.  Convenient when the
+// production code only makes one trivy invocation per test.
 func (r *trivyExecRecorder) use(t *testing.T, realName string, realArgs ...string) {
 	t.Helper()
+	r.useSequence(t, execResponse{name: realName, args: realArgs})
+}
+
+// useSequence installs the recorder with one backend per call, advancing
+// through responses in order.  Calls beyond the end fall through to `true`
+// (succeed silently) so tests don't have to pad tail slots they don't care
+// about.  Required for runScan and runApprove now that both make a Scan +
+// Convert pair of docker invocations.
+func (r *trivyExecRecorder) useSequence(t *testing.T, responses ...execResponse) {
+	t.Helper()
+	idx := 0
 	orig := trivy.ExecCommandVar()
 	trivy.SetExecCommand(func(name string, args ...string) *exec.Cmd {
 		r.calls = append(r.calls, trivyCall{
 			name: name,
 			args: append([]string(nil), args...),
 		})
-		return exec.Command(realName, realArgs...)
+		var resp execResponse
+		if idx < len(responses) {
+			resp = responses[idx]
+		}
+		idx++
+		if resp.name == "" {
+			resp = execResponse{name: "true"}
+		}
+		return exec.Command(resp.name, resp.args...)
 	})
 	t.Cleanup(func() { trivy.SetExecCommand(orig) })
 }
@@ -795,8 +813,64 @@ func TestRunScan_noImages(t *testing.T) {
 	}
 }
 
+// ── printScanReport ───────────────────────────────────────────────────────────
+
+func TestPrintScanReport_writesTrivyTable(t *testing.T) {
+	withConfig(t)
+	rec := &trivyExecRecorder{}
+	// Use cat so the report bytes round-trip through the fake exec — proves
+	// that printScanReport actually wired the report into trivy.Convert's
+	// stdin rather than passing it through some other path.
+	rec.use(t, "cat")
+
+	report := json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
+	var buf bytes.Buffer
+	if err := printScanReport(&buf, report); err != nil {
+		t.Fatalf("printScanReport: %v", err)
+	}
+	if buf.String() != string(report) {
+		t.Errorf("output = %q, want %q", buf.String(), report)
+	}
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 trivy exec call, got %d", len(rec.calls))
+	}
+}
+
+func TestPrintScanReport_emptyReportNoExec(t *testing.T) {
+	withConfig(t)
+	rec := &trivyExecRecorder{}
+	rec.use(t, "false") // any exec attempt would be a regression
+	var buf bytes.Buffer
+	if err := printScanReport(&buf, nil); err != nil {
+		t.Errorf("printScanReport(nil): %v", err)
+	}
+	if err := printScanReport(&buf, json.RawMessage(`null`)); err != nil {
+		t.Errorf("printScanReport(null): %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("buf = %q, want empty", buf.String())
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("empty/null reports must not invoke trivy, got %d calls", len(rec.calls))
+	}
+}
+
+func TestPrintScanReport_propagatesConvertError(t *testing.T) {
+	withConfig(t)
+	rec := &trivyExecRecorder{}
+	rec.use(t, "false")
+	var buf bytes.Buffer
+	err := printScanReport(&buf, json.RawMessage(`{"SchemaVersion":2}`))
+	if err == nil {
+		t.Error("expected error from failing convert, got nil")
+	}
+}
+
 func TestRunScan_alreadyScanned_noForce(t *testing.T) {
 	withConfig(t)
+	rec := &trivyExecRecorder{}
+	// Pre-scanned image: only the render step shells out (no scan).
+	rec.use(t, "echo", "rendered table contents")
 	img := makeImg(1, "linux", "amd64", db.StateScanned)
 	img.ScanReport = json.RawMessage(`{"SchemaVersion":2}`)
 	database = &mockDB{images: []*db.Image{img}}
@@ -808,15 +882,22 @@ func TestRunScan_alreadyScanned_noForce(t *testing.T) {
 			t.Errorf("runScan already scanned: %v", err)
 		}
 	})
-	if !strings.Contains(out, "SchemaVersion") {
-		t.Errorf("expected scan report in output: %q", out)
+	if !strings.Contains(out, "rendered table contents") {
+		t.Errorf("expected rendered table in stdout: %q", out)
+	}
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 trivy exec (render only), got %d", len(rec.calls))
 	}
 }
 
 func TestRunScan_success(t *testing.T) {
 	withConfig(t)
 	rec := &trivyExecRecorder{}
-	rec.use(t, "echo", `{"SchemaVersion":2,"Results":[]}`)
+	// Scan + printScanReport (Convert) — two trivy invocations now.
+	rec.useSequence(t,
+		execResponse{name: "echo", args: []string{`{"SchemaVersion":2,"Results":[]}`}},
+		execResponse{name: "echo", args: []string{"fake table"}},
+	)
 	img := makeImg(1, "linux", "amd64", db.StateQueued)
 	scanned := makeImg(1, "linux", "amd64", db.StateScanned)
 	scanned.ScanReport = json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
@@ -829,8 +910,8 @@ func TestRunScan_success(t *testing.T) {
 			t.Errorf("runScan success: %v", err)
 		}
 	})
-	if len(rec.calls) != 1 {
-		t.Errorf("expected 1 trivy exec call, got %d", len(rec.calls))
+	if len(rec.calls) != 2 {
+		t.Errorf("expected 2 trivy exec calls (scan + render), got %d", len(rec.calls))
 	}
 }
 
@@ -1218,10 +1299,20 @@ func TestRunApprove_noImages(t *testing.T) {
 	}
 }
 
+// scanThenRenderResponses returns the canonical pair of backends used by
+// approve tests that exercise the implicit scan: echo'd JSON for trivy.Scan,
+// then a fake table line for printScanReport / trivy.Convert.
+func scanThenRenderResponses() []execResponse {
+	return []execResponse{
+		{name: "echo", args: []string{`{"SchemaVersion":2,"Results":[]}`}},
+		{name: "echo", args: []string{"fake table"}},
+	}
+}
+
 func TestRunApprove_answerNO(t *testing.T) {
 	withConfig(t)
 	rec := &trivyExecRecorder{}
-	rec.use(t, "echo", `{"SchemaVersion":2,"Results":[]}`)
+	rec.useSequence(t, scanThenRenderResponses()...)
 	img := makeImg(1, "linux", "amd64", db.StateQueued)
 	scanned := makeImg(1, "linux", "amd64", db.StateScanned)
 	scanned.ScanReport = json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
@@ -1234,15 +1325,15 @@ func TestRunApprove_answerNO(t *testing.T) {
 			t.Errorf("runApprove NO: %v", err)
 		}
 	})
-	if len(rec.calls) != 1 {
-		t.Errorf("expected 1 trivy exec (the implicit scan), got %d", len(rec.calls))
+	if len(rec.calls) != 2 {
+		t.Errorf("expected 2 trivy execs (scan + render), got %d", len(rec.calls))
 	}
 }
 
 func TestRunApprove_answerYES(t *testing.T) {
 	withConfig(t)
 	rec := &trivyExecRecorder{}
-	rec.use(t, "echo", `{"SchemaVersion":2,"Results":[]}`)
+	rec.useSequence(t, scanThenRenderResponses()...)
 	img := makeImg(1, "linux", "amd64", db.StateQueued)
 	scanned := makeImg(1, "linux", "amd64", db.StateScanned)
 	scanned.ScanReport = json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
@@ -1255,15 +1346,15 @@ func TestRunApprove_answerYES(t *testing.T) {
 			t.Errorf("runApprove YES: %v", err)
 		}
 	})
-	if len(rec.calls) != 1 {
-		t.Errorf("expected 1 trivy exec (the implicit scan), got %d", len(rec.calls))
+	if len(rec.calls) != 2 {
+		t.Errorf("expected 2 trivy execs (scan + render), got %d", len(rec.calls))
 	}
 }
 
 func TestRunApprove_answerREJECT(t *testing.T) {
 	withConfig(t)
 	rec := &trivyExecRecorder{}
-	rec.use(t, "echo", `{"SchemaVersion":2,"Results":[]}`)
+	rec.useSequence(t, scanThenRenderResponses()...)
 	img := makeImg(1, "linux", "amd64", db.StateQueued)
 	scanned := makeImg(1, "linux", "amd64", db.StateScanned)
 	scanned.ScanReport = json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
@@ -1277,13 +1368,16 @@ func TestRunApprove_answerREJECT(t *testing.T) {
 			t.Error("expected error from REJECT answer, got nil")
 		}
 	})
-	if len(rec.calls) != 1 {
-		t.Errorf("expected 1 trivy exec (the implicit scan), got %d", len(rec.calls))
+	if len(rec.calls) != 2 {
+		t.Errorf("expected 2 trivy execs (scan + render), got %d", len(rec.calls))
 	}
 }
 
 func TestRunApprove_alreadyScanned(t *testing.T) {
 	withConfig(t)
+	rec := &trivyExecRecorder{}
+	// Pre-scanned image: only the render step shells out (no implicit scan).
+	rec.use(t, "echo", "fake table")
 	img := makeImg(1, "linux", "amd64", db.StateScanned)
 	img.ScanReport = json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
 	database = &mockDB{images: []*db.Image{img}}
@@ -1295,6 +1389,9 @@ func TestRunApprove_alreadyScanned(t *testing.T) {
 			t.Errorf("runApprove already scanned: %v", err)
 		}
 	})
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 trivy exec (render only, scan is skipped), got %d", len(rec.calls))
+	}
 }
 
 // ── runApprove --cache ────────────────────────────────────────────────────────
@@ -1315,12 +1412,14 @@ func setApproveCacheFlag(t *testing.T, value string) {
 }
 
 // approveCacheSetup builds the common fixtures for --cache tests: an
-// already-scanned image (skips the implicit trivy scan) and a YES stdin
-// answer, with cfg pre-populated so approveExecRecorder is the only
-// moving piece the test body needs to configure.
+// already-scanned image (skips the implicit trivy scan), a YES stdin answer,
+// and a trivy recorder backing the printScanReport render step so the test
+// body only has to configure the approveExecRecorder for pushToCache.
 func approveCacheSetup(t *testing.T) *mockDB {
 	t.Helper()
 	withConfig(t)
+	tr := &trivyExecRecorder{}
+	tr.use(t, "echo", "fake table")
 	img := makeImg(1, "linux", "amd64", db.StateScanned)
 	img.ScanReport = json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
 	m := &mockDB{images: []*db.Image{img}}

@@ -272,7 +272,9 @@ hermes scan [--force] [--platform OS/ARCH] IMAGE
 ```
 
 Queues `IMAGE` if it does not already exist, fetches its manifest, runs a trivy
-scan, saves the report, and prints the JSON to stdout.
+scan, saves the report, and prints the trivy table to stdout. Use
+`hermes report IMAGE --format json` (or any other format) for a machine-readable
+view after the scan completes.
 
 If the image already has a scan report, the existing report is printed unless
 `--force` is given.
@@ -289,7 +291,7 @@ If the image already has a scan report, the existing report is printed unless
 hermes approve [--platform OS/ARCH] [--cache [URL]] IMAGE
 ```
 
-Shows the trivy scan report (scanning first if needed) and prompts:
+Shows the trivy scan report as a table (scanning first if needed) and prompts:
 
 ```
 Approve this image? [YES / NO / REJECT] (default: NO):
