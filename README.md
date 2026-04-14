@@ -250,9 +250,12 @@ redirect mode.
   replaces `msg`, `PRIORITY` replaces `level` as a syslog priority digit
   (`0`-`7`), and `time` is dropped (journald stamps its own).
 
-Every CLI and API event persisted to the `events` table is also mirrored to
-the global logger, so operators can tail audit activity through `journalctl`
-or a Loki query without reading the database.
+`hermes serve` mirrors every event it persists to the `events` table to the
+global logger, so operators can tail gateway audit activity through
+`journalctl` or a Loki query without reading the database.  CLI commands
+(`approve`, `scan`, etc.) write events to the database only — their slog
+mirror is suppressed so per-event JSON cannot interleave with interactive
+output.
 
 A JSON Schema is provided at [`docs/hermes.schema.json`](docs/hermes.schema.json).
 

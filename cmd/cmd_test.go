@@ -866,6 +866,19 @@ func TestPrintScanReport_propagatesConvertError(t *testing.T) {
 	}
 }
 
+// ── loggerSinkFor ─────────────────────────────────────────────────────────────
+
+func TestLoggerSinkFor(t *testing.T) {
+	if got := loggerSinkFor("serve"); got != os.Stderr {
+		t.Errorf("loggerSinkFor(serve) = %v, want os.Stderr", got)
+	}
+	for _, name := range []string{"approve", "scan", "view", "list", "report", "reject", "rescind", "health", ""} {
+		if got := loggerSinkFor(name); got != io.Discard {
+			t.Errorf("loggerSinkFor(%q) = %v, want io.Discard", name, got)
+		}
+	}
+}
+
 func TestRunScan_alreadyScanned_noForce(t *testing.T) {
 	withConfig(t)
 	rec := &trivyExecRecorder{}
