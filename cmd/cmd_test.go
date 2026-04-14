@@ -257,15 +257,21 @@ type mockDB struct {
 	rescindErr  error
 
 	// call captures — populated by the mock methods for tests to assert on.
-	listFilter db.ListFilter
-	rejectIDs  []int64
-	rescindIDs []int64
+	listFilter    db.ListFilter
+	rejectIDs     []int64
+	rescindIDs    []int64
+	approveIDs    []int64
+	approveCaches []string
+	setErrorIDs   []int64
 }
 
 func (m *mockDB) Queue(_ db.ImageRef, _ db.Fetcher) ([]*db.Image, error) {
 	return m.images, m.queueErr
 }
-func (m *mockDB) SetError(_ int64) error { return nil }
+func (m *mockDB) SetError(id int64) error {
+	m.setErrorIDs = append(m.setErrorIDs, id)
+	return nil
+}
 func (m *mockDB) SaveScan(_ int64, _ json.RawMessage) (*db.Image, error) {
 	return m.saveScanImg, m.saveScanErr
 }
@@ -277,7 +283,11 @@ func (m *mockDB) List(f db.ListFilter) ([]db.Image, error) {
 	return m.listOut, m.listErr
 }
 func (m *mockDB) GetByRef(_ db.ImageRef) ([]*db.Image, error) { return m.images, m.getRefErr }
-func (m *mockDB) Approve(_ int64, _ string) error             { return m.approveErr }
+func (m *mockDB) Approve(id int64, cacheRegistry string) error {
+	m.approveIDs = append(m.approveIDs, id)
+	m.approveCaches = append(m.approveCaches, cacheRegistry)
+	return m.approveErr
+}
 func (m *mockDB) Reject(id int64) error {
 	m.rejectIDs = append(m.rejectIDs, id)
 	return m.rejectErr
@@ -340,19 +350,98 @@ func makeListImg(id int64, imgOS, arch string, state db.State) db.Image {
 	return *makeImg(id, imgOS, arch, state)
 }
 
-// fakeCmd returns a func(string, ...string) *exec.Cmd that runs name with fixedArgs.
-func fakeCmd(name string, fixedArgs ...string) func(string, ...string) *exec.Cmd {
-	return func(_ string, _ ...string) *exec.Cmd {
-		return exec.Command(name, fixedArgs...)
-	}
+// trivyCall is one captured invocation of the trivy execCommand var.
+type trivyCall struct {
+	name string
+	args []string
 }
 
-// withTrivyExec temporarily replaces the trivy execCommand.
-func withTrivyExec(t *testing.T, fn func(string, ...string) *exec.Cmd) {
+// trivyExecRecorder records every call routed through the trivy execCommand
+// var and lets each test pick the real backend (echo, cat, false) so the
+// production code's *exec.Cmd remains genuine.  Routing trivy.Convert through
+// `cat` proves the production code wired Stdin to the report bytes; routing
+// trivy.Scan through `echo <json>` simulates a successful scan output.  Tests
+// can then assert on .calls to confirm the exec actually happened and inspect
+// the constructed argv.
+type trivyExecRecorder struct {
+	calls []trivyCall
+}
+
+// use installs the recorder on trivy's execCommand var for the duration of
+// the test, returning the recorder for inline assertions.  Each invocation
+// records (name, args) and then runs realName/realArgs as the actual
+// subprocess so cmd.Stdin/Output/etc. behave normally.
+func (r *trivyExecRecorder) use(t *testing.T, realName string, realArgs ...string) {
 	t.Helper()
 	orig := trivy.ExecCommandVar()
-	trivy.SetExecCommand(fn)
+	trivy.SetExecCommand(func(name string, args ...string) *exec.Cmd {
+		r.calls = append(r.calls, trivyCall{
+			name: name,
+			args: append([]string(nil), args...),
+		})
+		return exec.Command(realName, realArgs...)
+	})
 	t.Cleanup(func() { trivy.SetExecCommand(orig) })
+}
+
+// approveCall is one captured invocation of cmd/approve.go's
+// approveExecCommand var.  Stored separately from trivyCall so future
+// changes to either recorder are independent.
+type approveCall struct {
+	name string
+	args []string
+}
+
+// execResponse describes one real subprocess the approveExecRecorder should
+// stand in for when its sequenced mode is used.  A zero execResponse (name
+// == "") means "succeed silently" — handy when a test needs N slots and
+// only cares about K < N of them.
+type execResponse struct {
+	name string
+	args []string
+}
+
+// approveExecRecorder records every call routed through cmd/approve.go's
+// approveExecCommand var.  Unlike trivyExecRecorder it supports sequenced
+// backends: pushToCache makes four docker calls (pull, tag, push, rmi), and
+// a realistic regression test has to simulate e.g. "pull and tag succeed,
+// push fails" — a single fixed response cannot express that.
+type approveExecRecorder struct {
+	calls []approveCall
+}
+
+// use installs the recorder with a single fixed backend that every call
+// routes through — convenient for "everything succeeds" or "everything fails"
+// tests.  Use useSequence when different calls need different outcomes.
+func (r *approveExecRecorder) use(t *testing.T, realName string, realArgs ...string) {
+	t.Helper()
+	r.useSequence(t, execResponse{name: realName, args: realArgs})
+}
+
+// useSequence installs the recorder with a list of backends, one per call.
+// The Nth production call gets the Nth response; calls beyond the end of
+// the sequence fall through to `true` (succeed silently) so a test that
+// only cares about the first few failures doesn't have to pad the tail.
+func (r *approveExecRecorder) useSequence(t *testing.T, responses ...execResponse) {
+	t.Helper()
+	idx := 0
+	orig := approveExecCommand
+	approveExecCommand = func(name string, args ...string) *exec.Cmd {
+		r.calls = append(r.calls, approveCall{
+			name: name,
+			args: append([]string(nil), args...),
+		})
+		var resp execResponse
+		if idx < len(responses) {
+			resp = responses[idx]
+		}
+		idx++
+		if resp.name == "" {
+			resp = execResponse{name: "true"}
+		}
+		return exec.Command(resp.name, resp.args...)
+	}
+	t.Cleanup(func() { approveExecCommand = orig })
 }
 
 // withConfig temporarily sets the global cfg for a test.
@@ -726,7 +815,8 @@ func TestRunScan_alreadyScanned_noForce(t *testing.T) {
 
 func TestRunScan_success(t *testing.T) {
 	withConfig(t)
-	withTrivyExec(t, fakeCmd("echo", `{"SchemaVersion":2,"Results":[]}`))
+	rec := &trivyExecRecorder{}
+	rec.use(t, "echo", `{"SchemaVersion":2,"Results":[]}`)
 	img := makeImg(1, "linux", "amd64", db.StateQueued)
 	scanned := makeImg(1, "linux", "amd64", db.StateScanned)
 	scanned.ScanReport = json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
@@ -739,11 +829,15 @@ func TestRunScan_success(t *testing.T) {
 			t.Errorf("runScan success: %v", err)
 		}
 	})
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 trivy exec call, got %d", len(rec.calls))
+	}
 }
 
 func TestRunScan_trivyError(t *testing.T) {
 	withConfig(t)
-	withTrivyExec(t, fakeCmd("false")) // exits non-zero
+	rec := &trivyExecRecorder{}
+	rec.use(t, "false") // exits non-zero
 	img := makeImg(1, "linux", "amd64", db.StateQueued)
 	database = &mockDB{images: []*db.Image{img}}
 	scanForce = false
@@ -753,11 +847,15 @@ func TestRunScan_trivyError(t *testing.T) {
 	if err == nil {
 		t.Error("expected trivy error, got nil")
 	}
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 trivy exec call (the failing one), got %d", len(rec.calls))
+	}
 }
 
 func TestRunScan_saveScanError(t *testing.T) {
 	withConfig(t)
-	withTrivyExec(t, fakeCmd("echo", `{"SchemaVersion":2,"Results":[]}`))
+	rec := &trivyExecRecorder{}
+	rec.use(t, "echo", `{"SchemaVersion":2,"Results":[]}`)
 	img := makeImg(1, "linux", "amd64", db.StateQueued)
 	database = &mockDB{images: []*db.Image{img}, saveScanErr: os.ErrPermission}
 	scanForce = false
@@ -766,6 +864,9 @@ func TestRunScan_saveScanError(t *testing.T) {
 	err := runScan(scanCmd, []string{"registry.example.com/myrepo:v1.0"})
 	if err == nil {
 		t.Error("expected error from SaveScan, got nil")
+	}
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 trivy exec call before the SaveScan failure, got %d", len(rec.calls))
 	}
 }
 
@@ -995,38 +1096,99 @@ func TestRunReport_noScanReport(t *testing.T) {
 	}
 }
 
+// TestRunReport_jsonFormat verifies that the json fast-path writes the
+// stored scan_report bytes verbatim to stdout AND bypasses trivy entirely
+// (no exec call should be made).  Both invariants matter: the bytes must
+// reach the user, and we must not pay the trivy round-trip when we already
+// have JSON.
 func TestRunReport_jsonFormat(t *testing.T) {
+	withConfig(t)
+	rec := &trivyExecRecorder{}
+	rec.use(t, "false") // any exec attempt would be a regression
+
 	reportFormat = "json"
 	reportOutput = ""
 	t.Cleanup(func() { reportFormat = "table"; reportOutput = "" })
 
+	stored := json.RawMessage(`{"SchemaVersion":2,"Results":[{"Target":"alpine"}]}`)
 	img := makeImg(1, "linux", "amd64", db.StateScanned)
-	img.ScanReport = json.RawMessage(`{"SchemaVersion":2}`)
+	img.ScanReport = stored
 	database = &mockDB{images: []*db.Image{img}}
 
-	_ = captureStdout(t, func() {
+	out := captureStdout(t, func() {
 		if err := runReport(reportCmd, []string{"registry.example.com/myrepo:v1.0"}); err != nil {
 			t.Errorf("runReport json: %v", err)
 		}
 	})
+	if out != string(stored) {
+		t.Errorf("stdout = %q, want stored report bytes %q", out, stored)
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("json fast-path must not invoke trivy, got %d calls", len(rec.calls))
+	}
 }
 
+// TestRunReport_tableFormat is the regression test for the
+// "trivy convert -" bug.  It pipes the report through a `cat` backend so
+// any byte that reaches stdout demonstrably traversed the production
+// Stdin → trivy.Convert → ConvertToFile → os.Stdout pipeline; if Convert
+// were broken (e.g. `-` arg, missing Stdin wiring, fast-path skip), the
+// captured stdout would not equal the stored report bytes.
 func TestRunReport_tableFormat(t *testing.T) {
 	withConfig(t)
-	withTrivyExec(t, fakeCmd("echo", "table output"))
+	rec := &trivyExecRecorder{}
+	rec.use(t, "cat") // pipes Stdin → Stdout; only works if Convert wires Stdin
+
 	reportFormat = "table"
 	reportOutput = ""
 	t.Cleanup(func() { reportFormat = "table"; reportOutput = "" })
 
+	stored := json.RawMessage(`{"SchemaVersion":2,"Results":[{"Target":"alpine"}]}`)
 	img := makeImg(1, "linux", "amd64", db.StateScanned)
-	img.ScanReport = json.RawMessage(`{"SchemaVersion":2}`)
+	img.ScanReport = stored
 	database = &mockDB{images: []*db.Image{img}}
 
-	_ = captureStdout(t, func() {
+	out := captureStdout(t, func() {
 		if err := runReport(reportCmd, []string{"registry.example.com/myrepo:v1.0"}); err != nil {
 			t.Errorf("runReport table: %v", err)
 		}
 	})
+	if out != string(stored) {
+		t.Errorf("stdout = %q, want stored report bytes %q\n"+
+			"(if these differ, runReport→trivy.Convert is not wiring Stdin)",
+			out, stored)
+	}
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 trivy exec call, got %d", len(rec.calls))
+	}
+	// Spot-check the call landed on docker with the configured format flag.
+	// Detailed argv assertions live in internal/trivy/trivy_test.go.
+	if len(rec.calls) > 0 {
+		call := rec.calls[0]
+		if call.name != "docker" {
+			t.Errorf("trivy exec name = %q, want docker", call.name)
+		}
+		hasFormat := false
+		for i := 0; i+1 < len(call.args); i++ {
+			if call.args[i] == "--format" && call.args[i+1] == "table" {
+				hasFormat = true
+				break
+			}
+		}
+		if !hasFormat {
+			t.Errorf("args missing --format table\nargs: %v", call.args)
+		}
+		// Defense-in-depth regression check: the original bug passed "-"
+		// to trivy convert as if it would read stdin.  Trivy treats that
+		// as a literal file path and fails.  Make sure no orchestration
+		// regression silently puts "-" back on the command line.
+		for _, a := range call.args {
+			if a == "-" {
+				t.Errorf("args contain literal '-' input path; trivy convert does not read stdin\nargs: %v", call.args)
+				break
+			}
+		}
+	}
 }
 
 // ── runApprove ────────────────────────────────────────────────────────────────
@@ -1058,7 +1220,8 @@ func TestRunApprove_noImages(t *testing.T) {
 
 func TestRunApprove_answerNO(t *testing.T) {
 	withConfig(t)
-	withTrivyExec(t, fakeCmd("echo", `{"SchemaVersion":2,"Results":[]}`))
+	rec := &trivyExecRecorder{}
+	rec.use(t, "echo", `{"SchemaVersion":2,"Results":[]}`)
 	img := makeImg(1, "linux", "amd64", db.StateQueued)
 	scanned := makeImg(1, "linux", "amd64", db.StateScanned)
 	scanned.ScanReport = json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
@@ -1071,11 +1234,15 @@ func TestRunApprove_answerNO(t *testing.T) {
 			t.Errorf("runApprove NO: %v", err)
 		}
 	})
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 trivy exec (the implicit scan), got %d", len(rec.calls))
+	}
 }
 
 func TestRunApprove_answerYES(t *testing.T) {
 	withConfig(t)
-	withTrivyExec(t, fakeCmd("echo", `{"SchemaVersion":2,"Results":[]}`))
+	rec := &trivyExecRecorder{}
+	rec.use(t, "echo", `{"SchemaVersion":2,"Results":[]}`)
 	img := makeImg(1, "linux", "amd64", db.StateQueued)
 	scanned := makeImg(1, "linux", "amd64", db.StateScanned)
 	scanned.ScanReport = json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
@@ -1088,11 +1255,15 @@ func TestRunApprove_answerYES(t *testing.T) {
 			t.Errorf("runApprove YES: %v", err)
 		}
 	})
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 trivy exec (the implicit scan), got %d", len(rec.calls))
+	}
 }
 
 func TestRunApprove_answerREJECT(t *testing.T) {
 	withConfig(t)
-	withTrivyExec(t, fakeCmd("echo", `{"SchemaVersion":2,"Results":[]}`))
+	rec := &trivyExecRecorder{}
+	rec.use(t, "echo", `{"SchemaVersion":2,"Results":[]}`)
 	img := makeImg(1, "linux", "amd64", db.StateQueued)
 	scanned := makeImg(1, "linux", "amd64", db.StateScanned)
 	scanned.ScanReport = json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
@@ -1106,6 +1277,9 @@ func TestRunApprove_answerREJECT(t *testing.T) {
 			t.Error("expected error from REJECT answer, got nil")
 		}
 	})
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 trivy exec (the implicit scan), got %d", len(rec.calls))
+	}
 }
 
 func TestRunApprove_alreadyScanned(t *testing.T) {
@@ -1121,6 +1295,168 @@ func TestRunApprove_alreadyScanned(t *testing.T) {
 			t.Errorf("runApprove already scanned: %v", err)
 		}
 	})
+}
+
+// ── runApprove --cache ────────────────────────────────────────────────────────
+
+// setApproveCacheFlag sets --cache explicitly so cmd.Flags().Changed("cache")
+// returns true inside runApprove, and registers a cleanup that resets both
+// the value and the changed bit so sibling tests see a fresh flag state.
+func setApproveCacheFlag(t *testing.T, value string) {
+	t.Helper()
+	if err := approveCmd.Flags().Set("cache", value); err != nil {
+		t.Fatalf("set --cache: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = approveCmd.Flags().Set("cache", "")
+		approveCmd.Flags().Lookup("cache").Changed = false
+		approveCache = ""
+	})
+}
+
+// approveCacheSetup builds the common fixtures for --cache tests: an
+// already-scanned image (skips the implicit trivy scan) and a YES stdin
+// answer, with cfg pre-populated so approveExecRecorder is the only
+// moving piece the test body needs to configure.
+func approveCacheSetup(t *testing.T) *mockDB {
+	t.Helper()
+	withConfig(t)
+	img := makeImg(1, "linux", "amd64", db.StateScanned)
+	img.ScanReport = json.RawMessage(`{"SchemaVersion":2,"Results":[]}`)
+	m := &mockDB{images: []*db.Image{img}}
+	database = m
+	approvePlatform = ""
+	t.Cleanup(func() { approvePlatform = "" })
+	fakeStdin(t, "YES")
+	return m
+}
+
+// TestRunApprove_cacheSuccess exercises the full pushToCache sequence —
+// pull, tag, push, rmi — and asserts that (a) all four docker calls
+// actually ran in the correct order, (b) the image was approved with the
+// cache registry recorded, and (c) no SetError path fired.
+func TestRunApprove_cacheSuccess(t *testing.T) {
+	m := approveCacheSetup(t)
+	setApproveCacheFlag(t, "cache.example.com")
+
+	rec := &approveExecRecorder{}
+	rec.use(t, "true") // every docker call succeeds
+
+	_ = captureStdout(t, func() {
+		if err := runApprove(approveCmd, []string{"registry.example.com/myrepo:v1.0"}); err != nil {
+			t.Errorf("runApprove YES --cache: %v", err)
+		}
+	})
+
+	if len(rec.calls) != 4 {
+		t.Fatalf("expected 4 docker calls (pull, tag, push, rmi), got %d: %+v", len(rec.calls), rec.calls)
+	}
+	wantSubcommands := []string{"pull", "tag", "push", "rmi"}
+	for i, want := range wantSubcommands {
+		call := rec.calls[i]
+		if call.name != "docker" {
+			t.Errorf("call[%d] name = %q, want docker", i, call.name)
+		}
+		if len(call.args) == 0 || call.args[0] != want {
+			t.Errorf("call[%d] subcommand = %v, want %q", i, call.args, want)
+		}
+	}
+	// The push destination must carry the cache registry prefix.
+	pushCall := rec.calls[2]
+	if len(pushCall.args) < 2 {
+		t.Fatalf("push call missing dest: %v", pushCall.args)
+	}
+	dest := pushCall.args[1]
+	if !strings.HasPrefix(dest, "cache.example.com/") {
+		t.Errorf("push dest = %q, want cache.example.com/ prefix", dest)
+	}
+
+	// Database state: Approve called once with the cache URL, no SetError.
+	if len(m.approveIDs) != 1 || m.approveIDs[0] != 1 {
+		t.Errorf("approveIDs = %v, want [1]", m.approveIDs)
+	}
+	if len(m.approveCaches) != 1 || m.approveCaches[0] != "cache.example.com" {
+		t.Errorf("approveCaches = %v, want [cache.example.com]", m.approveCaches)
+	}
+	if len(m.setErrorIDs) != 0 {
+		t.Errorf("setErrorIDs = %v, want empty on success", m.setErrorIDs)
+	}
+}
+
+// TestRunApprove_cachePullFails verifies the early-exit path: the pull
+// step fails, pushToCache returns immediately, runApprove flips the image
+// to errored, and no Approve call ever reaches the database.
+func TestRunApprove_cachePullFails(t *testing.T) {
+	m := approveCacheSetup(t)
+	setApproveCacheFlag(t, "cache.example.com")
+
+	rec := &approveExecRecorder{}
+	rec.use(t, "false") // every docker call fails — pull is the first to hit
+
+	_ = captureStdout(t, func() {
+		err := runApprove(approveCmd, []string{"registry.example.com/myrepo:v1.0"})
+		if err == nil {
+			t.Error("expected error from failing docker pull, got nil")
+		}
+	})
+
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 docker call (pull only), got %d: %+v", len(rec.calls), rec.calls)
+	}
+	if len(rec.calls) > 0 && rec.calls[0].args[0] != "pull" {
+		t.Errorf("first call was %v, want pull", rec.calls[0].args)
+	}
+	if len(m.setErrorIDs) != 1 || m.setErrorIDs[0] != 1 {
+		t.Errorf("setErrorIDs = %v, want [1]", m.setErrorIDs)
+	}
+	if len(m.approveIDs) != 0 {
+		t.Errorf("approveIDs = %v, want empty on failure", m.approveIDs)
+	}
+}
+
+// TestRunApprove_cachePushFails covers the sequenced-failure case the
+// single-backend harness cannot express: pull and tag succeed, push
+// fails.  runApprove must bail out before rmi and before Approve, and
+// it must flip the image to errored.
+func TestRunApprove_cachePushFails(t *testing.T) {
+	m := approveCacheSetup(t)
+	setApproveCacheFlag(t, "cache.example.com")
+
+	rec := &approveExecRecorder{}
+	rec.useSequence(t,
+		execResponse{name: "true"},  // pull succeeds
+		execResponse{name: "true"},  // tag succeeds
+		execResponse{name: "false"}, // push fails
+		// rmi slot intentionally absent — pushToCache must not reach it.
+	)
+
+	_ = captureStdout(t, func() {
+		err := runApprove(approveCmd, []string{"registry.example.com/myrepo:v1.0"})
+		if err == nil {
+			t.Error("expected error from failing docker push, got nil")
+		}
+	})
+
+	if len(rec.calls) != 3 {
+		t.Errorf("expected 3 docker calls (pull, tag, push), got %d: %+v", len(rec.calls), rec.calls)
+	}
+	if len(rec.calls) >= 3 {
+		if rec.calls[2].args[0] != "push" {
+			t.Errorf("third call subcommand = %q, want push", rec.calls[2].args[0])
+		}
+	}
+	// rmi must not have run — short-circuit on push error.
+	for i, c := range rec.calls {
+		if c.args[0] == "rmi" {
+			t.Errorf("call[%d] was rmi, but pushToCache must not reach rmi when push fails", i)
+		}
+	}
+	if len(m.setErrorIDs) != 1 || m.setErrorIDs[0] != 1 {
+		t.Errorf("setErrorIDs = %v, want [1]", m.setErrorIDs)
+	}
+	if len(m.approveIDs) != 0 {
+		t.Errorf("approveIDs = %v, want empty on failure", m.approveIDs)
+	}
 }
 
 // ensure bytes is imported for the buffer usage in test helpers

@@ -99,11 +99,33 @@ func extractJSON(b []byte) ([]byte, error) {
 	return raw, nil
 }
 
-// Convert converts a trivy JSON report to another format using
-// `docker run --rm -i aquasec/trivy convert --format <format>`.
+// stagedReportPath is the in-container path where Convert writes the report
+// JSON before invoking trivy convert against it.  Lives under /tmp because
+// the trivy image is alpine-based and /tmp is always writable there.
+const stagedReportPath = "/tmp/hermes-report.json"
+
+// convertScript is the shell wrapper executed inside the trivy container.
+// It reads the report JSON from stdin into a file, then runs `trivy convert`
+// with all extra arguments forwarded via "$@".  Splitting staging from the
+// trivy invocation is required because `trivy convert` expects a file path
+// argument and does NOT read from stdin (passing "-" yields a literal
+// "open -: no such file or directory" error from trivy).
 //
-// It pipes the report JSON to trivy via stdin (trivy reads "-").
-// Extra args from cfg.Trivy.ConvertArgs are appended after --format <format>.
+// Wrapping the call in sh inside the trivy image (via --entrypoint sh)
+// avoids the alternative of bind-mounting a host scratch directory, which
+// would not work when hermes itself runs in a container without sharing
+// that directory with the host docker daemon.
+const convertScript = `cat > ` + stagedReportPath +
+	` && trivy convert "$@" ` + stagedReportPath
+
+// Convert converts a trivy JSON report to another format using
+// `docker run --rm -i --entrypoint sh aquasec/trivy -c <wrapper> ...`.
+//
+// The wrapper script stages the report from stdin into a file inside the
+// trivy container and then invokes `trivy convert` against it.  Extra args
+// from cfg.Trivy.ConvertArgs are appended after `--format <format>` and are
+// forwarded into the script via positional parameters, so no shell quoting
+// is performed in Go.
 func Convert(report []byte, format string, cfg config.TrivyConfig) ([]byte, error) {
 	trivyImage := cfg.Image
 	if trivyImage == "" {
@@ -112,12 +134,13 @@ func Convert(report []byte, format string, cfg config.TrivyConfig) ([]byte, erro
 
 	args := []string{
 		"run", "--rm", "-i",
+		"--entrypoint", "sh",
 		trivyImage,
-		"convert",
+		"-c", convertScript,
+		"sh", // $0 placeholder for the script
 		"--format", format,
 	}
 	args = append(args, cfg.ConvertArgs...)
-	args = append(args, "-") // read from stdin
 
 	cmd := execCommand("docker", args...)
 	cmd.Stdin = bytes.NewReader(report)
