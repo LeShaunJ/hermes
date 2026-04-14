@@ -183,19 +183,24 @@ func prompt(message string) (string, error) {
 	return "", nil
 }
 
+// approveExecCommand is the constructor for external commands used by
+// pushToCache; overridden in tests via approveExecRecorder to avoid
+// shelling out to a real docker daemon.
+var approveExecCommand = exec.Command
+
 // pushToCache pushes imageRef to the cache registry using `docker` commands.
 func pushToCache(imageRef string, ref db.ImageRef, cacheURL string) error {
 	dest := fmt.Sprintf("%s/%s:%s", cacheURL, ref.Repository, ref.Tag)
 
-	if out, err := exec.Command("docker", "pull", imageRef).CombinedOutput(); err != nil {
+	if out, err := approveExecCommand("docker", "pull", imageRef).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker pull: %s: %w", string(out), err)
 	}
-	if out, err := exec.Command("docker", "tag", imageRef, dest).CombinedOutput(); err != nil {
+	if out, err := approveExecCommand("docker", "tag", imageRef, dest).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker tag: %s: %w", string(out), err)
 	}
-	if out, err := exec.Command("docker", "push", dest).CombinedOutput(); err != nil {
+	if out, err := approveExecCommand("docker", "push", dest).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker push: %s: %w", string(out), err)
 	}
-	_ = exec.Command("docker", "rmi", dest).Run()
+	_ = approveExecCommand("docker", "rmi", dest).Run()
 	return nil
 }
