@@ -9,6 +9,7 @@ import (
 
 	"github.com/leshaunj/hermes/internal/config"
 	"github.com/leshaunj/hermes/internal/db"
+	"github.com/leshaunj/hermes/internal/logger"
 )
 
 // datastore is the subset of db.DB operations used by CLI commands.
@@ -46,8 +47,16 @@ authoritative gateway for OCI Distribution registries.`,
 		}
 		cfg = c
 
-		// serve opens its own DB connection; skip here.
-		if cmd.Name() == "serve" {
+		// Install the global logger before anything may log.
+		logger.Init(logger.Config{
+			Format: logger.Format(cfg.Log.Format),
+			Level:  cfg.Log.Level,
+		}, os.Stderr)
+
+		// serve opens its own DB connection, and health doesn't need one at
+		// all — skip the connect for both so a dead DB doesn't block either.
+		switch cmd.Name() {
+		case "serve", "health":
 			return nil
 		}
 

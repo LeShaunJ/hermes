@@ -235,6 +235,47 @@ func TestSetError(t *testing.T) {
 	}
 }
 
+func TestVoid(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET state`)).
+		WithArgs("voided", int64(4)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := d.Void(4); err != nil {
+		t.Fatalf("Void: %v", err)
+	}
+}
+
+func TestVoidByBlob_voidsUncachedOwners(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE images`)).
+		WithArgs("registry.example.com", "myrepo",
+			sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).
+			AddRow(int64(7)).AddRow(int64(8)))
+
+	ids, err := d.VoidByBlob("registry.example.com", "myrepo", "sha256:abc")
+	if err != nil {
+		t.Fatalf("VoidByBlob: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != 7 || ids[1] != 8 {
+		t.Errorf("ids = %v, want [7 8]", ids)
+	}
+}
+
+func TestVoidByBlob_noMatches(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE images`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+	ids, err := d.VoidByBlob("registry.example.com", "myrepo", "sha256:abc")
+	if err != nil {
+		t.Fatalf("VoidByBlob: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("ids = %v, want empty", ids)
+	}
+}
+
 // ── Approve ───────────────────────────────────────────────────────────────────
 
 func TestApprove_noCacheRegistry(t *testing.T) {
@@ -590,6 +631,34 @@ func TestList_withRefFilter_noTag(t *testing.T) {
 	}
 }
 
+func TestList_withPlatformFilter(t *testing.T) {
+	d, mock := newMockDB(t)
+	// os + arch both bound as query args in that order.
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("linux", "arm64").
+		WillReturnRows(testImageRow(4, "approved"))
+
+	imgs, err := d.List(ListFilter{OS: "linux", Arch: "arm64"})
+	if err != nil {
+		t.Fatalf("List with platform: %v", err)
+	}
+	if len(imgs) != 1 {
+		t.Errorf("len = %d, want 1", len(imgs))
+	}
+}
+
+func TestList_withPlatformFilter_osOnly(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("linux").
+		WillReturnRows(sqlmock.NewRows(imageRowCols))
+
+	_, err := d.List(ListFilter{OS: "linux"})
+	if err != nil {
+		t.Fatalf("List os-only: %v", err)
+	}
+}
+
 // ── QueueStub ─────────────────────────────────────────────────────────────────
 
 func TestQueueStub_newTag(t *testing.T) {
@@ -896,6 +965,7 @@ func TestGroupOf(t *testing.T) {
 		{StateQueued, GroupPending},
 		{StateScanned, GroupPending},
 		{StateRescinded, GroupPending},
+		{StateVoided, GroupPending},
 		{StateApproved, GroupVerified},
 		{StateRejected, GroupVerified},
 		{StateErrored, ""},
@@ -920,9 +990,10 @@ func TestParseStateOrGroup(t *testing.T) {
 		{"scanned", []State{StateScanned}, false},
 		{"approved", []State{StateApproved}, false},
 		{"rescinded", []State{StateRescinded}, false},
+		{"voided", []State{StateVoided}, false},
 		{"rejected", []State{StateRejected}, false},
 		{"errored", []State{StateErrored}, false},
-		{"pending", []State{StateQueued, StateScanned, StateRescinded}, false},
+		{"pending", []State{StateQueued, StateScanned, StateRescinded, StateVoided}, false},
 		{"verified", []State{StateApproved, StateRejected}, false},
 		{"unknown", nil, true},
 		{"", nil, true},
@@ -1040,42 +1111,70 @@ func TestExtractConfigDigest_invalidJSON(t *testing.T) {
 
 // ── BlobAuthorized ────────────────────────────────────────────────────────────
 
-func TestBlobAuthorized_true(t *testing.T) {
+func TestBlobAuthorized_originForward(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT EXISTS`)).
+	// Authorized without a cache_registry → empty string, forward to origin.
+	mock.ExpectQuery(`SELECT COALESCE\(cr\.url, ''\)`).
 		WithArgs("registry.example.com", "myrepo",
 			sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		WillReturnRows(sqlmock.NewRows([]string{"cache_url"}).AddRow(""))
 
-	ok, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
+	ok, cache, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
 	if err != nil {
 		t.Fatalf("BlobAuthorized: %v", err)
 	}
 	if !ok {
-		t.Error("expected true")
+		t.Error("expected authorized=true")
+	}
+	if cache != "" {
+		t.Errorf("cache = %q, want empty", cache)
 	}
 }
 
-func TestBlobAuthorized_false(t *testing.T) {
+func TestBlobAuthorized_cacheForward(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT EXISTS`)).
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectQuery(`SELECT COALESCE\(cr\.url, ''\)`).
+		WithArgs("registry.example.com", "myrepo",
+			sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"cache_url"}).
+			AddRow("cache.internal.example.com"))
 
-	ok, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
+	ok, cache, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
+	if err != nil {
+		t.Fatalf("BlobAuthorized: %v", err)
+	}
+	if !ok {
+		t.Error("expected authorized=true")
+	}
+	if cache != "cache.internal.example.com" {
+		t.Errorf("cache = %q, want cache.internal.example.com", cache)
+	}
+}
+
+func TestBlobAuthorized_noOwner(t *testing.T) {
+	d, mock := newMockDB(t)
+	// No rows → unauthorized.
+	mock.ExpectQuery(`SELECT COALESCE\(cr\.url, ''\)`).
+		WillReturnRows(sqlmock.NewRows([]string{"cache_url"}))
+
+	ok, cache, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
 	if err != nil {
 		t.Fatalf("BlobAuthorized: %v", err)
 	}
 	if ok {
-		t.Error("expected false")
+		t.Error("expected authorized=false")
+	}
+	if cache != "" {
+		t.Errorf("cache = %q, want empty on unauthorized", cache)
 	}
 }
 
 func TestBlobAuthorized_dbError(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT EXISTS`)).
+	mock.ExpectQuery(`SELECT COALESCE\(cr\.url, ''\)`).
 		WillReturnError(fmt.Errorf("connection refused"))
 
-	_, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
+	_, _, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
 	if err == nil {
 		t.Error("expected error, got nil")
 	}

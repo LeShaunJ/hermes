@@ -21,5 +21,8 @@ VOLUME [ "/var/run/docker.sock" ]
 
 EXPOSE 8080
 
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=5 \
+  CMD ["hermes", "health"]
+
 ENTRYPOINT ["hermes"]
 CMD ["serve"]

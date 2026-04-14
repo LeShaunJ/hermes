@@ -222,6 +222,10 @@ trivy:
   args:         []                     # extra args for `trivy image`
   convert_args: []                     # extra args for `trivy convert`
 
+log:
+  format: json           # json (Loki-compatible) | journald (systemd fields)
+  level:  info           # debug | info | warn | error
+
 cache_url: ""            # default registry for `hermes approve --cache`
 ```
 
@@ -232,7 +236,23 @@ clients obtain bearer tokens through the `/ident/` proxy. It defaults to
 `server.redirect` controls how authorized upstream traffic (manifests, blobs,
 tag lists) is forwarded. When `false` (default), hermes reverse-proxies the
 request. When `true`, hermes sends an HTTP 307 redirect to the upstream URL —
-useful when clients have direct access to the upstream registry.
+useful when clients have direct access to the upstream registry. Automatic
+voiding of approved-but-disappeared digests (see [Image states](#image-states))
+requires proxy mode, because hermes never observes the upstream response in
+redirect mode.
+
+`log.format` selects the global logger wire format:
+
+- `json` (default) emits standard `slog` JSON — `time`, `level` (slog label),
+  `msg`, and attributes at the top level. Suitable for Loki, Promtail, Vector,
+  and similar pipelines.
+- `journald` emits JSON using systemd-journal field conventions: `MESSAGE`
+  replaces `msg`, `PRIORITY` replaces `level` as a syslog priority digit
+  (`0`-`7`), and `time` is dropped (journald stamps its own).
+
+Every CLI and API event persisted to the `events` table is also mirrored to
+the global logger, so operators can tail audit activity through `journalctl`
+or a Loki query without reading the database.
 
 A JSON Schema is provided at [`docs/hermes.schema.json`](docs/hermes.schema.json).
 
@@ -277,11 +297,15 @@ Approve this image? [YES / NO / REJECT] (default: NO):
 
 - **YES** — sets state to `approved`; exits 0.
 - **NO** — no change; exits 0.
-- **REJECT** — sets state to `rejected`; exits 0.
+- **REJECT** — sets state to `rejected`; exits non-zero so the operator's shell
+  pipeline can treat it as a hard deny.
 
 If `--cache` is provided, the image is pushed to `URL` (or `cache_url` from the
 config if no URL is given) upon `YES`. A successful push records the cache
-registry in the database. A failed push sets the state to `errored`.
+registry in the database and the gateway forwards future manifest and blob
+requests for the image to the cache registry instead of the origin — so the
+image stays pullable even if the origin later removes or rewrites its digest.
+A failed push sets the state to `errored`.
 
 > ```bash
 > hermes approve registry.example.com/myapp:v1.2.3
@@ -360,8 +384,8 @@ hermes report [--format FORMAT] [--output FILE] [--platform OS/ARCH] IMAGE
 ```
 
 Retrieves the stored trivy JSON report and converts it using `trivy convert`.
-Supported formats: `table`, `json`, `sarif`, `cyclonedx`, `spdx`, `spdx-json`,
-`github`, `cosign-vuln`. Output goes to stdout or `FILE`.
+Supported formats: `table`, `json`, `template`, `sarif`, `cyclonedx`, `spdx`,
+`spdx-json`, `github`, `cosign-vuln`. Output goes to stdout or `FILE`.
 
 > ```bash
 > hermes report registry.example.com/myapp:v1.2.3
@@ -556,6 +580,6 @@ Append-only audit log of every CLI and API action.
 | `id`         | `bigserial`   | Primary key |
 | `image_id`   | `bigint`      | FK → `images.id` (nullable) |
 | `source`     | `text`        | `cli` or `api` |
-| `event_type` | `text`        | e.g. `scan`, `approve`, `validate_approved`, `validate_adopted`, `blob_approved`, `blob_denied` |
+| `event_type` | `text`        | e.g. `scan`, `approve`, `validate_approved`, `validate_adopted`, `validate_voided`, `blob_approved`, `blob_denied`, `blob_voided` |
 | `details`    | `text`        | JSON with context-specific fields |
 | `created_at` | `timestamptz` | |

@@ -22,6 +22,13 @@ DOCKER_HOST=tcp://localhost:8888 docker pull registry.example.com/myapp:v1.2.3
 ## Git Workflow
 
 - **Pull Requests:** Group related changes into single, logical commits.
+  - Title is a concise summary of main feature or fix.
+  - Description formatted as:
+    ```markdown
+    ### Changelog
+
+    <!-- list of commit titles only; nest breaking changes if needed -->
+    ```
 - **Commits:** Follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
   - Plan your [changes](https://github.com/angular/angular/blob/22b96b9/CONTRIBUTING.md#type):
     | type | purpose |

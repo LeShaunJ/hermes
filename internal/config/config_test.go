@@ -27,6 +27,39 @@ func TestLoad_defaults(t *testing.T) {
 	if cfg.Trivy.Image != "aquasec/trivy:latest" {
 		t.Errorf("Trivy.Image = %q, want %q", cfg.Trivy.Image, "aquasec/trivy:latest")
 	}
+	if cfg.Log.Format != "json" {
+		t.Errorf("Log.Format = %q, want json", cfg.Log.Format)
+	}
+	if cfg.Log.Level != "info" {
+		t.Errorf("Log.Level = %q, want info", cfg.Log.Level)
+	}
+}
+
+func TestLoad_logFromYAML(t *testing.T) {
+	yaml := `
+log:
+  format: journald
+  level: debug
+`
+	f, err := os.CreateTemp(t.TempDir(), "hermes*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(yaml); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	cfg, err := Load(f.Name())
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Log.Format != "journald" {
+		t.Errorf("Log.Format = %q, want journald", cfg.Log.Format)
+	}
+	if cfg.Log.Level != "debug" {
+		t.Errorf("Log.Level = %q, want debug", cfg.Log.Level)
+	}
 }
 
 func TestLoad_serverURL_default(t *testing.T) {

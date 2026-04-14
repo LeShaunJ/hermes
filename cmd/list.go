@@ -13,18 +13,23 @@ import (
 )
 
 var (
-	listStates []string
-	listJSON   bool
+	listStates   []string
+	listJSON     bool
+	listPlatform string
 )
 
 var listCmd = &cobra.Command{
-	Use:   "list [--state STATE[,...]] [--json] [REF ...]",
+	Use:   "list [--platform OS/ARCH] [--state STATE[,...]] [--json] [REF ...]",
 	Short: "List tracked OCI image tags",
 	Long: `list prints image records from the database as a table (or JSON).
 
 STATE may be any individual state (queued, scanned, approved, rescinded,
 rejected, error) or a group name (pending, verified).  Multiple values can
 be combined with commas or by repeating the flag.
+
+--platform narrows to a single OS/ARCH pair (e.g. linux/amd64).  A single
+segment with no slash (e.g. "linux") matches any architecture.  Stub tags
+are excluded when --platform is set since they have no resolved platform yet.
 
 REF filters by [namespace/]name[:tag].  Multiple REFs are OR-ed together.
 
@@ -33,6 +38,7 @@ Examples:
   hermes list --state approved
   hermes list --state pending,verified
   hermes list --state approved --json
+  hermes list --platform linux/amd64 --state pending
   hermes list myapp:v1.2.3 otherapp`,
 	RunE: runList,
 }
@@ -40,6 +46,7 @@ Examples:
 func init() {
 	listCmd.Flags().StringArrayVar(&listStates, "state", nil, "filter by state or group (comma-separated or repeated)")
 	listCmd.Flags().BoolVar(&listJSON, "json", false, "output as JSON array")
+	listCmd.Flags().StringVar(&listPlatform, "platform", "", "filter by platform (os/arch, e.g. linux/amd64)")
 	rootCmd.AddCommand(listCmd)
 }
 
@@ -73,9 +80,16 @@ func runList(_ *cobra.Command, args []string) error {
 		states = deduped
 	}
 
+	platformOS, platformArch, err := parsePlatformFilter(listPlatform)
+	if err != nil {
+		return err
+	}
+
 	images, err := database.List(db.ListFilter{
 		States: states,
 		Refs:   args,
+		OS:     platformOS,
+		Arch:   platformArch,
 	})
 	if err != nil {
 		return err
@@ -86,6 +100,25 @@ func runList(_ *cobra.Command, args []string) error {
 	}
 
 	return outputTable(images)
+}
+
+// parsePlatformFilter splits "os/arch" into its two components.  A single
+// segment ("linux") leaves arch empty for a match-any filter.  An empty
+// input yields two empty strings (no filter).
+func parsePlatformFilter(platform string) (os, arch string, err error) {
+	platform = strings.TrimSpace(platform)
+	if platform == "" {
+		return "", "", nil
+	}
+	parts := strings.SplitN(platform, "/", 2)
+	os = strings.TrimSpace(parts[0])
+	if len(parts) == 2 {
+		arch = strings.TrimSpace(parts[1])
+	}
+	if os == "" {
+		return "", "", fmt.Errorf("invalid --platform %q", platform)
+	}
+	return os, arch, nil
 }
 
 func outputTable(images []db.Image) error {

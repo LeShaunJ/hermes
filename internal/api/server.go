@@ -36,11 +36,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -49,8 +48,6 @@ import (
 	"github.com/leshaunj/hermes/internal/config"
 	"github.com/leshaunj/hermes/internal/db"
 )
-
-var logger = log.New(os.Stderr, "INFO: ", log.Ldate|log.Ltime)
 
 // storage is the subset of db.DB operations used by Server.
 // *db.DB satisfies this interface automatically.
@@ -61,7 +58,9 @@ type storage interface {
 	GetRejected(registry, repository, tag string) (*db.Image, error)
 	QueueStub(ref db.ImageRef) error
 	AdoptTagByDigest(ref db.ImageRef, digest string) (bool, error)
-	BlobAuthorized(registry, repository, digest string) (bool, error)
+	BlobAuthorized(registry, repository, digest string) (authorized bool, cacheRegistry string, err error)
+	Void(imageID int64) error
+	VoidByBlob(registry, repository, digest string) ([]int64, error)
 	LogEvent(imageID *int64, source db.EventSource, eventType string, details map[string]interface{}) error
 }
 
@@ -99,7 +98,7 @@ func New(database storage, cfg *config.Config) *Server {
 
 // ListenAndServe starts the HTTP server.
 func (s *Server) ListenAndServe() error {
-	logger.Printf("hermes gateway listening on %s", s.cfg.Server.Addr)
+	slog.Info("hermes gateway listening", "addr", s.cfg.Server.Addr)
 	return http.ListenAndServe(s.cfg.Server.Addr, s.mux)
 }
 
@@ -152,25 +151,44 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 		img, err = s.db.GetApprovedByTagAndDigest(p.Registry, p.Repository, p.Tag, p.Digest)
 	}
 	if err != nil {
-		logger.Printf("ERROR db lookup %s/%s — %v", p.Registry, p.Repository, err)
+		slog.Error("db lookup", "registry", p.Registry, "repository", p.Repository, "err", err)
 		s.writeOCIError(w, http.StatusInternalServerError, "UNKNOWN", "internal error")
 		return
 	}
 
 	if img != nil {
 		// Approved — proxy/redirect to upstream using the pinned digest ref.
+		// When the image has been cached, the cache registry is the forward
+		// target instead of the origin; a cached image keeps serving even if
+		// the origin later removes or rewrites the digest.
 		ref := img.Digest
 		if ref == "" {
 			ref = p.Tag
 		}
+		forwardRegistry := p.Registry
+		if img.CacheRegistry != "" {
+			forwardRegistry = img.CacheRegistry
+		}
 		_ = s.db.LogEvent(&img.ID, db.SourceAPI, "validate_approved", map[string]interface{}{
-			"registry":   p.Registry,
-			"repository": p.Repository,
-			"tag":        p.Tag,
-			"digest":     p.Digest,
-			"latency_ms": time.Since(start).Milliseconds(),
+			"registry":         p.Registry,
+			"repository":       p.Repository,
+			"tag":              p.Tag,
+			"digest":           p.Digest,
+			"forward_registry": forwardRegistry,
+			"latency_ms":       time.Since(start).Milliseconds(),
 		})
-		s.proxyOrRedirect(w, r, p.Registry, "/v2/"+p.Repository+"/manifests/"+ref)
+		// Only attach the void hook when forwarding to the origin for a
+		// digest-addressed request: cached images stay servable from the
+		// cache registry, and tag-only requests cannot distinguish "tag
+		// moved" from "digest gone" — that's what the adoption path is for.
+		// Redirect mode also skips voiding because hermes never sees the
+		// upstream response.
+		var hooks []responseHook
+		if !s.cfg.Server.Redirect && img.CacheRegistry == "" &&
+			(p.Kind == refKindDigest || p.Kind == refKindTagAndDigest) {
+			hooks = append(hooks, s.voidManifestHook(img, p, start))
+		}
+		s.proxyOrRedirect(w, r, forwardRegistry, "/v2/"+p.Repository+"/manifests/"+ref, hooks...)
 		return
 	}
 
@@ -179,7 +197,7 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 		var rejected *db.Image
 		rejected, err = s.db.GetRejected(p.Registry, p.Repository, p.Tag)
 		if err != nil {
-			logger.Printf("WARN rejected lookup %s/%s:%s — %v", p.Registry, p.Repository, p.Tag, err)
+			slog.Warn("rejected lookup", "registry", p.Registry, "repository", p.Repository, "tag", p.Tag, "err", err)
 		}
 		if rejected != nil {
 			_ = s.db.LogEvent(&rejected.ID, db.SourceAPI, "validate_rejected", map[string]interface{}{
@@ -213,7 +231,7 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 	if p.Tag != "" {
 		ref := db.ImageRef{Registry: p.Registry, Repository: p.Repository, Tag: p.Tag}
 		if qErr := s.db.QueueStub(ref); qErr != nil {
-			logger.Printf("WARN queue stub %s/%s:%s — %v", p.Registry, p.Repository, p.Tag, qErr)
+			slog.Warn("queue stub", "registry", p.Registry, "repository", p.Repository, "tag", p.Tag, "err", qErr)
 		}
 	}
 
@@ -246,7 +264,7 @@ func (s *Server) adoptTagResponseHook(ref db.ImageRef, start time.Time) response
 			if digest != "" {
 				adopted, err := s.db.AdoptTagByDigest(ref, digest)
 				if err != nil {
-					logger.Printf("WARN adopt %s/%s:%s — %v", ref.Registry, ref.Repository, ref.Tag, err)
+					slog.Warn("adopt tag", "registry", ref.Registry, "repository", ref.Repository, "tag", ref.Tag, "err", err)
 				}
 				if adopted {
 					_ = s.db.LogEvent(nil, db.SourceAPI, "validate_adopted", map[string]interface{}{
@@ -264,7 +282,7 @@ func (s *Server) adoptTagResponseHook(ref db.ImageRef, start time.Time) response
 		// Not adopted — stub-register and replace the response body with a
 		// hermes-owned 401 so the approval workflow kicks in.
 		if qErr := s.db.QueueStub(ref); qErr != nil {
-			logger.Printf("WARN queue stub %s/%s:%s — %v", ref.Registry, ref.Repository, ref.Tag, qErr)
+			slog.Warn("queue stub", "registry", ref.Registry, "repository", ref.Repository, "tag", ref.Tag, "err", qErr)
 		}
 		_ = s.db.LogEvent(nil, db.SourceAPI, "validate_denied", map[string]interface{}{
 			"registry":      ref.Registry,
@@ -274,6 +292,99 @@ func (s *Server) adoptTagResponseHook(ref db.ImageRef, start time.Time) response
 			"latency_ms":    time.Since(start).Milliseconds(),
 		})
 		return rewriteResponseOCIError(resp, http.StatusUnauthorized, "UNAUTHORIZED", "approval required")
+	}
+}
+
+// voidCodes are the OCI Distribution error codes that unambiguously mean
+// "this digest no longer exists upstream".  Any other 404 body — NAME_UNKNOWN,
+// DENIED, UNAUTHORIZED, a Docker-Hub private-repo masquerade, etc. — is
+// treated as a transient or auth-level failure and does not trigger voiding.
+var voidCodes = map[string]bool{
+	"MANIFEST_UNKNOWN": true,
+	"BLOB_UNKNOWN":     true,
+}
+
+// shouldVoid reports whether an upstream response means the addressed
+// digest is gone.  It is true for 410 Gone unconditionally and for 404
+// Not Found with a CNCF error body carrying a code in voidCodes.  The
+// response body is read into memory and then replaced with an identical
+// io.NopCloser so the client still receives the bytes unchanged.
+func shouldVoid(resp *http.Response) bool {
+	switch resp.StatusCode {
+	case http.StatusGone:
+		return true
+	case http.StatusNotFound:
+		// fall through
+	default:
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil || len(body) == 0 {
+		return false
+	}
+	var doc ociErrorResponse
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return false
+	}
+	for _, e := range doc.Errors {
+		if voidCodes[e.Code] {
+			return true
+		}
+	}
+	return false
+}
+
+// voidManifestHook returns a responseHook that voids the given image when
+// the upstream response indicates its digest no longer exists.  The hook
+// never rewrites the response — the client still sees the upstream 404/410.
+func (s *Server) voidManifestHook(img *db.Image, p parsedPath, start time.Time) responseHook {
+	return func(resp *http.Response) error {
+		if !shouldVoid(resp) {
+			return nil
+		}
+		if err := s.db.Void(img.ID); err != nil {
+			slog.Error("void image", "image_id", img.ID, "err", err)
+			return nil
+		}
+		_ = s.db.LogEvent(&img.ID, db.SourceAPI, "validate_voided", map[string]interface{}{
+			"registry":      p.Registry,
+			"repository":    p.Repository,
+			"tag":           p.Tag,
+			"digest":        p.Digest,
+			"upstream_code": resp.StatusCode,
+			"latency_ms":    time.Since(start).Milliseconds(),
+		})
+		return nil
+	}
+}
+
+// voidBlobHook returns a responseHook that voids every uncached approved
+// image whose manifest references digest when the upstream indicates the
+// blob is gone.
+func (s *Server) voidBlobHook(p parsedPath, start time.Time) responseHook {
+	return func(resp *http.Response) error {
+		if !shouldVoid(resp) {
+			return nil
+		}
+		ids, err := s.db.VoidByBlob(p.Registry, p.Repository, p.Digest)
+		if err != nil {
+			slog.Error("void by blob", "registry", p.Registry, "repository", p.Repository, "digest", p.Digest, "err", err)
+			return nil
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		_ = s.db.LogEvent(nil, db.SourceAPI, "blob_voided", map[string]interface{}{
+			"registry":         p.Registry,
+			"repository":       p.Repository,
+			"digest":           p.Digest,
+			"voided_image_ids": ids,
+			"upstream_code":    resp.StatusCode,
+			"latency_ms":       time.Since(start).Milliseconds(),
+		})
+		return nil
 	}
 }
 
@@ -303,10 +414,12 @@ func rewriteResponseOCIError(resp *http.Response, status int, code, message stri
 
 // serveBlob authorizes a /v2/<registry>/<repo>/blobs/<digest> download against
 // the database and either forwards it to the upstream registry or denies it.
+// When any owning approved image has been cached, the blob is served from the
+// cache registry so it stays available even if the origin has removed it.
 func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath, start time.Time) {
-	ok, err := s.db.BlobAuthorized(p.Registry, p.Repository, p.Digest)
+	ok, cacheRegistry, err := s.db.BlobAuthorized(p.Registry, p.Repository, p.Digest)
 	if err != nil {
-		logger.Printf("ERROR blob authz %s/%s %s — %v", p.Registry, p.Repository, p.Digest, err)
+		slog.Error("blob authz", "registry", p.Registry, "repository", p.Repository, "digest", p.Digest, "err", err)
 		s.writeOCIError(w, http.StatusInternalServerError, "UNKNOWN", "internal error")
 		return
 	}
@@ -320,13 +433,25 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath,
 		s.writeOCIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "blob not part of an approved image")
 		return
 	}
+	forwardRegistry := p.Registry
+	if cacheRegistry != "" {
+		forwardRegistry = cacheRegistry
+	}
 	_ = s.db.LogEvent(nil, db.SourceAPI, "blob_approved", map[string]interface{}{
-		"registry":   p.Registry,
-		"repository": p.Repository,
-		"digest":     p.Digest,
-		"latency_ms": time.Since(start).Milliseconds(),
+		"registry":         p.Registry,
+		"repository":       p.Repository,
+		"digest":           p.Digest,
+		"forward_registry": forwardRegistry,
+		"latency_ms":       time.Since(start).Milliseconds(),
 	})
-	s.proxyOrRedirect(w, r, p.Registry, "/v2/"+p.Repository+"/blobs/"+p.Digest)
+	// Void hook runs only on the origin-forward branch — cached blobs live
+	// in the cache registry and cannot meaningfully "disappear" upstream.
+	// Redirect mode also skips voiding since hermes never sees the response.
+	var hooks []responseHook
+	if !s.cfg.Server.Redirect && cacheRegistry == "" {
+		hooks = append(hooks, s.voidBlobHook(p, start))
+	}
+	s.proxyOrRedirect(w, r, forwardRegistry, "/v2/"+p.Repository+"/blobs/"+p.Digest, hooks...)
 }
 
 // challengeRetrieve probes GET https://<registry>/v2/<path> and returns the
@@ -407,17 +532,17 @@ func (s *Server) serveIdent(w http.ResponseWriter, r *http.Request) {
 		s.writeOCIError(w, http.StatusBadRequest, "UNSUPPORTED", "malformed `scope=` paramter")
 		return
 	}
-	logger.Printf("match | %+v", match)
+	slog.Debug("ident scope match", "match", match)
 
 	wwwAuth := s.challengeRetrieve(match[1], match[2]+"/tags/list")
-	logger.Printf("wwwAuth | %s", wwwAuth)
+	slog.Debug("ident challenge retrieved", "www_authenticate", wwwAuth)
 
 	challenge := challengeParse(wwwAuth, account[0])
 	if challenge == "" {
 		s.writeOCIError(w, http.StatusFailedDependency, "UNSUPPORTED", "could not retrieve auth challenge")
 		return
 	}
-	logger.Printf("challenge | %s", challenge)
+	slog.Debug("ident challenge parsed", "challenge", challenge)
 
 	target, err := url.Parse(challenge)
 	if err != nil {

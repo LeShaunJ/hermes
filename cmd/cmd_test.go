@@ -255,6 +255,11 @@ type mockDB struct {
 	approveErr  error
 	rejectErr   error
 	rescindErr  error
+
+	// call captures — populated by the mock methods for tests to assert on.
+	listFilter db.ListFilter
+	rejectIDs  []int64
+	rescindIDs []int64
 }
 
 func (m *mockDB) Queue(_ db.ImageRef, _ db.Fetcher) ([]*db.Image, error) {
@@ -267,12 +272,21 @@ func (m *mockDB) SaveScan(_ int64, _ json.RawMessage) (*db.Image, error) {
 func (m *mockDB) LogEvent(_ *int64, _ db.EventSource, _ string, _ map[string]interface{}) error {
 	return nil
 }
-func (m *mockDB) List(_ db.ListFilter) ([]db.Image, error)    { return m.listOut, m.listErr }
+func (m *mockDB) List(f db.ListFilter) ([]db.Image, error) {
+	m.listFilter = f
+	return m.listOut, m.listErr
+}
 func (m *mockDB) GetByRef(_ db.ImageRef) ([]*db.Image, error) { return m.images, m.getRefErr }
 func (m *mockDB) Approve(_ int64, _ string) error             { return m.approveErr }
-func (m *mockDB) Reject(_ int64) error                        { return m.rejectErr }
-func (m *mockDB) Rescind(_ int64) error                       { return m.rescindErr }
-func (m *mockDB) Close()                                      {}
+func (m *mockDB) Reject(id int64) error {
+	m.rejectIDs = append(m.rejectIDs, id)
+	return m.rejectErr
+}
+func (m *mockDB) Rescind(id int64) error {
+	m.rescindIDs = append(m.rescindIDs, id)
+	return m.rescindErr
+}
+func (m *mockDB) Close() {}
 
 // captureStdout temporarily replaces os.Stdout, runs f, and returns the output.
 func captureStdout(t *testing.T, f func()) string {
@@ -596,6 +610,75 @@ func TestRunList_withRef(t *testing.T) {
 	})
 }
 
+func TestRunList_platformFilter(t *testing.T) {
+	m := &mockDB{listOut: nil}
+	database = m
+	listStates = nil
+	listJSON = false
+	listPlatform = "linux/arm64"
+	t.Cleanup(func() { listPlatform = "" })
+
+	_ = captureStdout(t, func() {
+		if err := runList(listCmd, nil); err != nil {
+			t.Errorf("runList --platform: %v", err)
+		}
+	})
+	if m.listFilter.OS != "linux" || m.listFilter.Arch != "arm64" {
+		t.Errorf("listFilter = %+v, want OS=linux Arch=arm64", m.listFilter)
+	}
+}
+
+func TestRunList_platformOSOnly(t *testing.T) {
+	m := &mockDB{listOut: nil}
+	database = m
+	listPlatform = "windows"
+	t.Cleanup(func() { listPlatform = "" })
+
+	_ = captureStdout(t, func() {
+		if err := runList(listCmd, nil); err != nil {
+			t.Errorf("runList --platform os-only: %v", err)
+		}
+	})
+	if m.listFilter.OS != "windows" || m.listFilter.Arch != "" {
+		t.Errorf("listFilter = %+v, want OS=windows Arch=''", m.listFilter)
+	}
+}
+
+func TestRunList_platformInvalid(t *testing.T) {
+	database = &mockDB{listOut: nil}
+	listPlatform = "/amd64"
+	t.Cleanup(func() { listPlatform = "" })
+
+	err := runList(listCmd, nil)
+	if err == nil {
+		t.Error("expected error for empty OS in --platform, got nil")
+	}
+}
+
+func TestParsePlatformFilter(t *testing.T) {
+	cases := []struct {
+		in, os, arch string
+		wantErr      bool
+	}{
+		{"", "", "", false},
+		{"linux", "linux", "", false},
+		{"linux/amd64", "linux", "amd64", false},
+		{"  linux/arm64  ", "linux", "arm64", false},
+		{"/amd64", "", "", true},
+	}
+	for _, c := range cases {
+		os, arch, err := parsePlatformFilter(c.in)
+		if (err != nil) != c.wantErr {
+			t.Errorf("parsePlatformFilter(%q) err = %v, wantErr = %v", c.in, err, c.wantErr)
+			continue
+		}
+		if !c.wantErr && (os != c.os || arch != c.arch) {
+			t.Errorf("parsePlatformFilter(%q) = (%q, %q), want (%q, %q)",
+				c.in, os, arch, c.os, c.arch)
+		}
+	}
+}
+
 // ── runScan ───────────────────────────────────────────────────────────────────
 
 func TestRunScan_badRef(t *testing.T) {
@@ -809,6 +892,69 @@ func TestRunReject_confirmed(t *testing.T) {
 			t.Errorf("runReject confirmed: %v", err)
 		}
 	})
+}
+
+func TestRunReject_platformNarrows(t *testing.T) {
+	// Two platforms; --platform linux/arm64 should reject only the arm64 one.
+	amd := makeImg(1, "linux", "amd64", db.StateScanned)
+	arm := makeImg(2, "linux", "arm64", db.StateScanned)
+	m := &mockDB{images: []*db.Image{amd, arm}}
+	database = m
+	rejectPlatform = "linux/arm64"
+	t.Cleanup(func() { rejectPlatform = "" })
+	fakeStdin(t, "YES")
+
+	_ = captureStdout(t, func() {
+		if err := runReject(rejectCmd, []string{"registry.example.com/myrepo:v1.0"}); err != nil {
+			t.Errorf("runReject --platform: %v", err)
+		}
+	})
+	if len(m.rejectIDs) != 1 || m.rejectIDs[0] != 2 {
+		t.Errorf("rejectIDs = %v, want [2]", m.rejectIDs)
+	}
+}
+
+func TestRunReject_platformNotFound(t *testing.T) {
+	amd := makeImg(1, "linux", "amd64", db.StateScanned)
+	database = &mockDB{images: []*db.Image{amd}}
+	rejectPlatform = "linux/arm64"
+	t.Cleanup(func() { rejectPlatform = "" })
+
+	err := runReject(rejectCmd, []string{"registry.example.com/myrepo:v1.0"})
+	if err == nil {
+		t.Error("expected error for unknown --platform, got nil")
+	}
+}
+
+func TestRunRescind_platformNarrows(t *testing.T) {
+	amd := makeImg(1, "linux", "amd64", db.StateApproved)
+	arm := makeImg(2, "linux", "arm64", db.StateApproved)
+	m := &mockDB{images: []*db.Image{amd, arm}}
+	database = m
+	rescindPlatform = "linux/amd64"
+	t.Cleanup(func() { rescindPlatform = "" })
+
+	_ = captureStdout(t, func() {
+		if err := runRescind(rescindCmd, []string{"registry.example.com/myrepo:v1.0"}); err != nil {
+			t.Errorf("runRescind --platform: %v", err)
+		}
+	})
+	if len(m.rescindIDs) != 1 || m.rescindIDs[0] != 1 {
+		t.Errorf("rescindIDs = %v, want [1]", m.rescindIDs)
+	}
+}
+
+func TestRunRescind_platformNotApproved(t *testing.T) {
+	amd := makeImg(1, "linux", "amd64", db.StateApproved)
+	arm := makeImg(2, "linux", "arm64", db.StateScanned)
+	database = &mockDB{images: []*db.Image{amd, arm}}
+	rescindPlatform = "linux/arm64"
+	t.Cleanup(func() { rescindPlatform = "" })
+
+	err := runRescind(rescindCmd, []string{"registry.example.com/myrepo:v1.0"})
+	if err == nil {
+		t.Error("expected error rescinding non-approved platform, got nil")
+	}
 }
 
 // ── runReport ─────────────────────────────────────────────────────────────────

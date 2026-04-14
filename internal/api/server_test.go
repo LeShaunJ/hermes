@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -32,10 +33,17 @@ type mockStorage struct {
 	adoptCalls  int
 
 	blobAuthorized   bool
+	blobAuthCache    string
 	blobAuthErr      error
 	blobAuthRegistry string
 	blobAuthRepo     string
 	blobAuthDigest   string
+
+	voidErr         error
+	voidedIDs       []int64
+	voidByBlobIDs   []int64
+	voidByBlobErr   error
+	voidByBlobCalls int
 }
 
 func (m *mockStorage) GetApproved(_, _, _ string) (*db.Image, error) {
@@ -55,11 +63,19 @@ func (m *mockStorage) AdoptTagByDigest(_ db.ImageRef, _ string) (bool, error) {
 	m.adoptCalls++
 	return m.adoptResult, m.adoptErr
 }
-func (m *mockStorage) BlobAuthorized(registry, repository, digest string) (bool, error) {
+func (m *mockStorage) BlobAuthorized(registry, repository, digest string) (bool, string, error) {
 	m.blobAuthRegistry = registry
 	m.blobAuthRepo = repository
 	m.blobAuthDigest = digest
-	return m.blobAuthorized, m.blobAuthErr
+	return m.blobAuthorized, m.blobAuthCache, m.blobAuthErr
+}
+func (m *mockStorage) Void(imageID int64) error {
+	m.voidedIDs = append(m.voidedIDs, imageID)
+	return m.voidErr
+}
+func (m *mockStorage) VoidByBlob(_, _, _ string) ([]int64, error) {
+	m.voidByBlobCalls++
+	return m.voidByBlobIDs, m.voidByBlobErr
 }
 func (m *mockStorage) LogEvent(_ *int64, _ db.EventSource, _ string, _ map[string]interface{}) error {
 	return m.logEventErr
@@ -374,6 +390,49 @@ func TestServeOCI_approved_emptyDigest(t *testing.T) {
 	}
 }
 
+func TestServeOCI_approved_forwardsToCacheRegistry(t *testing.T) {
+	// Approved image with a cache registry: the redirect Location must point
+	// at the cache host, not the origin (p.Registry).
+	img := makeTestImage(db.StateApproved)
+	img.CacheRegistry = "cache.internal.example.com"
+	store := &mockStorage{approved: img}
+	s := newMockServer(store, "http://localhost:8080", true)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/latest", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want 307", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.Contains(loc, "cache.internal.example.com") {
+		t.Errorf("Location = %q, want cache host", loc)
+	}
+	if strings.Contains(loc, "registry.example.com") {
+		t.Errorf("Location = %q, must not reference origin", loc)
+	}
+}
+
+func TestServeOCI_approved_uncachedForwardsToOrigin(t *testing.T) {
+	img := makeTestImage(db.StateApproved)
+	img.CacheRegistry = "" // uncached
+	store := &mockStorage{approved: img}
+	s := newMockServer(store, "http://localhost:8080", true)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/manifests/latest", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want 307", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.Contains(loc, "registry.example.com") {
+		t.Errorf("Location = %q, want origin host", loc)
+	}
+}
+
 func TestServeOCI_rejected(t *testing.T) {
 	img := makeTestImage(db.StateRejected)
 	store := &mockStorage{rejected: img}
@@ -443,6 +502,255 @@ func TestServeOCI_otherPath_redirect(t *testing.T) {
 	}
 }
 
+// ── shouldVoid ────────────────────────────────────────────────────────────────
+
+func makeResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{},
+	}
+}
+
+func TestShouldVoid(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"200 ok", 200, `{}`, false},
+		{"502 bad gateway", 502, ``, false},
+		{"410 gone", 410, ``, true},
+		{"404 manifest unknown",
+			404, `{"errors":[{"code":"MANIFEST_UNKNOWN","message":"gone"}]}`, true},
+		{"404 blob unknown",
+			404, `{"errors":[{"code":"BLOB_UNKNOWN","message":"gone"}]}`, true},
+		{"404 denied (auth masquerade)",
+			404, `{"errors":[{"code":"DENIED","message":"forbidden"}]}`, false},
+		{"404 name unknown",
+			404, `{"errors":[{"code":"NAME_UNKNOWN","message":"repo gone"}]}`, false},
+		{"404 empty body", 404, ``, false},
+		{"404 garbage body", 404, `<html>not json</html>`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := makeResponse(tc.status, tc.body)
+			got := shouldVoid(resp)
+			if got != tc.want {
+				t.Errorf("shouldVoid = %v, want %v", got, tc.want)
+			}
+			// Body must remain readable by the client.
+			body, _ := io.ReadAll(resp.Body)
+			if string(body) != tc.body {
+				t.Errorf("body after shouldVoid = %q, want %q", body, tc.body)
+			}
+		})
+	}
+}
+
+// ── voiding via gateway ───────────────────────────────────────────────────────
+
+func TestServeOCI_digestManifest_voidsOnManifestUnknown(t *testing.T) {
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"errors":[{"code":"MANIFEST_UNKNOWN","message":"gone"}]}`))
+	})
+	defer srv.Close()
+
+	img := makeTestImage(db.StateApproved)
+	img.ID = 42
+	img.CacheRegistry = "" // uncached — void path is eligible
+	store := &mockStorage{approvedByDigest: img}
+	s := newMockServer(store, "http://localhost:8080", false) // proxy mode
+	s.transport = http.DefaultTransport
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/v2/"+host+"/myrepo/manifests/sha256:abc123", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if len(store.voidedIDs) != 1 || store.voidedIDs[0] != 42 {
+		t.Errorf("voidedIDs = %v, want [42]", store.voidedIDs)
+	}
+}
+
+func TestServeOCI_digestManifest_doesNotVoidOnBare404(t *testing.T) {
+	// A 404 without a recognised OCI error code — could be auth-as-404.
+	// Image must NOT be voided.
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`not json`))
+	})
+	defer srv.Close()
+
+	img := makeTestImage(db.StateApproved)
+	img.CacheRegistry = ""
+	store := &mockStorage{approvedByDigest: img}
+	s := newMockServer(store, "http://localhost:8080", false)
+	s.transport = http.DefaultTransport
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/v2/"+host+"/myrepo/manifests/sha256:abc123", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if len(store.voidedIDs) != 0 {
+		t.Errorf("voidedIDs = %v, want empty (bare 404 is not a void signal)", store.voidedIDs)
+	}
+}
+
+func TestServeOCI_digestManifest_doesNotVoidOn5xx(t *testing.T) {
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	defer srv.Close()
+
+	img := makeTestImage(db.StateApproved)
+	img.CacheRegistry = ""
+	store := &mockStorage{approvedByDigest: img}
+	s := newMockServer(store, "http://localhost:8080", false)
+	s.transport = http.DefaultTransport
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/v2/"+host+"/myrepo/manifests/sha256:abc123", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if len(store.voidedIDs) != 0 {
+		t.Errorf("voidedIDs = %v, want empty (5xx is not a void signal)", store.voidedIDs)
+	}
+}
+
+func TestServeOCI_digestManifest_cachedSkipsVoidHook(t *testing.T) {
+	// A cached image is forwarded to the cache registry; even if the cache
+	// returns 404+MANIFEST_UNKNOWN, the void hook must NOT run, because the
+	// cache carve-out protects cached images by construction.
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"errors":[{"code":"MANIFEST_UNKNOWN","message":"cache miss"}]}`))
+	})
+	defer srv.Close()
+
+	img := makeTestImage(db.StateApproved)
+	img.ID = 77
+	img.CacheRegistry = host // forward will go to the test backend as "cache"
+	store := &mockStorage{approvedByDigest: img}
+	s := newMockServer(store, "http://localhost:8080", false)
+	s.transport = http.DefaultTransport
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/v2/registry.example.com/myrepo/manifests/sha256:abc123", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if len(store.voidedIDs) != 0 {
+		t.Errorf("voidedIDs = %v, want empty (cached images never void)", store.voidedIDs)
+	}
+}
+
+func TestServeOCI_digestManifest_redirectModeSkipsVoidHook(t *testing.T) {
+	// Redirect mode never sees the upstream response, so the void hook is
+	// skipped entirely.  We assert via the Location header (307) that no
+	// proxy occurred, and verify Void was not called.
+	img := makeTestImage(db.StateApproved)
+	img.CacheRegistry = ""
+	store := &mockStorage{approvedByDigest: img}
+	s := newMockServer(store, "http://localhost:8080", true) // redirect=true
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/v2/registry.example.com/myrepo/manifests/sha256:abc123", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Errorf("status = %d, want 307", rec.Code)
+	}
+	if len(store.voidedIDs) != 0 {
+		t.Errorf("voidedIDs = %v, want empty (redirect mode)", store.voidedIDs)
+	}
+}
+
+func TestServeOCI_blob_voidsOnBlobUnknown(t *testing.T) {
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"errors":[{"code":"BLOB_UNKNOWN","message":"gone"}]}`))
+	})
+	defer srv.Close()
+
+	store := &mockStorage{
+		blobAuthorized: true,
+		voidByBlobIDs:  []int64{11, 22},
+	}
+	s := newMockServer(store, "http://localhost:8080", false) // proxy mode
+	s.transport = http.DefaultTransport
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/v2/"+host+"/myrepo/blobs/sha256:abc", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+	if store.voidByBlobCalls != 1 {
+		t.Errorf("voidByBlobCalls = %d, want 1", store.voidByBlobCalls)
+	}
+}
+
+func TestServeOCI_blob_doesNotVoidOn200(t *testing.T) {
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`blobdata`))
+	})
+	defer srv.Close()
+
+	store := &mockStorage{blobAuthorized: true}
+	s := newMockServer(store, "http://localhost:8080", false)
+	s.transport = http.DefaultTransport
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/v2/"+host+"/myrepo/blobs/sha256:abc", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if store.voidByBlobCalls != 0 {
+		t.Errorf("voidByBlobCalls = %d, want 0", store.voidByBlobCalls)
+	}
+}
+
+func TestServeOCI_blob_cachedSkipsVoidHook(t *testing.T) {
+	// Cached blob: void hook must not run even if the cache returns 404.
+	srv, host := newUpstreamBackend(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"errors":[{"code":"BLOB_UNKNOWN","message":"gone"}]}`))
+	})
+	defer srv.Close()
+
+	store := &mockStorage{
+		blobAuthorized: true,
+		blobAuthCache:  host, // forward goes to test backend as "cache"
+	}
+	s := newMockServer(store, "http://localhost:8080", false)
+	s.transport = http.DefaultTransport
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/v2/registry.example.com/myrepo/blobs/sha256:abc", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if store.voidByBlobCalls != 0 {
+		t.Errorf("voidByBlobCalls = %d, want 0 (cached blob)", store.voidByBlobCalls)
+	}
+}
+
 // ── serveOCI blob gatekeeping ─────────────────────────────────────────────────
 
 func TestServeOCI_blob_authorized(t *testing.T) {
@@ -461,6 +769,29 @@ func TestServeOCI_blob_authorized(t *testing.T) {
 	}
 	if store.blobAuthRepo != "myrepo" {
 		t.Errorf("BlobAuthorized repo = %q, want myrepo", store.blobAuthRepo)
+	}
+}
+
+func TestServeOCI_blob_authorized_forwardsToCache(t *testing.T) {
+	store := &mockStorage{
+		blobAuthorized: true,
+		blobAuthCache:  "cache.internal.example.com",
+	}
+	s := newMockServer(store, "http://localhost:8080", true)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.example.com/myrepo/blobs/sha256:abc", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want 307", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.Contains(loc, "cache.internal.example.com") {
+		t.Errorf("Location = %q, want cache host", loc)
+	}
+	if strings.Contains(loc, "registry.example.com") {
+		t.Errorf("Location = %q, must not reference origin", loc)
 	}
 }
 
