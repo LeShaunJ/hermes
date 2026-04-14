@@ -4,17 +4,76 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/leshaunj/hermes/internal/config"
 )
 
-// fakeExec returns a function that substitutes execCommand with a real binary
-// (echo, cat, false, etc.) so tests never touch Docker.
-func fakeExec(name string, fixedArgs ...string) func(string, ...string) *exec.Cmd {
-	return func(_ string, _ ...string) *exec.Cmd {
-		return exec.Command(name, fixedArgs...)
+// ── exec capture harness ──────────────────────────────────────────────────────
+
+// capturedCall records one (name, args) pair seen by execCommand.
+type capturedCall struct {
+	name string
+	args []string
+}
+
+// recorder collects every execCommand invocation made through its function.
+// Each Recorder.fn returned closure prepends a real subprocess that the test
+// chooses; the production code's *exec.Cmd is genuine so cmd.Stdin / cmd.Output
+// behave normally, which is what lets the harness verify stdin wiring.
+type recorder struct {
+	calls []capturedCall
+}
+
+// useReal returns an execCommand replacement that captures the call and then
+// constructs an exec.Cmd that runs realName with realArgs.  The production
+// code's Stdin assignment is preserved, so a "cat" backend echoes the report
+// bytes through to stdout — which proves the production code actually wired
+// Stdin to the subprocess.
+func (r *recorder) useReal(realName string, realArgs ...string) func(string, ...string) *exec.Cmd {
+	return func(name string, args ...string) *exec.Cmd {
+		r.calls = append(r.calls, capturedCall{
+			name: name,
+			args: append([]string(nil), args...),
+		})
+		return exec.Command(realName, realArgs...)
 	}
+}
+
+// last returns the last captured call, or fails the test if none exist.
+func (r *recorder) last(t *testing.T) capturedCall {
+	t.Helper()
+	if len(r.calls) == 0 {
+		t.Fatalf("no execCommand calls captured")
+	}
+	return r.calls[len(r.calls)-1]
+}
+
+// withExec swaps execCommand for the duration of a test and restores it on
+// cleanup.  Tests should always go through this helper rather than
+// hand-rolling save/restore so a panic in the body cannot leak the override.
+func withExec(t *testing.T, fn func(string, ...string) *exec.Cmd) {
+	t.Helper()
+	orig := execCommand
+	execCommand = fn
+	t.Cleanup(func() { execCommand = orig })
+}
+
+// containsSubsequence reports whether want appears as a contiguous slice
+// inside got — used to assert that "--format" is followed by the expected
+// value rather than just present somewhere in args.
+func containsSubsequence(got, want []string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	for i := 0; i+len(want) <= len(got); i++ {
+		if slices.Equal(got[i:i+len(want)], want) {
+			return true
+		}
+	}
+	return false
 }
 
 // ── extractJSON ───────────────────────────────────────────────────────────────
@@ -99,176 +158,290 @@ func TestValidateFormat(t *testing.T) {
 
 // ── Scan ──────────────────────────────────────────────────────────────────────
 
-func TestScan_success(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("echo", `{"SchemaVersion":2,"Results":[]}`)
+func TestScan_constructsDockerInvocation(t *testing.T) {
+	rec := &recorder{}
+	withExec(t, rec.useReal("echo", `{"SchemaVersion":2,"Results":[]}`))
 
-	cfg := config.TrivyConfig{Image: "aquasec/trivy:latest"}
-	result, err := Scan("registry.example.com/myapp:v1", cfg)
+	cfg := config.TrivyConfig{Image: "aquasec/trivy:0.50.0"}
+	result, err := Scan("registry.example.com/myapp:v1.2.3", cfg)
 	if err != nil {
-		t.Fatalf("Scan() unexpected error: %v", err)
+		t.Fatalf("Scan: %v", err)
 	}
-	if len(result.Raw) == 0 {
-		t.Error("Scan() returned empty Raw")
+	if string(result.Raw) != `{"SchemaVersion":2,"Results":[]}` {
+		t.Errorf("Raw = %q, want the JSON our fake printed", result.Raw)
+	}
+
+	call := rec.last(t)
+	if call.name != "docker" {
+		t.Errorf("name = %q, want docker", call.name)
+	}
+	wantSequence := [][]string{
+		{"run", "--rm"},
+		{"-v", "/var/run/docker.sock:/var/run/docker.sock"},
+		{"aquasec/trivy:0.50.0"},
+		{"image"},
+		{"--disable-telemetry"},
+		{"--format", "json"},
+		{"--quiet"},
+		{"registry.example.com/myapp:v1.2.3"},
+	}
+	for _, want := range wantSequence {
+		if !containsSubsequence(call.args, want) {
+			t.Errorf("args missing subsequence %v\nargs: %v", want, call.args)
+		}
+	}
+	// imageRef must be the last positional, after --quiet, so trivy treats it
+	// as the scan target rather than a flag value.
+	if call.args[len(call.args)-1] != "registry.example.com/myapp:v1.2.3" {
+		t.Errorf("last arg = %q, want image ref", call.args[len(call.args)-1])
 	}
 }
 
 func TestScan_defaultImage(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("echo", `{"SchemaVersion":2}`)
+	rec := &recorder{}
+	withExec(t, rec.useReal("echo", `{"SchemaVersion":2}`))
 
-	// Empty Image should default to aquasec/trivy:latest without panicking.
-	cfg := config.TrivyConfig{}
-	_, err := Scan("myimage:latest", cfg)
-	if err != nil {
-		t.Fatalf("Scan() with empty Image: %v", err)
+	if _, err := Scan("myimage:latest", config.TrivyConfig{}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	call := rec.last(t)
+	if !slices.Contains(call.args, "aquasec/trivy:latest") {
+		t.Errorf("args missing default image\nargs: %v", call.args)
 	}
 }
 
-func TestScan_extraArgs(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("echo", `{"SchemaVersion":2}`)
+func TestScan_extraArgsAppearBeforeImageRef(t *testing.T) {
+	rec := &recorder{}
+	withExec(t, rec.useReal("echo", `{"SchemaVersion":2}`))
 
-	cfg := config.TrivyConfig{Args: []string{"--ignore-unfixed"}}
-	_, err := Scan("myimage:latest", cfg)
-	if err != nil {
-		t.Fatalf("Scan() with extra args: %v", err)
+	cfg := config.TrivyConfig{Args: []string{"--ignore-unfixed", "--severity", "HIGH,CRITICAL"}}
+	if _, err := Scan("myimage:latest", cfg); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	call := rec.last(t)
+
+	for _, want := range []string{"--ignore-unfixed", "--severity", "HIGH,CRITICAL"} {
+		if !slices.Contains(call.args, want) {
+			t.Errorf("args missing %q\nargs: %v", want, call.args)
+		}
+	}
+	// The extra args must precede the image ref so trivy parses them as
+	// flags rather than positional arguments.
+	imageIdx := slices.Index(call.args, "myimage:latest")
+	severityIdx := slices.Index(call.args, "--severity")
+	if imageIdx < 0 || severityIdx < 0 || severityIdx > imageIdx {
+		t.Errorf("expected --severity before image ref\nargs: %v", call.args)
 	}
 }
 
 func TestScan_commandFails(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	// "false" exits with non-zero status.
-	execCommand = fakeExec("false")
+	rec := &recorder{}
+	withExec(t, rec.useReal("false"))
 
-	cfg := config.TrivyConfig{}
-	_, err := Scan("myimage:latest", cfg)
+	_, err := Scan("myimage:latest", config.TrivyConfig{})
 	if err == nil {
-		t.Error("Scan() expected error from failing command, got nil")
+		t.Error("expected error from failing command, got nil")
+	}
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 call, got %d", len(rec.calls))
 	}
 }
 
 func TestScan_noJSON(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("echo", "no json output here")
+	rec := &recorder{}
+	withExec(t, rec.useReal("echo", "no json output here"))
 
-	cfg := config.TrivyConfig{}
-	_, err := Scan("myimage:latest", cfg)
+	_, err := Scan("myimage:latest", config.TrivyConfig{})
 	if err == nil {
-		t.Error("Scan() expected error when no JSON, got nil")
+		t.Error("expected error when no JSON, got nil")
 	}
 }
 
 // ── Convert ───────────────────────────────────────────────────────────────────
 
-func TestConvert_success(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("echo", "converted output")
+// TestConvert_pipesReportThroughStdin is the regression test for the
+// "trivy convert -" bug.  By mocking execCommand with `cat`, the test
+// confirms that the production code actually wires cmd.Stdin to a reader
+// over the report bytes — if Stdin were nil (the old `-` form), `cat` would
+// produce empty output and the assertion would fail.
+func TestConvert_pipesReportThroughStdin(t *testing.T) {
+	rec := &recorder{}
+	withExec(t, rec.useReal("cat"))
 
-	cfg := config.TrivyConfig{Image: "aquasec/trivy:latest"}
-	out, err := Convert([]byte(`{"SchemaVersion":2}`), "table", cfg)
+	report := []byte(`{"SchemaVersion":2,"Results":[{"Target":"alpine"}]}`)
+	out, err := Convert(report, "table", config.TrivyConfig{})
 	if err != nil {
-		t.Fatalf("Convert() unexpected error: %v", err)
+		t.Fatalf("Convert: %v", err)
 	}
-	if len(out) == 0 {
-		t.Error("Convert() returned empty output")
+	if string(out) != string(report) {
+		t.Errorf("Convert output = %q, want %q\n(if these differ, Stdin was not wired through)",
+			out, report)
+	}
+}
+
+// TestConvert_constructsShellWrapperInvocation pins the docker invocation
+// to the in-container staging design so a future refactor cannot silently
+// regress to passing "-" as an input path.
+func TestConvert_constructsShellWrapperInvocation(t *testing.T) {
+	rec := &recorder{}
+	withExec(t, rec.useReal("cat"))
+
+	cfg := config.TrivyConfig{Image: "aquasec/trivy:0.50.0"}
+	if _, err := Convert([]byte(`{}`), "sarif", cfg); err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	call := rec.last(t)
+	if call.name != "docker" {
+		t.Errorf("name = %q, want docker", call.name)
+	}
+	// `-i` keeps stdin open so the wrapper's `cat` can read the report.
+	if !slices.Contains(call.args, "-i") {
+		t.Errorf("args missing -i (stdin must be open)\nargs: %v", call.args)
+	}
+	// Override the image entrypoint so we can run sh.
+	if !containsSubsequence(call.args, []string{"--entrypoint", "sh"}) {
+		t.Errorf("args missing --entrypoint sh\nargs: %v", call.args)
+	}
+	// The shell script must stage stdin into a file *before* invoking trivy.
+	scriptIdx := slices.IndexFunc(call.args, func(s string) bool {
+		return strings.Contains(s, "cat >") && strings.Contains(s, "trivy convert")
+	})
+	if scriptIdx < 0 {
+		t.Errorf("args missing cat-then-trivy shell wrapper\nargs: %v", call.args)
+	}
+	// trivy convert MUST NOT receive "-" as an input file — that's the
+	// regression we are guarding against.
+	if slices.Contains(call.args, "-") {
+		t.Errorf("args contain literal '-' input path; trivy does not read stdin\nargs: %v", call.args)
+	}
+	// Format flag must be present and follow the script positional.
+	if !containsSubsequence(call.args, []string{"--format", "sarif"}) {
+		t.Errorf("args missing --format sarif sequence\nargs: %v", call.args)
+	}
+	// Configured trivy image is honoured.
+	if !slices.Contains(call.args, "aquasec/trivy:0.50.0") {
+		t.Errorf("args missing configured image\nargs: %v", call.args)
 	}
 }
 
 func TestConvert_defaultImage(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("echo", "output")
+	rec := &recorder{}
+	withExec(t, rec.useReal("cat"))
 
-	cfg := config.TrivyConfig{}
-	_, err := Convert([]byte(`{}`), "sarif", cfg)
-	if err != nil {
-		t.Fatalf("Convert() with empty Image: %v", err)
+	if _, err := Convert([]byte(`{}`), "sarif", config.TrivyConfig{}); err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	if !slices.Contains(rec.last(t).args, "aquasec/trivy:latest") {
+		t.Errorf("default image not honoured\nargs: %v", rec.last(t).args)
 	}
 }
 
-func TestConvert_extraArgs(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("echo", "output")
+// TestConvert_extraArgsForwardedAfterFormat verifies that ConvertArgs land
+// after `--format <format>` and become positional arguments to the in-container
+// shell wrapper, which forwards them to trivy via "$@".
+func TestConvert_extraArgsForwardedAfterFormat(t *testing.T) {
+	rec := &recorder{}
+	withExec(t, rec.useReal("cat"))
 
-	cfg := config.TrivyConfig{ConvertArgs: []string{"--template", "@tmpl.tpl"}}
-	_, err := Convert([]byte(`{}`), "template", cfg)
-	if err != nil {
-		t.Fatalf("Convert() with ConvertArgs: %v", err)
+	cfg := config.TrivyConfig{ConvertArgs: []string{"--template", "@/contrib/html.tpl"}}
+	if _, err := Convert([]byte(`{}`), "template", cfg); err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	call := rec.last(t)
+	if !containsSubsequence(call.args, []string{"--format", "template", "--template", "@/contrib/html.tpl"}) {
+		t.Errorf("ConvertArgs not appended in order\nargs: %v", call.args)
 	}
 }
 
 func TestConvert_commandFails(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("false")
+	rec := &recorder{}
+	withExec(t, rec.useReal("false"))
 
-	cfg := config.TrivyConfig{}
-	_, err := Convert([]byte(`{}`), "table", cfg)
+	_, err := Convert([]byte(`{}`), "table", config.TrivyConfig{})
 	if err == nil {
-		t.Error("Convert() expected error from failing command, got nil")
+		t.Error("expected error from failing command, got nil")
+	}
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 call, got %d", len(rec.calls))
 	}
 }
 
 // ── ConvertToFile ─────────────────────────────────────────────────────────────
 
-func TestConvertToFile_stdout(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("echo", "table output")
+func TestConvertToFile_writesStdoutOnDash(t *testing.T) {
+	rec := &recorder{}
+	withExec(t, rec.useReal("cat"))
 
-	cfg := config.TrivyConfig{}
-	if err := ConvertToFile([]byte(`{}`), "table", "-", cfg); err != nil {
+	report := []byte(`{"converted":"contents"}`)
+
+	// Capture stdout to verify the bytes were written there.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	t.Cleanup(func() { os.Stdout = origStdout })
+
+	doneCh := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		n, _ := r.Read(buf)
+		doneCh <- buf[:n]
+	}()
+
+	if err := ConvertToFile(report, "table", "-", config.TrivyConfig{}); err != nil {
 		t.Fatalf("ConvertToFile(-): %v", err)
+	}
+	_ = w.Close()
+	got := <-doneCh
+
+	if string(got) != string(report) {
+		t.Errorf("stdout = %q, want %q", got, report)
 	}
 }
 
-func TestConvertToFile_file(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("echo", "sarif output")
+func TestConvertToFile_writesFileWhenPathGiven(t *testing.T) {
+	rec := &recorder{}
+	withExec(t, rec.useReal("cat"))
 
-	cfg := config.TrivyConfig{}
+	report := []byte(`{"sarif":"data"}`)
 	outPath := filepath.Join(t.TempDir(), "report.sarif")
-	if err := ConvertToFile([]byte(`{}`), "sarif", outPath, cfg); err != nil {
+
+	if err := ConvertToFile(report, "sarif", outPath, config.TrivyConfig{}); err != nil {
 		t.Fatalf("ConvertToFile(file): %v", err)
 	}
-	b, err := os.ReadFile(outPath)
+
+	got, err := os.ReadFile(outPath)
 	if err != nil {
 		t.Fatalf("read output file: %v", err)
 	}
-	if len(b) == 0 {
-		t.Error("output file is empty")
+	if string(got) != string(report) {
+		t.Errorf("file contents = %q, want %q", got, report)
 	}
 }
 
-func TestConvertToFile_empty_path_writes_stdout(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("echo", "output")
+func TestConvertToFile_emptyPathWritesStdout(t *testing.T) {
+	rec := &recorder{}
+	withExec(t, rec.useReal("cat"))
 
-	cfg := config.TrivyConfig{}
-	// empty outPath should behave like "-"
-	if err := ConvertToFile([]byte(`{}`), "table", "", cfg); err != nil {
+	// Empty outPath should behave like "-". We don't need to capture stdout
+	// here; the goal is to assert no error and that exec was actually called.
+	if err := ConvertToFile([]byte(`{}`), "table", "", config.TrivyConfig{}); err != nil {
 		t.Fatalf("ConvertToFile(empty): %v", err)
 	}
+	if len(rec.calls) != 1 {
+		t.Errorf("expected 1 exec call, got %d", len(rec.calls))
+	}
 }
 
-func TestConvertToFile_convertError(t *testing.T) {
-	orig := execCommand
-	defer func() { execCommand = orig }()
-	execCommand = fakeExec("false")
+func TestConvertToFile_propagatesConvertError(t *testing.T) {
+	rec := &recorder{}
+	withExec(t, rec.useReal("false"))
 
-	cfg := config.TrivyConfig{}
-	err := ConvertToFile([]byte(`{}`), "table", "/tmp/out.txt", cfg)
+	err := ConvertToFile([]byte(`{}`), "table", filepath.Join(t.TempDir(), "out"), config.TrivyConfig{})
 	if err == nil {
-		t.Error("ConvertToFile() expected error from failing convert, got nil")
+		t.Error("expected error from failing convert, got nil")
 	}
 }
