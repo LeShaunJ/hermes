@@ -113,9 +113,11 @@ func runApprove(cmd *cobra.Command, args []string) error {
 		logEvent("scan", img, map[string]interface{}{"digest": img.Digest})
 	}
 
-	// Display the report.
+	// Display the report.  Route the table through stderr alongside the
+	// dividers and prompt so a large stdout dump cannot interleave with
+	// the prompt and leave it overdrawn / invisible on the terminal.
 	fmt.Fprintln(os.Stderr, strings.Repeat("─", 72))
-	if err := printJSON(img.ScanReport); err != nil {
+	if err := printScanReport(os.Stderr, img.ScanReport); err != nil {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, strings.Repeat("─", 72))

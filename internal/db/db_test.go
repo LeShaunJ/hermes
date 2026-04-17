@@ -1,6 +1,8 @@
 package db
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -8,6 +10,7 @@ import (
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/lib/pq"
 )
 
 // newMockDB creates a DB backed by a sqlmock connection.
@@ -310,25 +313,263 @@ func TestApprove_withCacheRegistry(t *testing.T) {
 func TestLogEvent_withDetails(t *testing.T) {
 	d, mock := newMockDB(t)
 	id := int64(1)
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO events`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO events`)).
 		WithArgs(&id, "cli", "scan", sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(7)))
+	mock.ExpectExec(regexp.QuoteMeta(`pg_notify`)).
+		WithArgs("7").
+		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	err := d.LogEvent(&id, SourceCLI, "scan", map[string]interface{}{"key": "val"})
-	if err != nil {
+	if err := d.LogEvent(&id, SourceCLI, "scan", map[string]interface{}{"key": "val"}); err != nil {
 		t.Fatalf("LogEvent: %v", err)
 	}
 }
 
 func TestLogEvent_nilImageID(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO events`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO events`)).
 		WithArgs(nil, "api", "validate_denied", nil).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(8)))
+	mock.ExpectExec(regexp.QuoteMeta(`pg_notify`)).
+		WithArgs("8").
+		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	err := d.LogEvent(nil, SourceAPI, "validate_denied", nil)
-	if err != nil {
+	if err := d.LogEvent(nil, SourceAPI, "validate_denied", nil); err != nil {
 		t.Fatalf("LogEvent nil id: %v", err)
+	}
+}
+
+func TestLogEvent_insertFailureReturnsError(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO events`)).
+		WillReturnError(fmt.Errorf("db offline"))
+
+	if err := d.LogEvent(nil, SourceCLI, "scan", nil); err == nil {
+		t.Error("expected error, got nil")
+	}
+}
+
+func TestLogEvent_notifyFailureNonFatal(t *testing.T) {
+	d, mock := newMockDB(t)
+	id := int64(1)
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO events`)).
+		WithArgs(&id, "cli", "scan", sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(9)))
+	mock.ExpectExec(regexp.QuoteMeta(`pg_notify`)).
+		WillReturnError(fmt.Errorf("notify failed"))
+
+	if err := d.LogEvent(&id, SourceCLI, "scan", nil); err != nil {
+		t.Errorf("LogEvent should not surface notify failures: %v", err)
+	}
+}
+
+// ── getEvent ──────────────────────────────────────────────────────────────────
+
+func TestGetEvent_success(t *testing.T) {
+	d, mock := newMockDB(t)
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, image_id, source, event_type, details, created_at`)).
+		WithArgs(int64(5)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "image_id", "source", "event_type", "details", "created_at"}).
+			AddRow(int64(5), int64(42), "cli", "scan", `{"digest":"sha256:abc"}`, now))
+
+	ev, err := d.getEvent(5)
+	if err != nil {
+		t.Fatalf("getEvent: %v", err)
+	}
+	if ev.ID != 5 {
+		t.Errorf("ID = %d, want 5", ev.ID)
+	}
+	if ev.ImageID == nil || *ev.ImageID != 42 {
+		t.Errorf("ImageID = %v, want *42", ev.ImageID)
+	}
+	if ev.Source != SourceCLI {
+		t.Errorf("Source = %q, want cli", ev.Source)
+	}
+	if ev.EventType != "scan" {
+		t.Errorf("EventType = %q, want scan", ev.EventType)
+	}
+	if ev.Details != `{"digest":"sha256:abc"}` {
+		t.Errorf("Details = %q, want the stored JSON string", ev.Details)
+	}
+}
+
+func TestGetEvent_nullImageIDAndDetails(t *testing.T) {
+	d, mock := newMockDB(t)
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, image_id, source, event_type, details, created_at`)).
+		WithArgs(int64(6)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "image_id", "source", "event_type", "details", "created_at"}).
+			AddRow(int64(6), nil, "api", "validate_approved", nil, now))
+
+	ev, err := d.getEvent(6)
+	if err != nil {
+		t.Fatalf("getEvent: %v", err)
+	}
+	if ev.ImageID != nil {
+		t.Errorf("ImageID = %v, want nil", ev.ImageID)
+	}
+	if ev.Details != "" {
+		t.Errorf("Details = %q, want empty on NULL", ev.Details)
+	}
+}
+
+func TestGetEvent_notFound(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, image_id, source, event_type, details, created_at`)).
+		WithArgs(int64(99)).
+		WillReturnError(sql.ErrNoRows)
+
+	if _, err := d.getEvent(99); err == nil {
+		t.Error("expected error for missing row, got nil")
+	}
+}
+
+// ── handleNotification ────────────────────────────────────────────────────────
+
+func TestHandleNotification_deliversEvent(t *testing.T) {
+	d, mock := newMockDB(t)
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, image_id, source, event_type, details, created_at`)).
+		WithArgs(int64(3)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "image_id", "source", "event_type", "details", "created_at"}).
+			AddRow(int64(3), nil, "api", "validate_approved", nil, now))
+
+	out := make(chan *Event, 1)
+	ok := d.handleNotification(context.Background(),
+		&pq.Notification{Channel: "hermes_events", Extra: "3"}, out)
+	if !ok {
+		t.Error("handleNotification returned false, want true")
+	}
+	select {
+	case ev := <-out:
+		if ev.ID != 3 || ev.EventType != "validate_approved" {
+			t.Errorf("event = %+v, want id=3 validate_approved", ev)
+		}
+	default:
+		t.Error("out channel empty; expected one event")
+	}
+}
+
+func TestHandleNotification_nilNotification(t *testing.T) {
+	d, _ := newMockDB(t)
+	out := make(chan *Event, 1)
+	if !d.handleNotification(context.Background(), nil, out) {
+		t.Error("nil notify should not stop the listener")
+	}
+	if len(out) != 0 {
+		t.Error("nil notify must not emit anything")
+	}
+}
+
+func TestHandleNotification_badPayloadSkipped(t *testing.T) {
+	d, _ := newMockDB(t)
+	out := make(chan *Event, 1)
+	if !d.handleNotification(context.Background(),
+		&pq.Notification{Extra: "not-a-number"}, out) {
+		t.Error("bad payload should not stop the listener")
+	}
+	if len(out) != 0 {
+		t.Error("bad payload must not emit anything")
+	}
+}
+
+func TestHandleNotification_fetchErrorSkipped(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, image_id, source, event_type, details, created_at`)).
+		WithArgs(int64(4)).
+		WillReturnError(fmt.Errorf("db offline"))
+
+	out := make(chan *Event, 1)
+	if !d.handleNotification(context.Background(),
+		&pq.Notification{Extra: "4"}, out) {
+		t.Error("fetch error should not stop the listener")
+	}
+	if len(out) != 0 {
+		t.Error("fetch error must not emit anything")
+	}
+}
+
+func TestHandleNotification_ctxCancelledMidSend(t *testing.T) {
+	d, mock := newMockDB(t)
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, image_id, source, event_type, details, created_at`)).
+		WithArgs(int64(5)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "image_id", "source", "event_type", "details", "created_at"}).
+			AddRow(int64(5), nil, "cli", "scan", nil, now))
+
+	// Unbuffered channel + cancelled ctx → send blocks, ctx.Done fires.
+	out := make(chan *Event)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if d.handleNotification(ctx, &pq.Notification{Extra: "5"}, out) {
+		t.Error("cancelled ctx should signal listener to stop (returned true)")
+	}
+}
+
+// ── listenLoop ────────────────────────────────────────────────────────────────
+
+func TestListenLoop_deliversEventsUntilCancel(t *testing.T) {
+	d, mock := newMockDB(t)
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, image_id, source, event_type, details, created_at`)).
+		WithArgs(int64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "image_id", "source", "event_type", "details", "created_at"}).
+			AddRow(int64(1), nil, "cli", "scan", nil, now))
+
+	notify := make(chan *pq.Notification, 1)
+	out := make(chan *Event, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cleanupCalled := make(chan struct{})
+	go d.listenLoop(ctx, notify, out, func() { close(cleanupCalled) })
+
+	notify <- &pq.Notification{Extra: "1"}
+
+	select {
+	case ev := <-out:
+		if ev.ID != 1 || ev.EventType != "scan" {
+			t.Errorf("event = %+v, want id=1 scan", ev)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("no event delivered")
+	}
+
+	cancel()
+
+	select {
+	case _, ok := <-out:
+		if ok {
+			t.Error("out channel should be closed after cancel")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Error("listenLoop did not exit on cancel")
+	}
+
+	select {
+	case <-cleanupCalled:
+	case <-time.After(500 * time.Millisecond):
+		t.Error("cleanup was not called")
+	}
+}
+
+func TestListenLoop_nilCleanupIsAllowed(t *testing.T) {
+	d, _ := newMockDB(t)
+	notify := make(chan *pq.Notification)
+	out := make(chan *Event)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // exit immediately
+
+	done := make(chan struct{})
+	go func() {
+		d.listenLoop(ctx, notify, out, nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Error("listenLoop with nil cleanup did not exit")
 	}
 }
 

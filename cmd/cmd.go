@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -47,11 +48,15 @@ authoritative gateway for OCI Distribution registries.`,
 		}
 		cfg = c
 
-		// Install the global logger before anything may log.
+		// Install the global logger before anything may log.  Only `serve`
+		// streams events to its real sink — CLI commands route the slog
+		// mirror to io.Discard so per-event JSON cannot interleave with
+		// interactive output (the events still land in the events table
+		// via db.LogEvent's INSERT either way).
 		logger.Init(logger.Config{
 			Format: logger.Format(cfg.Log.Format),
 			Level:  cfg.Log.Level,
-		}, os.Stderr)
+		}, loggerSinkFor(cmd.Name()))
 
 		// serve opens its own DB connection, and health doesn't need one at
 		// all — skip the connect for both so a dead DB doesn't block either.
@@ -85,4 +90,16 @@ func Execute() {
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgPath, "config", config.DefaultPath, "path to hermes.yaml")
+}
+
+// loggerSinkFor picks the io.Writer the global slog logger should use for
+// the given cobra command name.  Only `serve` writes to os.Stderr so its
+// long-running gateway can be tailed via journalctl/Loki; everything else
+// (one-shot CLI commands) routes to io.Discard so the per-event slog
+// mirror cannot interleave with interactive output.
+func loggerSinkFor(cmdName string) io.Writer {
+	if cmdName == "serve" {
+		return os.Stderr
+	}
+	return io.Discard
 }

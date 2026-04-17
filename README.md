@@ -250,9 +250,15 @@ redirect mode.
   replaces `msg`, `PRIORITY` replaces `level` as a syslog priority digit
   (`0`-`7`), and `time` is dropped (journald stamps its own).
 
-Every CLI and API event persisted to the `events` table is also mirrored to
-the global logger, so operators can tail audit activity through `journalctl`
-or a Loki query without reading the database.
+`hermes serve` subscribes to a Postgres `LISTEN hermes_events` channel and
+streams every newly persisted event through the global logger, so operators
+can tail gateway audit activity through `journalctl` or a Loki query without
+reading the database.  Both CLI (`approve`, `scan`, etc.) and API events
+flow through the same channel, so the container log stream is unified
+regardless of whether the event originated from a `docker exec hermes ...`
+invocation, a standalone binary on the same host, or a gateway request
+handler inside `serve` itself.  CLI processes do not write their own slog
+output — every event reaches the log stream via `serve`'s listener.
 
 A JSON Schema is provided at [`docs/hermes.schema.json`](docs/hermes.schema.json).
 
@@ -272,7 +278,9 @@ hermes scan [--force] [--platform OS/ARCH] IMAGE
 ```
 
 Queues `IMAGE` if it does not already exist, fetches its manifest, runs a trivy
-scan, saves the report, and prints the JSON to stdout.
+scan, saves the report, and prints the trivy table to stdout. Use
+`hermes report IMAGE --format json` (or any other format) for a machine-readable
+view after the scan completes.
 
 If the image already has a scan report, the existing report is printed unless
 `--force` is given.
@@ -289,7 +297,7 @@ If the image already has a scan report, the existing report is printed unless
 hermes approve [--platform OS/ARCH] [--cache [URL]] IMAGE
 ```
 
-Shows the trivy scan report (scanning first if needed) and prompts:
+Shows the trivy scan report as a table (scanning first if needed) and prompts:
 
 ```
 Approve this image? [YES / NO / REJECT] (default: NO):

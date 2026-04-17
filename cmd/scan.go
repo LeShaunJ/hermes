@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -70,7 +71,7 @@ func runScan(_ *cobra.Command, args []string) error {
 	// If already scanned (or beyond) and not forced, return the existing report.
 	if !scanForce && img.State != db.StateQueued && len(img.ScanReport) > 0 && string(img.ScanReport) != "null" {
 		fmt.Fprintf(os.Stderr, "state: %s (use --force to re-scan)\n", img.State)
-		return printJSON(img.ScanReport)
+		return printScanReport(os.Stdout, img.ScanReport)
 	}
 
 	// Build the digest-pinned ref for trivy so it scans the exact platform image.
@@ -96,7 +97,7 @@ func runScan(_ *cobra.Command, args []string) error {
 	}
 
 	logEvent("scan", img, map[string]interface{}{"digest": img.Digest})
-	return printJSON(img.ScanReport)
+	return printScanReport(os.Stdout, img.ScanReport)
 }
 
 // ── platform selection ────────────────────────────────────────────────────────
@@ -228,6 +229,20 @@ func printJSON(v interface{}) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
+}
+
+// printScanReport renders a stored trivy JSON report as the human-readable
+// trivy table format and writes it to w.  Empty/null reports are a no-op.
+func printScanReport(w io.Writer, report json.RawMessage) error {
+	if len(report) == 0 || string(report) == "null" {
+		return nil
+	}
+	out, err := trivy.Convert(report, "table", cfg.Trivy)
+	if err != nil {
+		return fmt.Errorf("render scan table: %w", err)
+	}
+	_, err = w.Write(out)
+	return err
 }
 
 // logEvent logs a CLI event for img (which may be nil).

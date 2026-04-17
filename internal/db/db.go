@@ -2,10 +2,12 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,16 +103,6 @@ const (
 	SourceAPI EventSource = "api"
 )
 
-// Event records an action taken on an image (or the system in general).
-type Event struct {
-	ID        int64
-	ImageID   *int64
-	Source    EventSource
-	EventType string
-	Details   map[string]interface{}
-	CreatedAt time.Time
-}
-
 // ── Fetcher ───────────────────────────────────────────────────────────────────
 
 // Fetcher is implemented by oci.Client (duck-typed — the oci package does not
@@ -145,8 +137,11 @@ func isImageIndex(mt string) bool {
 // ── DB ────────────────────────────────────────────────────────────────────────
 
 // DB wraps the connection pool and exposes all persistence operations.
+// dsn is retained so Listen can open a dedicated LISTEN connection via
+// pq.NewListener, which requires its own socket outside the query pool.
 type DB struct {
-	db *sql.DB
+	db  *sql.DB
+	dsn string
 }
 
 // Open connects to PostgreSQL, runs schema migrations, and returns a DB.
@@ -157,7 +152,7 @@ func Open(dsn string) (*DB, error) {
 	}
 	sqlDB.SetMaxOpenConns(10)
 
-	d := &DB{db: sqlDB}
+	d := &DB{db: sqlDB, dsn: dsn}
 	if err := d.migrate(); err != nil {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("db: migrate: %w", err)
@@ -1119,11 +1114,21 @@ func (d *DB) AdoptTagByDigest(ref ImageRef, digest string) (bool, error) {
 
 // ── event logging ─────────────────────────────────────────────────────────────
 
-// LogEvent records an event. imageID may be nil for non-image events.
-//
-// In addition to the events-table insert, the same payload is mirrored to
-// slog.Default() so operators can tail audit activity through the global
-// hermes logger (journald, Loki, etc.).
+// Event is one row from the events table, shaped for streaming through slog.
+// Details is the raw JSON string as stored (empty for null).
+type Event struct {
+	ID        int64
+	ImageID   *int64
+	Source    EventSource
+	EventType string
+	Details   string
+	CreatedAt time.Time
+}
+
+// LogEvent records an event and fires a Postgres NOTIFY on the hermes_events
+// channel so a subscriber (hermes serve, via Listen) can stream the new row
+// through slog into the container log.  Persistence errors are returned;
+// notify failures are best-effort because the row is already committed.
 func (d *DB) LogEvent(imageID *int64, source EventSource, eventType string, details map[string]interface{}) error {
 	var detailsJSON interface{}
 	if len(details) > 0 {
@@ -1132,31 +1137,102 @@ func (d *DB) LogEvent(imageID *int64, source EventSource, eventType string, deta
 			detailsJSON = string(b)
 		}
 	}
-	_, err := d.db.Exec(`
+	var id int64
+	if err := d.db.QueryRow(`
 		INSERT INTO events (image_id, source, event_type, details)
-		VALUES ($1, $2, $3, $4)`,
+		VALUES ($1, $2, $3, $4)
+		RETURNING id`,
 		imageID, string(source), eventType, detailsJSON,
-	)
+	).Scan(&id); err != nil {
+		return err
+	}
+	_, _ = d.db.Exec(`SELECT pg_notify('hermes_events', $1)`, strconv.FormatInt(id, 10))
+	return nil
+}
 
-	attrs := []any{
-		slog.String("source", string(source)),
-		slog.String("event_type", eventType),
+// Listen subscribes to the hermes_events Postgres channel and delivers each
+// newly persisted Event on the returned channel.  The goroutine terminates
+// and closes the channel when ctx is cancelled.  Notification payloads are
+// event IDs; the listener re-fetches each row through getEvent so the full
+// payload is not constrained by Postgres's 8 KiB NOTIFY limit.
+func (d *DB) Listen(ctx context.Context) (<-chan *Event, error) {
+	listener := pq.NewListener(d.dsn, 10*time.Second, time.Minute, nil)
+	if err := listener.Listen("hermes_events"); err != nil {
+		_ = listener.Close()
+		return nil, err
 	}
-	if imageID != nil {
-		attrs = append(attrs, slog.Int64("image_id", *imageID))
+
+	out := make(chan *Event, 64)
+	go d.listenLoop(ctx, listener.Notify, out, func() { _ = listener.Close() })
+	return out, nil
+}
+
+// listenLoop is the body of Listen's goroutine, split out so tests can feed
+// a synthetic notify channel and verify delivery / cancellation without
+// standing up a real pq.Listener.  Closes out on exit and runs cleanup (if
+// non-nil) via defer.
+func (d *DB) listenLoop(ctx context.Context, notify <-chan *pq.Notification, out chan<- *Event, cleanup func()) {
+	defer close(out)
+	if cleanup != nil {
+		defer cleanup()
 	}
-	if len(details) > 0 {
-		detailAttrs := make([]any, 0, len(details))
-		for k, v := range details {
-			detailAttrs = append(detailAttrs, slog.Any(k, v))
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case n := <-notify:
+			if !d.handleNotification(ctx, n, out) {
+				return
+			}
 		}
-		attrs = append(attrs, slog.Group("details", detailAttrs...))
 	}
+}
+
+// handleNotification processes one pq notification and sends the resolved
+// Event on out.  Returns false only when ctx is cancelled mid-send, so the
+// Listen goroutine can stop promptly; bad payloads and row-fetch errors are
+// logged and the listener keeps going.  Split out so it is testable without
+// standing up a real Postgres listener.
+func (d *DB) handleNotification(ctx context.Context, n *pq.Notification, out chan<- *Event) bool {
+	if n == nil {
+		return true // pq delivers nil on reconnect; nothing to emit.
+	}
+	id, err := strconv.ParseInt(n.Extra, 10, 64)
 	if err != nil {
-		attrs = append(attrs, slog.String("persist_err", err.Error()))
-		slog.Warn("event", attrs...)
-	} else {
-		slog.Info("event", attrs...)
+		slog.Warn("event notify: bad payload", "extra", n.Extra)
+		return true
 	}
-	return err
+	ev, err := d.getEvent(id)
+	if err != nil {
+		slog.Warn("event notify: fetch row", "id", id, "err", err)
+		return true
+	}
+	select {
+	case out <- ev:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// getEvent fetches a single event row by id.
+func (d *DB) getEvent(id int64) (*Event, error) {
+	var ev Event
+	var imageID sql.NullInt64
+	var source string
+	var details sql.NullString
+	if err := d.db.QueryRow(`
+		SELECT id, image_id, source, event_type, details, created_at
+		FROM events WHERE id = $1`, id,
+	).Scan(&ev.ID, &imageID, &source, &ev.EventType, &details, &ev.CreatedAt); err != nil {
+		return nil, err
+	}
+	if imageID.Valid {
+		ev.ImageID = &imageID.Int64
+	}
+	ev.Source = EventSource(source)
+	if details.Valid {
+		ev.Details = details.String
+	}
+	return &ev, nil
 }
