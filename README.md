@@ -283,7 +283,9 @@ scan, saves the report, and prints the trivy table to stdout. Use
 view after the scan completes.
 
 If the image already has a scan report, the existing report is printed unless
-`--force` is given.
+`--force` is given.  Scans are attached to the manifest digest, not the
+`(registry, repository)` location, so scanning the same digest reused at a
+second repo returns the existing report without re-running trivy.
 
 > ```bash
 > hermes scan registry.example.com/myapp:v1.2.3
@@ -307,6 +309,10 @@ Approve this image? [YES / NO / REJECT] (default: NO):
 - **NO** — no change; exits 0.
 - **REJECT** — sets state to `rejected`; exits non-zero so the operator's shell
   pipeline can treat it as a hard deny.
+
+Approval state is attached to the manifest digest — once a digest is approved,
+every `(registry, repository)` location observing the same digest inherits
+the verdict.  Use `hermes rescind` to undo.
 
 If `--cache` is provided, the image is pushed to `URL` (or `cache_url` from the
 config if no URL is given) upon `YES`. A successful push records the cache
@@ -467,9 +473,10 @@ stub-registered for operator review and `401 UNAUTHORIZED` is returned.
 **Blob paths** (`/v2/<registry>/<repo>/blobs/<digest>`):
 
 Blob downloads are gatekept by the database — they are forwarded **only** when
-`<digest>` appears as the `config` digest or one of the `layers[].digest`
-values of an `approved` image's manifest in the same repository.  Unauthorized
-blobs return `401 UNAUTHORIZED`.  This stops clients from streaming arbitrary
+`<digest>` appears (via [`manifest_blobs`](#manifest_blobs)) as the `config`
+blob or one of the `layer` blobs of a manifest that is observed at the same
+`(registry, repository)` and is currently `approved`.  Unauthorized blobs
+return `401 UNAUTHORIZED`.  This stops clients from streaming arbitrary
 content through the gateway by guessing or replaying digests.
 
 **Other paths** (tag lists, blob uploads, catalog, etc.):
@@ -527,51 +534,132 @@ hermes uses PostgreSQL and creates its tables automatically on first run via
 > Additionally, API requests to `/v2/docker.io/...` will resolve to
 > `/v2/registry-1.docker.io/...` (_the last of any rows with this mask_).
 
-### `tags`
+The schema separates **content** (manifest body, blobs, scan report, approval
+state, cache registry — all keyed on manifest digest) from **location /
+provenance** (which `(registry, repository)` and which `tags` have served a
+given digest).  Because a manifest's digest uniquely identifies its bytes,
+every scan, approval verdict, and cache target is stored once per digest and
+shared by every location that hosts it.
 
-One row per `(registry, repository, name)` triple.  A tag with no rows in
-[`tag_images`](#tag_images) is a "stub" — seen at the gateway but not yet
-populated.  `digest` records the top-level manifest or index digest the tag
-last resolved to and is the lookup key for alternate-tag adoption.
+```mermaid
+erDiagram
+  registries      ||--o{ repositories    : "scopes"
+  repositories    ||--o{ tags            : "holds"
+  repositories    ||--o{ images          : "holds"
+  manifests       ||--o{ tags            : "top-level ref"
+  manifests       ||--o{ images          : "observed at"
+  manifests       ||--o{ manifest_blobs  : "references"
+  blobs           ||--o{ manifest_blobs  : "appears in"
+  tags            ||--o{ tag_images      : "links"
+  images          ||--o{ tag_images      : "links"
+  images          ||--o{ events          : "audited by"
+  registries      ||--o{ manifests       : "cached at (optional)"
+```
+
+### `repositories`
+
+One row per `(registry, path)` pair.  Every tag and image references a
+repository via FK, keeping the repository string in one place.
 
 | Column       | Type          | Description |
 |--------------|---------------|-------------|
 | `id`         | `bigserial`   | Primary key |
-| `registry`   | `bigint`      | FK → `registries.id` |
-| `repository` | `text`        | e.g. `myorg/myapp` |
-| `name`       | `text`        | e.g. `v1.2.3` |
-| `digest`     | `text`        | Top-level (manifest or index) digest; NULL for stubs until first populated |
+| `registry`   | `bigint`      | FK → `registries.id` (`ON DELETE CASCADE`) |
+| `path`       | `text`        | e.g. `myorg/myapp` |
 | `created_at` | `timestamptz` | |
 | `updated_at` | `timestamptz` | |
 
-### `images`
+### `tags`
 
-One row per tracked OCI platform image, identified by `(registry, repository,
-digest)` independently of any tag.  Multiple tags may reference the same image
-via [`tag_images`](#tag_images), so an alternate tag (e.g. moving `latest` to
-an already-approved digest) does not duplicate manifests, scan reports, or
-approval state.
+One row per `(repository, name)`.  A tag with no rows in
+[`tag_images`](#tag_images) is a "stub" — seen at the gateway but not yet
+populated.  `manifest` is the top-level (image manifest or index) reference
+the tag last resolved to and is the lookup key for alternate-tag adoption.
+
+| Column       | Type          | Description |
+|--------------|---------------|-------------|
+| `id`         | `bigserial`   | Primary key |
+| `repository` | `bigint`      | FK → `repositories.id` (`ON DELETE CASCADE`) |
+| `name`       | `text`        | e.g. `v1.2.3` |
+| `manifest`   | `bigint`      | FK → [`manifests.id`](#manifests); NULL for stubs |
+| `created_at` | `timestamptz` | |
+| `updated_at` | `timestamptz` | |
+
+### `manifests`
+
+Content-addressed store: one row per manifest digest, globally.  Because the
+manifest bytes determine the digest, every derived property lives here —
+raw body, platform hints, scan report, approval state, and optional cache
+registry.  Two `(registry, repository)` locations observing the same digest
+share a single manifest row and therefore a single verdict.
 
 | Column           | Type          | Description |
 |------------------|---------------|-------------|
 | `id`             | `bigserial`   | Primary key |
-| `registry`       | `bigint`      | FK → `registries.id` |
-| `repository`     | `text`        | e.g. `myorg/myapp` |
+| `digest`         | `text`        | `sha256:…`, unique |
+| `media_type`     | `text`        | OCI/Docker manifest media type |
+| `body`           | `jsonb`       | Raw manifest bytes (forwarded verbatim by the gateway) |
+| `arch`           | `text`        | e.g. `amd64`, `arm64`; NULL for index manifests |
+| `os`             | `text`        | e.g. `linux`, `windows`; NULL for index manifests |
+| `scan_report`    | `jsonb`       | Raw trivy JSON report; NULL until first scan |
+| `scanned_at`     | `timestamptz` | Last scan timestamp |
 | `cache_registry` | `bigint`      | FK → `registries.id`; set after a successful cache push |
-| `digest`         | `text`        | Platform-specific manifest digest |
-| `arch`           | `text`        | e.g. `amd64`, `arm64` |
-| `os`             | `text`        | e.g. `linux`, `windows` |
-| `manifest`       | `jsonb`       | Raw platform manifest (also the source of truth for blob gatekeeping via the GIN index on `manifest`) |
-| `scan_report`    | `jsonb`       | Raw trivy JSON report |
 | `state`          | `state`       | Current state (see [Image states](#image-states)) |
 | `created_at`     | `timestamptz` | |
 | `updated_at`     | `timestamptz` | |
 
+### `blobs`
+
+Content-addressed catalog of every config/layer digest referenced by any
+manifest.  Populated during manifest ingestion and used by the gateway's blob
+authorization check.
+
+| Column       | Type          | Description |
+|--------------|---------------|-------------|
+| `id`         | `bigserial`   | Primary key |
+| `digest`     | `text`        | `sha256:…`, unique |
+| `size`       | `bigint`      | From the manifest descriptor; nullable |
+| `media_type` | `text`        | From the manifest descriptor; nullable |
+| `created_at` | `timestamptz` | |
+
+### `manifest_blobs`
+
+Many-to-many link from [`manifests`](#manifests) to the config and layer
+[`blobs`](#blobs) they reference.  Replaces JSONB containment for blob
+gatekeeping — `BlobAuthorized` is now a plain B-tree indexed JOIN on
+`manifest_blobs(blob)`.
+
+| Column     | Type     | Description |
+|------------|----------|-------------|
+| `manifest` | `bigint` | FK → `manifests.id` (`ON DELETE CASCADE`) |
+| `blob`     | `bigint` | FK → `blobs.id` (`ON DELETE CASCADE`) |
+| `role`     | `text`   | `config` or `layer` |
+| `ordinal`  | `int`    | Layer order; NULL for config |
+
+Primary key: `(manifest, blob, role)`.
+
+### `images`
+
+Pure provenance row: "this manifest was observed at this repository".  State,
+scan, and cache live on [`manifests`](#manifests); an `images` row simply
+records the `(repository → manifest)` observation and is what
+`events.image_id` audits against.
+
+| Column       | Type          | Description |
+|--------------|---------------|-------------|
+| `id`         | `bigserial`   | Primary key |
+| `repository` | `bigint`      | FK → `repositories.id` (`ON DELETE CASCADE`) |
+| `manifest`   | `bigint`      | FK → `manifests.id` |
+| `created_at` | `timestamptz` | |
+| `updated_at` | `timestamptz` | |
+
+Unique on `(repository, manifest)`.
+
 ### `tag_images`
 
 Many-to-many link between [`tags`](#tags) and [`images`](#images).  A row in
-this table means "this tag currently resolves to (and shares the approval
-state of) this image".  Both foreign keys cascade on delete.
+this table means "this tag currently resolves to this `(repository, manifest)`
+observation".  Both foreign keys cascade on delete.
 
 | Column       | Type          | Description |
 |--------------|---------------|-------------|

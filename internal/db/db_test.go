@@ -77,15 +77,101 @@ func TestUpsertRegistry_error(t *testing.T) {
 	}
 }
 
+// ── upsertRepository ──────────────────────────────────────────────────────────
+
+func TestUpsertRepository(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO repositories`)).
+		WithArgs(int64(1), "myrepo").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11)))
+
+	id, err := d.upsertRepository(1, "myrepo")
+	if err != nil {
+		t.Fatalf("upsertRepository: %v", err)
+	}
+	if id != 11 {
+		t.Errorf("id = %d, want 11", id)
+	}
+}
+
+// ── upsertManifest ────────────────────────────────────────────────────────────
+
+func TestUpsertManifest(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO manifests`)).
+		WithArgs("sha256:abc", mediaTypeOCIManifest, sqlmock.AnyArg(), "amd64", "linux").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(33)))
+
+	id, err := d.upsertManifest("sha256:abc", mediaTypeOCIManifest, []byte(`{}`), "amd64", "linux")
+	if err != nil {
+		t.Fatalf("upsertManifest: %v", err)
+	}
+	if id != 33 {
+		t.Errorf("id = %d, want 33", id)
+	}
+}
+
+// ── upsertBlob ────────────────────────────────────────────────────────────────
+
+func TestUpsertBlob_withSize(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO blobs`)).
+		WithArgs("sha256:layer", int64(4096), "application/vnd.oci.image.layer.v1.tar+gzip").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(77)))
+
+	id, err := d.upsertBlob("sha256:layer", 4096, "application/vnd.oci.image.layer.v1.tar+gzip")
+	if err != nil {
+		t.Fatalf("upsertBlob: %v", err)
+	}
+	if id != 77 {
+		t.Errorf("id = %d, want 77", id)
+	}
+}
+
+func TestUpsertBlob_zeroSizeBecomesNil(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO blobs`)).
+		WithArgs("sha256:cfg", nil, "").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(4)))
+
+	if _, err := d.upsertBlob("sha256:cfg", 0, ""); err != nil {
+		t.Fatalf("upsertBlob zero size: %v", err)
+	}
+}
+
+// ── linkManifestBlob ──────────────────────────────────────────────────────────
+
+func TestLinkManifestBlob_config(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO manifest_blobs`)).
+		WithArgs(int64(1), int64(2), "config", nil).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := d.linkManifestBlob(1, 2, roleConfig, 0); err != nil {
+		t.Fatalf("linkManifestBlob config: %v", err)
+	}
+}
+
+func TestLinkManifestBlob_layer(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO manifest_blobs`)).
+		WithArgs(int64(1), int64(3), "layer", 2).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := d.linkManifestBlob(1, 3, roleLayer, 2); err != nil {
+		t.Fatalf("linkManifestBlob layer: %v", err)
+	}
+}
+
 // ── getTagID ──────────────────────────────────────────────────────────────────
 
 func TestGetTagID_found(t *testing.T) {
 	d, mock := newMockDB(t)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
-		WithArgs(int64(1), "myrepo", "v1.0").
+		WithArgs(int64(11), "v1.0").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(42)))
 
-	id, err := d.getTagID(1, "myrepo", "v1.0")
+	id, err := d.getTagID(11, "v1.0")
 	if err != nil {
 		t.Fatalf("getTagID: %v", err)
 	}
@@ -97,10 +183,10 @@ func TestGetTagID_found(t *testing.T) {
 func TestGetTagID_notFound(t *testing.T) {
 	d, mock := newMockDB(t)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
-		WithArgs(int64(1), "myrepo", "v1.0").
+		WithArgs(int64(11), "v1.0").
 		WillReturnRows(sqlmock.NewRows([]string{"id"})) // empty → ErrNoRows
 
-	id, err := d.getTagID(1, "myrepo", "v1.0")
+	id, err := d.getTagID(11, "v1.0")
 	if err != nil {
 		t.Fatalf("getTagID not found: %v", err)
 	}
@@ -111,13 +197,13 @@ func TestGetTagID_notFound(t *testing.T) {
 
 // ── insertTag ─────────────────────────────────────────────────────────────────
 
-func TestInsertTag_withDigest(t *testing.T) {
+func TestInsertTag_withManifest(t *testing.T) {
 	d, mock := newMockDB(t)
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO tags`)).
-		WithArgs(int64(1), "myrepo", "v1.0", "sha256:abc").
+		WithArgs(int64(11), "v1.0", int64(33)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(7)))
 
-	id, err := d.insertTag(1, "myrepo", "v1.0", "sha256:abc")
+	id, err := d.insertTag(11, "v1.0", 33)
 	if err != nil {
 		t.Fatalf("insertTag: %v", err)
 	}
@@ -126,47 +212,45 @@ func TestInsertTag_withDigest(t *testing.T) {
 	}
 }
 
-func TestInsertTag_emptyDigest(t *testing.T) {
+func TestInsertTag_stub(t *testing.T) {
 	d, mock := newMockDB(t)
-	// When digest is empty, nil is passed as the value.
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO tags`)).
-		WithArgs(int64(1), "myrepo", "v1.0", nil).
+		WithArgs(int64(11), "v1.0", nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(3)))
 
-	id, err := d.insertTag(1, "myrepo", "v1.0", "")
+	id, err := d.insertTag(11, "v1.0", 0)
 	if err != nil {
-		t.Fatalf("insertTag empty digest: %v", err)
+		t.Fatalf("insertTag stub: %v", err)
 	}
 	if id != 3 {
 		t.Errorf("id = %d, want 3", id)
 	}
 }
 
-// ── insertImage ───────────────────────────────────────────────────────────────
+// ── insertImagePolicy ─────────────────────────────────────────────────────────
 
-func TestInsertImage(t *testing.T) {
+func TestInsertImagePolicy(t *testing.T) {
 	d, mock := newMockDB(t)
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO images`)).
-		WithArgs(int64(1), "myrepo", "sha256:abc", "amd64", "linux", sqlmock.AnyArg()).
+		WithArgs(int64(11), int64(33)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(42)))
 
-	id, err := d.insertImage(1, "myrepo", "sha256:abc", "amd64", "linux", []byte(`{}`))
+	id, err := d.insertImagePolicy(11, 33)
 	if err != nil {
-		t.Fatalf("insertImage: %v", err)
+		t.Fatalf("insertImagePolicy: %v", err)
 	}
 	if id != 42 {
 		t.Errorf("id = %d, want 42", id)
 	}
 }
 
-func TestInsertImage_error(t *testing.T) {
+func TestInsertImagePolicy_error(t *testing.T) {
 	d, mock := newMockDB(t)
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO images`)).
-		WithArgs(int64(1), "myrepo", "sha256:abc", "amd64", "linux", sqlmock.AnyArg()).
+		WithArgs(int64(11), int64(33)).
 		WillReturnError(fmt.Errorf("unique violation"))
 
-	_, err := d.insertImage(1, "myrepo", "sha256:abc", "amd64", "linux", []byte(`{}`))
-	if err == nil {
+	if _, err := d.insertImagePolicy(11, 33); err == nil {
 		t.Error("expected error, got nil")
 	}
 }
@@ -199,7 +283,7 @@ func TestLinkTagImage_error(t *testing.T) {
 
 func TestSetImageState(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET state`)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE manifests SET state`)).
 		WithArgs("approved", int64(5)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -210,7 +294,7 @@ func TestSetImageState(t *testing.T) {
 
 func TestRescind(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET state`)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE manifests SET state`)).
 		WithArgs("rescinded", int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	if err := d.Rescind(1); err != nil {
@@ -220,7 +304,7 @@ func TestRescind(t *testing.T) {
 
 func TestReject(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET state`)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE manifests SET state`)).
 		WithArgs("rejected", int64(2)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	if err := d.Reject(2); err != nil {
@@ -230,7 +314,7 @@ func TestReject(t *testing.T) {
 
 func TestSetError(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET state`)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE manifests SET state`)).
 		WithArgs("errored", int64(3)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	if err := d.SetError(3); err != nil {
@@ -240,7 +324,7 @@ func TestSetError(t *testing.T) {
 
 func TestVoid(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET state`)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE manifests SET state`)).
 		WithArgs("voided", int64(4)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	if err := d.Void(4); err != nil {
@@ -250,9 +334,8 @@ func TestVoid(t *testing.T) {
 
 func TestVoidByBlob_voidsUncachedOwners(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE images`)).
-		WithArgs("registry.example.com", "myrepo",
-			sqlmock.AnyArg(), sqlmock.AnyArg()).
+	mock.ExpectQuery(regexp.QuoteMeta(`WITH affected AS`)).
+		WithArgs("registry.example.com", "myrepo", "sha256:abc").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).
 			AddRow(int64(7)).AddRow(int64(8)))
 
@@ -267,7 +350,7 @@ func TestVoidByBlob_voidsUncachedOwners(t *testing.T) {
 
 func TestVoidByBlob_noMatches(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE images`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`WITH affected AS`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 
 	ids, err := d.VoidByBlob("registry.example.com", "myrepo", "sha256:abc")
@@ -283,7 +366,7 @@ func TestVoidByBlob_noMatches(t *testing.T) {
 
 func TestApprove_noCacheRegistry(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET`)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE manifests SET`)).
 		WithArgs(nil, int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -298,8 +381,8 @@ func TestApprove_withCacheRegistry(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
 		WithArgs("cache.example.com").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(2)))
-	// UPDATE images.
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET`)).
+	// UPDATE manifests.
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE manifests SET`)).
 		WithArgs(int64(2), int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -782,7 +865,7 @@ func TestGetRejected_notFound(t *testing.T) {
 
 func TestSaveScan(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET`)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE manifests SET`)).
 		WithArgs(sqlmock.AnyArg(), int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// GetByID called internally.
@@ -801,7 +884,7 @@ func TestSaveScan(t *testing.T) {
 
 func TestSaveScan_error(t *testing.T) {
 	d, mock := newMockDB(t)
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE images SET`)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE manifests SET`)).
 		WithArgs(sqlmock.AnyArg(), int64(1)).
 		WillReturnError(fmt.Errorf("db error"))
 
@@ -909,13 +992,17 @@ func TestQueueStub_newTag(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
 		WithArgs("registry.example.com").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
+	// upsertRepository
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO repositories`)).
+		WithArgs(int64(1), "myrepo").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11)))
 	// getTagID → not found
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
-		WithArgs(int64(1), "myrepo", "v1.0").
+		WithArgs(int64(11), "v1.0").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
-	// insertTag (stub, empty digest) — no placeholder image inserted
+	// insertTag (stub, no manifest)
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO tags`)).
-		WithArgs(int64(1), "myrepo", "v1.0", nil).
+		WithArgs(int64(11), "v1.0", nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(10)))
 
 	ref := ImageRef{Registry: "registry.example.com", Repository: "myrepo", Tag: "v1.0"}
@@ -934,9 +1021,13 @@ func TestQueueStub_existingTag(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
 		WithArgs("registry.example.com").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
+	// upsertRepository
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO repositories`)).
+		WithArgs(int64(1), "myrepo").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11)))
 	// getTagID → found; nothing else to do.
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
-		WithArgs(int64(1), "myrepo", "v1.0").
+		WithArgs(int64(11), "v1.0").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(10)))
 
 	ref := ImageRef{Registry: "registry.example.com", Repository: "myrepo", Tag: "v1.0"}
@@ -968,36 +1059,64 @@ func (m *mockFetcher) FetchConfig(_, _, _ string) (string, string, error) {
 	return m.configArch, m.configOS, m.configErr
 }
 
+// expectCommonQueuePrefix expects the registry+repository upserts and the
+// getTagID lookup (returning no row).
+func expectCommonQueuePrefix(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
+		WithArgs("registry.example.com").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO repositories`)).
+		WithArgs(int64(1), "myrepo").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11)))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+}
+
 func TestQueue_singleImage(t *testing.T) {
 	d, mock := newMockDB(t)
 
 	fetcher := &mockFetcher{
 		manifestDigest:    "sha256:toplevel",
 		manifestMediaType: mediaTypeOCIManifest,
-		manifest:          []byte(`{"config":{"digest":"sha256:cfgdigest"}}`),
+		manifest:          []byte(`{"config":{"digest":"sha256:cfgdigest"},"layers":[{"digest":"sha256:layer1","size":1024,"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip"}]}`),
 		configArch:        "amd64",
 		configOS:          "linux",
 	}
 
-	// upsertRegistry
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
-		WithArgs("registry.example.com").
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
-	// getTagID → not found
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
-		WithArgs(int64(1), "myrepo", "v1.0").
-		WillReturnRows(sqlmock.NewRows([]string{"id"}))
-	// findImageIDsByTagDigest → no existing rows
+	expectCommonQueuePrefix(mock)
+	// findImageIDsByTagDigest → empty
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT ti.image`)).
-		WithArgs(int64(1), "myrepo", "sha256:toplevel").
+		WithArgs(int64(11), "sha256:toplevel").
 		WillReturnRows(sqlmock.NewRows([]string{"image"}))
+	// upsertManifest (initial, without arch/os)
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO manifests`)).
+		WithArgs("sha256:toplevel", mediaTypeOCIManifest, sqlmock.AnyArg(), "", "").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(30)))
 	// insertTag
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO tags`)).
-		WithArgs(int64(1), "myrepo", "v1.0", "sha256:toplevel").
+		WithArgs(int64(11), "v1.0", int64(30)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(5)))
-	// insertImage → returns id
+	// queueSingleImage: re-upsert manifest with arch/os from config
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO manifests`)).
+		WithArgs("sha256:toplevel", mediaTypeOCIManifest, sqlmock.AnyArg(), "amd64", "linux").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(30)))
+	// storeManifestBlobs: upsert config blob + link
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO blobs`)).
+		WithArgs("sha256:cfgdigest", nil, "").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(40)))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO manifest_blobs`)).
+		WithArgs(int64(30), int64(40), "config", nil).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// storeManifestBlobs: upsert layer blob + link
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO blobs`)).
+		WithArgs("sha256:layer1", int64(1024), "application/vnd.oci.image.layer.v1.tar+gzip").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(41)))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO manifest_blobs`)).
+		WithArgs(int64(30), int64(41), "layer", 0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// insertImagePolicy → provenance row
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO images`)).
-		WithArgs(int64(1), "myrepo", "sha256:toplevel", "amd64", "linux", sqlmock.AnyArg()).
+		WithArgs(int64(11), int64(30)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(99)))
 	// linkTagImage
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO tag_images`)).
@@ -1016,46 +1135,54 @@ func TestQueue_singleImage(t *testing.T) {
 	if len(imgs) != 1 {
 		t.Fatalf("len = %d, want 1", len(imgs))
 	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
 }
 
 func TestQueue_imageIndex(t *testing.T) {
 	d, mock := newMockDB(t)
 
+	// Index references two per-platform manifests; their per-platform
+	// manifests are fetched by digest via the same mockFetcher.
 	indexManifest := `{"manifests":[
 		{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:plat1","platform":{"os":"linux","architecture":"amd64"}},
 		{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:plat2","platform":{"os":"linux","architecture":"arm64"}}
 	]}`
 
+	// A single mockFetcher returns the same body for every FetchManifest call
+	// — good enough since queueIndexImages uses the returned digest anyway.
+	// Body has no layers to keep the expectation list compact.
 	fetcher := &mockFetcher{
 		manifestDigest:    "sha256:indexdigest",
 		manifestMediaType: mediaTypeOCIIndex,
 		manifest:          []byte(indexManifest),
-		configArch:        "amd64",
-		configOS:          "linux",
 	}
 
-	// upsertRegistry
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
-		WithArgs("registry.example.com").
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
-	// getTagID → not found
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	expectCommonQueuePrefix(mock)
 	// findImageIDsByTagDigest → empty
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT ti.image`)).
 		WillReturnRows(sqlmock.NewRows([]string{"image"}))
+	// upsertManifest for the top-level index
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO manifests`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1000)))
 	// insertTag
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO tags`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(2)))
-	// For each platform: insertImage + linkTagImage (2 platforms).
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO images`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11)))
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO tag_images`)).
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO images`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(12)))
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO tag_images`)).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	// queueIndexImages: loops over the two entries.  Each entry refetches
+	// via the mockFetcher (same body/digest), so the same ingestion pattern
+	// runs twice.  Since the mock fetcher always returns "sha256:indexdigest",
+	// both platforms resolve to the same manifest digest; second upsert is a
+	// no-op on the manifest but still appears in the expectation list.
+	for i := 0; i < 2; i++ {
+		mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO manifests`)).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1001 + i)))
+		// no config digest in the body → no config blob link, no layers
+		mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO images`)).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11 + i)))
+		mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO tag_images`)).
+			WillReturnResult(sqlmock.NewResult(1, 1))
+	}
 	// imagesByTagID
 	mock.ExpectQuery(`SELECT`).
 		WillReturnRows(testImageRow(11, "queued"))
@@ -1077,9 +1204,13 @@ func TestQueue_existingRealImages(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
 		WithArgs("registry.example.com").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
+	// upsertRepository
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO repositories`)).
+		WithArgs(int64(1), "myrepo").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11)))
 	// getTagID → found
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
-		WithArgs(int64(1), "myrepo", "v1.0").
+		WithArgs(int64(11), "v1.0").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(5)))
 	// imagesByTagID → already populated
 	mock.ExpectQuery(`SELECT`).
@@ -1105,23 +1236,20 @@ func TestQueue_altTagAdoption(t *testing.T) {
 		manifest:          []byte(`{"manifests":[]}`),
 	}
 
-	// upsertRegistry
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
-		WithArgs("registry.example.com").
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
-	// getTagID → not found
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
-		WithArgs(int64(1), "myrepo", "v2.0").
-		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	expectCommonQueuePrefix(mock)
 	// findImageIDsByTagDigest → existing image rows linked to a sibling tag
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT ti.image`)).
-		WithArgs(int64(1), "myrepo", "sha256:shared").
+		WithArgs(int64(11), "sha256:shared").
 		WillReturnRows(sqlmock.NewRows([]string{"image"}).
 			AddRow(int64(101)).
 			AddRow(int64(102)))
+	// upsertManifest for the top-level digest
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO manifests`)).
+		WithArgs("sha256:shared", mediaTypeOCIIndex, sqlmock.AnyArg(), "", "").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(55)))
 	// insertTag for the new alt tag
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO tags`)).
-		WithArgs(int64(1), "myrepo", "v2.0", "sha256:shared").
+		WithArgs(int64(11), "v2.0", int64(55)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(7)))
 	// linkTagImage twice (one per adopted image)
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO tag_images`)).
@@ -1152,12 +1280,7 @@ func TestQueue_fetchManifestError(t *testing.T) {
 	d, mock := newMockDB(t)
 	fetcher := &mockFetcher{manifestErr: fmt.Errorf("network error")}
 
-	// upsertRegistry
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
-	// getTagID → not found
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	expectCommonQueuePrefix(mock)
 
 	ref := ImageRef{Registry: "registry.example.com", Repository: "myrepo", Tag: "v1.0"}
 	_, err := d.Queue(ref, fetcher)
@@ -1174,14 +1297,14 @@ func TestQueue_unknownMediaType(t *testing.T) {
 		manifest:          []byte(`{}`),
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	expectCommonQueuePrefix(mock)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT ti.image`)).
 		WillReturnRows(sqlmock.NewRows([]string{"image"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO manifests`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(80)))
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO tags`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(3)))
+	// Unknown media-type path: just insertImagePolicy + linkTagImage.
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO images`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(50)))
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO tag_images`)).
@@ -1356,8 +1479,7 @@ func TestBlobAuthorized_originForward(t *testing.T) {
 	d, mock := newMockDB(t)
 	// Authorized without a cache_registry → empty string, forward to origin.
 	mock.ExpectQuery(`SELECT COALESCE\(cr\.url, ''\)`).
-		WithArgs("registry.example.com", "myrepo",
-			sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs("registry.example.com", "myrepo", "sha256:abc").
 		WillReturnRows(sqlmock.NewRows([]string{"cache_url"}).AddRow(""))
 
 	ok, cache, err := d.BlobAuthorized("registry.example.com", "myrepo", "sha256:abc")
@@ -1375,8 +1497,7 @@ func TestBlobAuthorized_originForward(t *testing.T) {
 func TestBlobAuthorized_cacheForward(t *testing.T) {
 	d, mock := newMockDB(t)
 	mock.ExpectQuery(`SELECT COALESCE\(cr\.url, ''\)`).
-		WithArgs("registry.example.com", "myrepo",
-			sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs("registry.example.com", "myrepo", "sha256:abc").
 		WillReturnRows(sqlmock.NewRows([]string{"cache_url"}).
 			AddRow("cache.internal.example.com"))
 
@@ -1423,21 +1544,38 @@ func TestBlobAuthorized_dbError(t *testing.T) {
 
 // ── AdoptTagByDigest ──────────────────────────────────────────────────────────
 
-func TestAdoptTagByDigest_approved(t *testing.T) {
-	d, mock := newMockDB(t)
-
-	// upsertRegistry
+// expectAdoptPrefix expects upsertRegistry, upsertRepository, and the
+// manifest digest lookup returning the given manifestID (0 = not found).
+func expectAdoptPrefix(mock sqlmock.Sqlmock, digest string, manifestID int64) {
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
 		WithArgs("registry.example.com").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
-	// digest lookup → finds an approved image
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT ti.image, i.state::text`)).
-		WithArgs(int64(1), "myrepo", "sha256:shared").
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO repositories`)).
+		WithArgs(int64(1), "myrepo").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11)))
+	if manifestID == 0 {
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM manifests`)).
+			WithArgs(digest).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	} else {
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM manifests`)).
+			WithArgs(digest).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(manifestID))
+	}
+}
+
+func TestAdoptTagByDigest_approved(t *testing.T) {
+	d, mock := newMockDB(t)
+
+	expectAdoptPrefix(mock, "sha256:shared", 55)
+	// Per-image state lookup → finds an approved image
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT ti.image, m.state::text`)).
+		WithArgs(int64(11), "sha256:shared").
 		WillReturnRows(sqlmock.NewRows([]string{"image", "state"}).
 			AddRow(int64(101), "approved"))
 	// insertTag for the new alt tag
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO tags`)).
-		WithArgs(int64(1), "myrepo", "v2.0", "sha256:shared").
+		WithArgs(int64(11), "v2.0", int64(55)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(7)))
 	// linkTagImage
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO tag_images`)).
@@ -1457,10 +1595,9 @@ func TestAdoptTagByDigest_approved(t *testing.T) {
 func TestAdoptTagByDigest_unapproved(t *testing.T) {
 	d, mock := newMockDB(t)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
+	expectAdoptPrefix(mock, "sha256:other", 56)
 	// Found but state is queued — should still link but return adopted=false.
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT ti.image, i.state::text`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT ti.image, m.state::text`)).
 		WillReturnRows(sqlmock.NewRows([]string{"image", "state"}).
 			AddRow(int64(202), "queued"))
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO tags`)).
@@ -1481,9 +1618,8 @@ func TestAdoptTagByDigest_unapproved(t *testing.T) {
 func TestAdoptTagByDigest_noMatch(t *testing.T) {
 	d, mock := newMockDB(t)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT ti.image, i.state::text`)).
+	expectAdoptPrefix(mock, "sha256:none", 0)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT ti.image, m.state::text`)).
 		WillReturnRows(sqlmock.NewRows([]string{"image", "state"}))
 
 	ref := ImageRef{Registry: "registry.example.com", Repository: "myrepo", Tag: "v1.0"}
@@ -1493,5 +1629,45 @@ func TestAdoptTagByDigest_noMatch(t *testing.T) {
 	}
 	if adopted {
 		t.Error("expected adopted=false")
+	}
+}
+
+// ── extractLayerDigests ───────────────────────────────────────────────────────
+
+func TestExtractLayerDigests(t *testing.T) {
+	manifest := []byte(`{
+		"layers":[
+			{"digest":"sha256:a","size":100,"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip"},
+			{"digest":"sha256:b","size":200}
+		]
+	}`)
+	got, err := extractLayerDigests(manifest)
+	if err != nil {
+		t.Fatalf("extractLayerDigests: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2", len(got))
+	}
+	if got[0].Digest != "sha256:a" || got[0].Size != 100 {
+		t.Errorf("got[0] = %+v, want digest sha256:a size 100", got[0])
+	}
+	if got[1].Digest != "sha256:b" || got[1].MediaType != "" {
+		t.Errorf("got[1] = %+v, want digest sha256:b empty mediaType", got[1])
+	}
+}
+
+func TestExtractLayerDigests_noLayers(t *testing.T) {
+	got, err := extractLayerDigests([]byte(`{}`))
+	if err != nil {
+		t.Fatalf("extractLayerDigests empty: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d layers, want 0", len(got))
+	}
+}
+
+func TestExtractLayerDigests_invalidJSON(t *testing.T) {
+	if _, err := extractLayerDigests([]byte("{invalid")); err == nil {
+		t.Error("expected error for invalid JSON, got nil")
 	}
 }

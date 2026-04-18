@@ -126,6 +126,19 @@ const (
 	mediaTypeDockerList  = "application/vnd.docker.distribution.manifest.list.v2+json"
 )
 
+// manifest_blobs.role values.
+const (
+	roleConfig = "config"
+	roleLayer  = "layer"
+)
+
+// blobDescriptor is a lightweight view of a manifest config/layer descriptor.
+type blobDescriptor struct {
+	Digest    string
+	Size      int64
+	MediaType string
+}
+
 func isImageManifest(mt string) bool {
 	return mt == mediaTypeOCIManifest || mt == mediaTypeDockerV2
 }
@@ -201,35 +214,83 @@ func (d *DB) migrate() error {
 		EXCEPTION WHEN duplicate_object THEN NULL;
 		END $$`,
 
-		// tags — one row per (registry, repository, name) triple.
-		// digest holds the top-level (manifest or index) digest the tag resolved to.
-		`CREATE TABLE IF NOT EXISTS tags (
+		// repositories — normalized repository path scoped to a registry.
+		`CREATE TABLE IF NOT EXISTS repositories (
 			id         BIGSERIAL PRIMARY KEY,
 			registry   BIGINT NOT NULL REFERENCES registries(id) ON DELETE CASCADE,
-			repository TEXT NOT NULL,
-			name       TEXT NOT NULL,
-			digest     TEXT,
+			path       TEXT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			UNIQUE (registry, repository, name)
+			UNIQUE (registry, path)
 		)`,
 
-		// images — one row per platform image, identified independently of any
-		// tag.  Multiple tags may reference the same image via tag_images.
+		// manifests — content-addressed store.  Carries the raw body for
+		// verbatim forwarding, platform hints, scan report, approval state,
+		// and optional cache registry.  All of these are determined by the
+		// manifest content, so the same digest observed at multiple
+		// (registry, repository) locations shares one row.
+		`CREATE TABLE IF NOT EXISTS manifests (
+			id             BIGSERIAL PRIMARY KEY,
+			digest         TEXT NOT NULL UNIQUE,
+			media_type     TEXT NOT NULL,
+			body           JSONB NOT NULL,
+			arch           TEXT,
+			os             TEXT,
+			scan_report    JSONB,
+			scanned_at     TIMESTAMPTZ,
+			cache_registry BIGINT REFERENCES registries(id) ON DELETE SET NULL,
+			state          state NOT NULL DEFAULT 'queued',
+			created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+
+		// blobs — content-addressed catalog of every config/layer digest
+		// referenced by any manifest.  Gatekeeps blob forwarding at the
+		// gateway without requiring JSONB containment.
+		`CREATE TABLE IF NOT EXISTS blobs (
+			id         BIGSERIAL PRIMARY KEY,
+			digest     TEXT NOT NULL UNIQUE,
+			size       BIGINT,
+			media_type TEXT,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+
+		// manifest_blobs — M2M link from manifests to their config/layer blobs.
+		// `role` distinguishes the config blob from the layer blobs; `ordinal`
+		// preserves layer order (NULL for config).
+		`CREATE TABLE IF NOT EXISTS manifest_blobs (
+			manifest BIGINT NOT NULL REFERENCES manifests(id) ON DELETE CASCADE,
+			blob     BIGINT NOT NULL REFERENCES blobs(id)     ON DELETE CASCADE,
+			role     TEXT   NOT NULL CHECK (role IN ('config','layer')),
+			ordinal  INT,
+			PRIMARY KEY (manifest, blob, role)
+		)`,
+
+		// tags — one row per (repository, name).  `manifest` is the top-level
+		// (image manifest or index) reference the tag last resolved to.  NULL
+		// means the tag is a "stub" that has been seen at the gateway but not
+		// yet populated.
+		`CREATE TABLE IF NOT EXISTS tags (
+			id         BIGSERIAL PRIMARY KEY,
+			repository BIGINT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+			name       TEXT   NOT NULL,
+			manifest   BIGINT REFERENCES manifests(id),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (repository, name)
+		)`,
+
+		// images — pure provenance row: "this manifest was observed at this
+		// repository".  State/scan/cache live on the manifest; an images row
+		// simply records the (repository → manifest) observation, and is what
+		// events.image_id audits against.
 		`CREATE TABLE IF NOT EXISTS images (
-			id              BIGSERIAL PRIMARY KEY,
-			registry        BIGINT NOT NULL REFERENCES registries(id) ON DELETE CASCADE,
-			repository      TEXT NOT NULL,
-			cache_registry  BIGINT REFERENCES registries(id) ON DELETE SET NULL,
-			digest          TEXT NOT NULL,
-			arch            TEXT,
-			os              TEXT,
-			manifest        jsonb,
-			scan_report     jsonb,
-			state           state NOT NULL DEFAULT 'queued',
-			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			UNIQUE (registry, repository, digest)
+			id         BIGSERIAL PRIMARY KEY,
+			repository BIGINT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+			manifest   BIGINT NOT NULL REFERENCES manifests(id),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (repository, manifest)
 		)`,
 
 		// tag_images — many-to-many link between tags and images.
@@ -252,44 +313,48 @@ func (d *DB) migrate() error {
 		)`,
 
 		// indexes
-		`CREATE INDEX IF NOT EXISTS idx_tags_registry       ON tags(registry)`,
-		`CREATE INDEX IF NOT EXISTS idx_tags_digest         ON tags(registry, repository, digest)`,
-		`CREATE INDEX IF NOT EXISTS idx_images_state        ON images(state)`,
-		`CREATE INDEX IF NOT EXISTS idx_images_lookup       ON images(registry, repository, digest)`,
-		`CREATE INDEX IF NOT EXISTS idx_images_manifest_gin ON images USING gin(manifest)`,
-		`CREATE INDEX IF NOT EXISTS idx_images_scanrpt_gin  ON images USING gin(scan_report)`,
-		`CREATE INDEX IF NOT EXISTS idx_tag_images_image    ON tag_images(image)`,
-		`CREATE INDEX IF NOT EXISTS idx_events_image_id     ON events(image_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_repositories_registry ON repositories(registry)`,
+		`CREATE INDEX IF NOT EXISTS idx_tags_repository       ON tags(repository)`,
+		`CREATE INDEX IF NOT EXISTS idx_tags_manifest         ON tags(manifest)`,
+		`CREATE INDEX IF NOT EXISTS idx_manifests_state       ON manifests(state)`,
+		`CREATE INDEX IF NOT EXISTS idx_images_manifest       ON images(manifest)`,
+		`CREATE INDEX IF NOT EXISTS idx_manifest_blobs_blob   ON manifest_blobs(blob)`,
+		`CREATE INDEX IF NOT EXISTS idx_tag_images_image      ON tag_images(image)`,
+		`CREATE INDEX IF NOT EXISTS idx_events_image_id       ON events(image_id)`,
 
 		// tag_image_rows — canonical SELECT shape for every image query.
 		// A LEFT JOIN through tag_images lets stub tags (no linked image)
 		// appear as synthesised rows with image_id = 0 and state = 'queued',
 		// so callers do not need to duplicate the COALESCE column list.
-		// Both image_digest (platform-specific) and tag_digest (top-level
-		// manifest or index digest) are exposed so approval queries can
-		// select whichever is appropriate for upstream forwarding.
+		// Both image_digest (platform-specific, from the linked manifest) and
+		// tag_digest (top-level manifest or index digest, via tags.manifest)
+		// are exposed so approval queries can select whichever is appropriate
+		// for upstream forwarding.
 		`CREATE OR REPLACE VIEW tag_image_rows AS
 			SELECT
-				COALESCE(i.id, 0)                     AS image_id,
-				t.id                                  AS tag_id,
-				r.url                                 AS registry_url,
-				t.repository                          AS repository,
-				t.name                                AS tag_name,
-				COALESCE(cr.url, '')                  AS cache_registry_url,
-				COALESCE(i.digest, '')                AS image_digest,
-				COALESCE(t.digest, '')                AS tag_digest,
-				COALESCE(i.arch, '')                  AS arch,
-				COALESCE(i.os, '')                    AS os,
-				COALESCE(i.manifest::text, 'null')    AS manifest,
-				COALESCE(i.scan_report::text, 'null') AS scan_report,
-				COALESCE(i.state::text, 'queued')     AS state,
-				COALESCE(i.created_at, t.created_at)  AS created_at,
-				COALESCE(i.updated_at, t.updated_at)  AS updated_at
+				COALESCE(i.id, 0)                      AS image_id,
+				t.id                                   AS tag_id,
+				r.url                                  AS registry_url,
+				p.path                                 AS repository,
+				t.name                                 AS tag_name,
+				COALESCE(cr.url, '')                   AS cache_registry_url,
+				COALESCE(im.digest, '')                AS image_digest,
+				COALESCE(tm.digest, '')                AS tag_digest,
+				COALESCE(im.arch, '')                  AS arch,
+				COALESCE(im.os, '')                    AS os,
+				COALESCE(im.body::text, 'null')        AS manifest,
+				COALESCE(im.scan_report::text, 'null') AS scan_report,
+				COALESCE(im.state::text, 'queued')     AS state,
+				COALESCE(i.created_at, t.created_at)   AS created_at,
+				COALESCE(i.updated_at, t.updated_at)   AS updated_at
 			FROM tags t
-			JOIN registries r       ON r.id  = t.registry
-			LEFT JOIN tag_images ti ON ti.tag = t.id
-			LEFT JOIN images i      ON i.id  = ti.image
-			LEFT JOIN registries cr ON cr.id = i.cache_registry`,
+			JOIN repositories p       ON p.id  = t.repository
+			JOIN registries r         ON r.id  = p.registry
+			LEFT JOIN manifests tm    ON tm.id = t.manifest
+			LEFT JOIN tag_images ti   ON ti.tag = t.id
+			LEFT JOIN images i        ON i.id  = ti.image
+			LEFT JOIN manifests im    ON im.id = i.manifest
+			LEFT JOIN registries cr   ON cr.id = im.cache_registry`,
 	}
 	for _, s := range stmts {
 		if _, err := d.db.Exec(s); err != nil {
@@ -314,13 +379,83 @@ func (d *DB) upsertRegistry(url string) (int64, error) {
 	return id, err
 }
 
+// upsertRepository inserts a (registry, path) pair if absent and returns its id.
+func (d *DB) upsertRepository(registryID int64, path string) (int64, error) {
+	var id int64
+	err := d.db.QueryRow(`
+		INSERT INTO repositories (registry, path)
+		VALUES ($1, $2)
+		ON CONFLICT (registry, path) DO UPDATE SET updated_at = NOW()
+		RETURNING id`,
+		registryID, path,
+	).Scan(&id)
+	return id, err
+}
+
+// upsertManifest inserts a manifest row keyed on digest (or updates arch/os
+// when better values arrive, without ever overwriting with blanks) and returns
+// its id.  Existing rows preserve state, scan_report, and cache_registry —
+// those are content-determined and therefore shared across every location
+// that observes this digest.
+func (d *DB) upsertManifest(digest, mediaType string, body []byte, arch, os string) (int64, error) {
+	var id int64
+	err := d.db.QueryRow(`
+		INSERT INTO manifests (digest, media_type, body, arch, os)
+		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''))
+		ON CONFLICT (digest) DO UPDATE SET
+			arch       = COALESCE(manifests.arch, NULLIF(EXCLUDED.arch, '')),
+			os         = COALESCE(manifests.os,   NULLIF(EXCLUDED.os,   '')),
+			updated_at = NOW()
+		RETURNING id`,
+		digest, mediaType, body, arch, os,
+	).Scan(&id)
+	return id, err
+}
+
+// upsertBlob inserts a blob digest if absent and returns its id.  Size and
+// media type from manifest descriptors fill in best-effort; empty values are
+// stored as NULL and never overwrite existing data.
+func (d *DB) upsertBlob(digest string, size int64, mediaType string) (int64, error) {
+	var id int64
+	var sz interface{}
+	if size > 0 {
+		sz = size
+	}
+	err := d.db.QueryRow(`
+		INSERT INTO blobs (digest, size, media_type)
+		VALUES ($1, $2, NULLIF($3, ''))
+		ON CONFLICT (digest) DO UPDATE SET
+			size       = COALESCE(blobs.size,       EXCLUDED.size),
+			media_type = COALESCE(blobs.media_type, EXCLUDED.media_type)
+		RETURNING id`,
+		digest, sz, mediaType,
+	).Scan(&id)
+	return id, err
+}
+
+// linkManifestBlob attaches a blob to a manifest with the given role.  Ordinal
+// is used for layers (preserving order) and NULL for the config.  Idempotent.
+func (d *DB) linkManifestBlob(manifestID, blobID int64, role string, ordinal int) error {
+	var ord interface{}
+	if role == roleLayer {
+		ord = ordinal
+	}
+	_, err := d.db.Exec(`
+		INSERT INTO manifest_blobs (manifest, blob, role, ordinal)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT DO NOTHING`,
+		manifestID, blobID, role, ord,
+	)
+	return err
+}
+
 // getTagID returns the id of an existing tag, or 0 if absent.
-func (d *DB) getTagID(registryID int64, repository, tagName string) (int64, error) {
+func (d *DB) getTagID(repositoryID int64, tagName string) (int64, error) {
 	var id int64
 	err := d.db.QueryRow(`
 		SELECT id FROM tags
-		WHERE registry = $1 AND repository = $2 AND name = $3`,
-		registryID, repository, tagName,
+		WHERE repository = $1 AND name = $2`,
+		repositoryID, tagName,
 	).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, nil
@@ -328,37 +463,36 @@ func (d *DB) getTagID(registryID int64, repository, tagName string) (int64, erro
 	return id, err
 }
 
-// insertTag creates a tag row and returns its id.
-func (d *DB) insertTag(registryID int64, repository, tagName, digest string) (int64, error) {
+// insertTag creates or updates a tag row and returns its id.  manifestID is
+// the top-level (image manifest or index) manifests.id the tag resolves to;
+// pass 0 for a stub tag with no resolved manifest yet.
+func (d *DB) insertTag(repositoryID int64, tagName string, manifestID int64) (int64, error) {
 	var id int64
-	var dgst interface{}
-	if digest != "" {
-		dgst = digest
+	var mid interface{}
+	if manifestID != 0 {
+		mid = manifestID
 	}
 	err := d.db.QueryRow(`
-		INSERT INTO tags (registry, repository, name, digest)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (registry, repository, name) DO UPDATE
-			SET digest = EXCLUDED.digest, updated_at = NOW()
+		INSERT INTO tags (repository, name, manifest)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (repository, name) DO UPDATE
+			SET manifest = EXCLUDED.manifest, updated_at = NOW()
 		RETURNING id`,
-		registryID, repository, tagName, dgst,
+		repositoryID, tagName, mid,
 	).Scan(&id)
 	return id, err
 }
 
-// insertImage inserts a platform image row keyed on (registry, repository,
-// digest) and returns its id.  Empty arch/os values are stored as NULL so an
-// upsert never overwrites better data with blanks.  Existing rows are left
-// unchanged (state, scan_report, etc. are preserved) and their id is returned.
-func (d *DB) insertImage(registryID int64, repository, digest, arch, os string, manifest []byte) (int64, error) {
+// insertImagePolicy inserts or reuses the (repository → manifest) provenance
+// row and returns its id.
+func (d *DB) insertImagePolicy(repositoryID, manifestID int64) (int64, error) {
 	var id int64
 	err := d.db.QueryRow(`
-		INSERT INTO images (registry, repository, digest, arch, os, manifest)
-		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), $6)
-		ON CONFLICT (registry, repository, digest) DO UPDATE
-			SET updated_at = NOW()
+		INSERT INTO images (repository, manifest)
+		VALUES ($1, $2)
+		ON CONFLICT (repository, manifest) DO UPDATE SET updated_at = NOW()
 		RETURNING id`,
-		registryID, repository, digest, arch, os, manifest,
+		repositoryID, manifestID,
 	).Scan(&id)
 	return id, err
 }
@@ -393,8 +527,8 @@ func (d *DB) imagesByTagID(tagID int64) ([]*Image, error) {
 
 // ── Queue ─────────────────────────────────────────────────────────────────────
 
-// QueueStub ensures the registry and tag rows exist without making any
-// outbound registry calls.  It is used by the API server to register a
+// QueueStub ensures the registry, repository, and tag rows exist without making
+// any outbound registry calls.  It is used by the API server to register a
 // first-seen tag so operators can see it in 'hermes list'.  A stub tag has no
 // linked image rows; manifest fetching and image insertion happen lazily the
 // first time the operator runs scan/approve (or when the API later adopts the
@@ -404,35 +538,43 @@ func (d *DB) QueueStub(ref ImageRef) error {
 	if err != nil {
 		return fmt.Errorf("upsert registry: %w", err)
 	}
-	tagID, err := d.getTagID(registryID, ref.Repository, ref.Tag)
+	repoID, err := d.upsertRepository(registryID, ref.Repository)
+	if err != nil {
+		return fmt.Errorf("upsert repository: %w", err)
+	}
+	tagID, err := d.getTagID(repoID, ref.Tag)
 	if err != nil {
 		return fmt.Errorf("get tag: %w", err)
 	}
 	if tagID == 0 {
-		if _, err := d.insertTag(registryID, ref.Repository, ref.Tag, ""); err != nil {
+		if _, err := d.insertTag(repoID, ref.Tag, 0); err != nil {
 			return fmt.Errorf("insert stub tag: %w", err)
 		}
 	}
 	return nil
 }
 
-// Queue ensures the registry, tag, and per-platform image rows exist in the DB.
-// If the tag has no linked image rows yet (including when stub-registered by
-// the API) it fetches the manifest via fetcher and either:
+// Queue ensures the registry, repository, tag, and per-platform image rows
+// exist in the DB.  If the tag has no linked image rows yet (including when
+// stub-registered by the API) it fetches the manifest via fetcher and either:
 //   - adopts existing image rows when another tag in the same repository
 //     already references the upstream-returned digest (alternate-tag case), or
 //   - inserts new image rows per platform.
 //
 // Returns all image rows linked to the tag.
 func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
-	// 1. Upsert registry.
+	// 1. Upsert registry + repository.
 	registryID, err := d.upsertRegistry(ref.Registry)
 	if err != nil {
 		return nil, fmt.Errorf("upsert registry: %w", err)
 	}
+	repoID, err := d.upsertRepository(registryID, ref.Repository)
+	if err != nil {
+		return nil, fmt.Errorf("upsert repository: %w", err)
+	}
 
 	// 2. Check whether the tag already exists and is fully populated.
-	tagID, err := d.getTagID(registryID, ref.Repository, ref.Tag)
+	tagID, err := d.getTagID(repoID, ref.Tag)
 	if err != nil {
 		return nil, fmt.Errorf("get tag: %w", err)
 	}
@@ -454,13 +596,19 @@ func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 	}
 
 	// 4. Look for existing images already known at this digest (alt-tag case).
-	existingIDs, err := d.findImageIDsByTagDigest(registryID, ref.Repository, digest)
+	existingIDs, err := d.findImageIDsByTagDigest(repoID, digest)
 	if err != nil {
 		return nil, fmt.Errorf("find images by digest: %w", err)
 	}
 
-	// 5. Upsert the tag row with the resolved digest.
-	tagID, err = d.insertTag(registryID, ref.Repository, ref.Tag, digest)
+	// 5. Upsert the top-level manifest row and link the tag to it.  For
+	//    indexes we store the raw body but leave blob links to the per-platform
+	//    manifests below.
+	topID, err := d.upsertManifest(digest, mediaType, manifest, "", "")
+	if err != nil {
+		return nil, fmt.Errorf("upsert top manifest: %w", err)
+	}
+	tagID, err = d.insertTag(repoID, ref.Tag, topID)
 	if err != nil {
 		return nil, fmt.Errorf("insert tag: %w", err)
 	}
@@ -478,16 +626,17 @@ func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 	// 6. No alt-tag match — populate normally.
 	switch {
 	case isImageManifest(mediaType):
-		if err := d.queueSingleImage(tagID, registryID, ref.Registry, ref.Repository, digest, manifest, fetcher); err != nil {
+		if err := d.queueSingleImage(tagID, repoID, ref.Registry, ref.Repository, topID, digest, mediaType, manifest, fetcher); err != nil {
 			return nil, err
 		}
 	case isImageIndex(mediaType):
-		if err := d.queueIndexImages(tagID, registryID, ref.Registry, ref.Repository, manifest, fetcher); err != nil {
+		if err := d.queueIndexImages(tagID, repoID, ref.Registry, ref.Repository, manifest, fetcher); err != nil {
 			return nil, err
 		}
 	default:
-		// Unknown media type — insert a minimal image row so the tag is tracked.
-		imgID, err := d.insertImage(registryID, ref.Repository, digest, "", "", manifest)
+		// Unknown media type — register a provenance row pointing at the
+		// top-level manifest so the tag is tracked.
+		imgID, err := d.insertImagePolicy(repoID, topID)
 		if err != nil {
 			return nil, fmt.Errorf("insert image (unknown media type): %w", err)
 		}
@@ -500,15 +649,16 @@ func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 }
 
 // findImageIDsByTagDigest returns the distinct ids of all images currently
-// linked to any tag in (registryID, repository) whose digest equals the given
-// value.  This drives the alternate-tag adoption path.
-func (d *DB) findImageIDsByTagDigest(registryID int64, repository, digest string) ([]int64, error) {
+// linked to any tag in the given repository whose top-level manifest has the
+// given digest.  This drives the alternate-tag adoption path.
+func (d *DB) findImageIDsByTagDigest(repositoryID int64, digest string) ([]int64, error) {
 	rows, err := d.db.Query(`
 		SELECT DISTINCT ti.image
 		FROM tags t
+		JOIN manifests tm  ON tm.id = t.manifest
 		JOIN tag_images ti ON ti.tag = t.id
-		WHERE t.registry = $1 AND t.repository = $2 AND t.digest = $3`,
-		registryID, repository, digest,
+		WHERE t.repository = $1 AND tm.digest = $2`,
+		repositoryID, digest,
 	)
 	if err != nil {
 		return nil, err
@@ -526,16 +676,59 @@ func (d *DB) findImageIDsByTagDigest(registryID int64, repository, digest string
 	return ids, rows.Err()
 }
 
-// queueSingleImage inserts a row for a single-platform manifest, best-effort
-// resolving arch/os from the image config, then links it to the tag.
-func (d *DB) queueSingleImage(tagID, registryID int64, registry, repository, digest string, manifest []byte, fetcher Fetcher) error {
-	var arch, os string
-	if configDigest, err := extractConfigDigest(manifest); err == nil {
+// storeManifestBlobs records the config and layer blob links for a manifest.
+// Best-effort: a failure on any single blob aborts the manifest ingestion so
+// the caller can surface the error, since the manifest row is useless for
+// gatekeeping without its blob links.
+func (d *DB) storeManifestBlobs(manifestID int64, body []byte) error {
+	if cfg, err := extractConfigDigest(body); err == nil {
+		blobID, err := d.upsertBlob(cfg, 0, "")
+		if err != nil {
+			return fmt.Errorf("upsert config blob: %w", err)
+		}
+		if err := d.linkManifestBlob(manifestID, blobID, roleConfig, 0); err != nil {
+			return fmt.Errorf("link config blob: %w", err)
+		}
+	}
+	layers, err := extractLayerDigests(body)
+	if err != nil {
+		return fmt.Errorf("extract layers: %w", err)
+	}
+	for i, l := range layers {
+		blobID, err := d.upsertBlob(l.Digest, l.Size, l.MediaType)
+		if err != nil {
+			return fmt.Errorf("upsert layer blob %s: %w", l.Digest, err)
+		}
+		if err := d.linkManifestBlob(manifestID, blobID, roleLayer, i); err != nil {
+			return fmt.Errorf("link layer blob %s: %w", l.Digest, err)
+		}
+	}
+	return nil
+}
+
+// queueSingleImage records a single-platform manifest: upserts the manifest
+// row (with arch/os from its config blob), extracts and stores its blob
+// links, inserts the (repository → manifest) provenance row, and links it to
+// the tag.
+func (d *DB) queueSingleImage(tagID, repositoryID int64, registry, repository string, manifestID int64, digest, mediaType string, body []byte, fetcher Fetcher) error {
+	arch, os := "", ""
+	if configDigest, err := extractConfigDigest(body); err == nil {
 		if a, o, err := fetcher.FetchConfig(registry, repository, configDigest); err == nil {
 			arch, os = a, o
 		}
 	}
-	imgID, err := d.insertImage(registryID, repository, digest, arch, os, manifest)
+	// Re-upsert with arch/os now that we've resolved them.
+	mid, err := d.upsertManifest(digest, mediaType, body, arch, os)
+	if err != nil {
+		return fmt.Errorf("upsert manifest: %w", err)
+	}
+	if mid != manifestID {
+		manifestID = mid
+	}
+	if err := d.storeManifestBlobs(manifestID, body); err != nil {
+		return err
+	}
+	imgID, err := d.insertImagePolicy(repositoryID, manifestID)
 	if err != nil {
 		return fmt.Errorf("insert image: %w", err)
 	}
@@ -543,9 +736,9 @@ func (d *DB) queueSingleImage(tagID, registryID int64, registry, repository, dig
 }
 
 // queueIndexImages iterates the manifests in an image index, fetches each
-// known platform's manifest + config, inserts image rows, and links them to
-// the tag.
-func (d *DB) queueIndexImages(tagID, registryID int64, registry, repository string, indexManifest []byte, fetcher Fetcher) error {
+// known platform's manifest + config, ingests them (manifest row + blob
+// links), and links per-platform provenance rows to the tag.
+func (d *DB) queueIndexImages(tagID, repositoryID int64, registry, repository string, indexManifest []byte, fetcher Fetcher) error {
 	var idx struct {
 		Manifests []struct {
 			MediaType string `json:"mediaType"`
@@ -570,13 +763,16 @@ func (d *DB) queueIndexImages(tagID, registryID int64, registry, repository stri
 		}
 
 		// Fetch the platform-specific manifest.
-		mDigest, _, mBody, err := fetcher.FetchManifest(registry, repository, entry.Digest)
+		mDigest, mMediaType, mBody, err := fetcher.FetchManifest(registry, repository, entry.Digest)
 		if err != nil {
 			// Log and skip this platform rather than aborting the whole queue.
 			continue
 		}
 		if mDigest == "" {
 			mDigest = entry.Digest
+		}
+		if mMediaType == "" {
+			mMediaType = entry.MediaType
 		}
 
 		// Fetch config for arch/os (best-effort).
@@ -588,7 +784,14 @@ func (d *DB) queueIndexImages(tagID, registryID int64, registry, repository stri
 			}
 		}
 
-		imgID, err := d.insertImage(registryID, repository, mDigest, arch, os, mBody)
+		manifestID, err := d.upsertManifest(mDigest, mMediaType, mBody, arch, os)
+		if err != nil {
+			return fmt.Errorf("upsert manifest %s: %w", mDigest, err)
+		}
+		if err := d.storeManifestBlobs(manifestID, mBody); err != nil {
+			return fmt.Errorf("store blobs for %s: %w", mDigest, err)
+		}
+		imgID, err := d.insertImagePolicy(repositoryID, manifestID)
 		if err != nil {
 			return fmt.Errorf("insert image %s: %w", mDigest, err)
 		}
@@ -615,16 +818,48 @@ func extractConfigDigest(manifest []byte) (string, error) {
 	return m.Config.Digest, nil
 }
 
+// extractLayerDigests returns the layers[] descriptors from an image manifest,
+// preserving order.  Returns an empty slice (not an error) if the manifest has
+// no layers field.
+func extractLayerDigests(manifest []byte) ([]blobDescriptor, error) {
+	var m struct {
+		Layers []struct {
+			Digest    string `json:"digest"`
+			Size      int64  `json:"size"`
+			MediaType string `json:"mediaType"`
+		} `json:"layers"`
+	}
+	if err := json.Unmarshal(manifest, &m); err != nil {
+		return nil, err
+	}
+	out := make([]blobDescriptor, 0, len(m.Layers))
+	for _, l := range m.Layers {
+		if l.Digest == "" {
+			continue
+		}
+		out = append(out, blobDescriptor{
+			Digest:    l.Digest,
+			Size:      l.Size,
+			MediaType: l.MediaType,
+		})
+	}
+	return out, nil
+}
+
 // ── image scan ────────────────────────────────────────────────────────────────
 
-// SaveScan stores the trivy scan report for an image and sets its state to scanned.
+// SaveScan stores the trivy scan report on the manifest referenced by an
+// image row and sets its state to scanned.  Because scan and state live on
+// the content-addressed manifest, every other image row that shares this
+// digest inherits the new report immediately.
 func (d *DB) SaveScan(imageID int64, scanReport json.RawMessage) (*Image, error) {
 	_, err := d.db.Exec(`
-		UPDATE images SET
+		UPDATE manifests SET
 			scan_report = $1,
+			scanned_at  = NOW(),
 			state       = 'scanned',
 			updated_at  = NOW()
-		WHERE id = $2`,
+		WHERE id = (SELECT manifest FROM images WHERE id = $2)`,
 		[]byte(scanReport), imageID,
 	)
 	if err != nil {
@@ -635,8 +870,9 @@ func (d *DB) SaveScan(imageID int64, scanReport json.RawMessage) (*Image, error)
 
 // ── state transitions ─────────────────────────────────────────────────────────
 
-// Approve sets a platform image's state to approved and optionally records the
-// cache registry URL.
+// Approve sets the referenced manifest's state to approved and optionally
+// records the cache registry URL.  Because approval is attached to the
+// manifest, every image row referencing that digest shares the verdict.
 func (d *DB) Approve(imageID int64, cacheRegistry string) error {
 	var cacheRegID interface{}
 	if cacheRegistry != "" {
@@ -647,60 +883,59 @@ func (d *DB) Approve(imageID int64, cacheRegistry string) error {
 		cacheRegID = id
 	}
 	_, err := d.db.Exec(`
-		UPDATE images SET
+		UPDATE manifests SET
 			state          = 'approved',
 			cache_registry = $1,
 			updated_at     = NOW()
-		WHERE id = $2`,
+		WHERE id = (SELECT manifest FROM images WHERE id = $2)`,
 		cacheRegID, imageID,
 	)
 	return err
 }
 
-// Rescind sets a platform image's state to rescinded.
+// Rescind sets the referenced manifest's state to rescinded.
 func (d *DB) Rescind(imageID int64) error {
 	return d.setImageState(imageID, StateRescinded)
 }
 
-// Void sets a platform image's state to voided — its digest no longer
+// Void sets the referenced manifest's state to voided — its digest no longer
 // exists upstream and the image was not cached, so it cannot be served.
 func (d *DB) Void(imageID int64) error {
 	return d.setImageState(imageID, StateVoided)
 }
 
-// VoidByBlob flips every approved, uncached image in (registry, repository)
-// whose manifest references digest (as the config or one of the layers) to
-// the voided state.  Cached images are left alone — they remain servable
-// from the cache registry regardless of upstream state.  Returns the IDs of
-// the images that were voided so the caller can log them in an audit event.
+// VoidByBlob flips every approved, uncached manifest in (registry, repository)
+// whose config or layer set includes the given blob digest to the voided
+// state.  Cached manifests are left alone — they remain servable from the
+// cache registry regardless of upstream state.  Returns the IDs of the image
+// rows that were voided so the caller can log them in an audit event.
 func (d *DB) VoidByBlob(registry, repository, digest string) ([]int64, error) {
-	configContains, err := json.Marshal(map[string]any{
-		"config": map[string]string{"digest": digest},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("marshal config containment: %w", err)
-	}
-	layersContains, err := json.Marshal(map[string]any{
-		"layers": []map[string]string{{"digest": digest}},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("marshal layers containment: %w", err)
-	}
-
 	rows, err := d.db.Query(`
-		UPDATE images
-		SET state = 'voided', updated_at = NOW()
-		WHERE id IN (
-			SELECT i.id
-			FROM images i
-			JOIN registries r ON r.id = i.registry
-			WHERE r.url = $1 AND i.repository = $2
-			  AND i.state = 'approved'
-			  AND i.cache_registry IS NULL
-			  AND (i.manifest @> $3::jsonb OR i.manifest @> $4::jsonb)
+		WITH affected AS (
+			UPDATE manifests
+			SET state = 'voided', updated_at = NOW()
+			WHERE id IN (
+				SELECT DISTINCT m.id
+				FROM manifests m
+				JOIN manifest_blobs mb ON mb.manifest = m.id
+				JOIN blobs b           ON b.id = mb.blob
+				JOIN images i          ON i.manifest = m.id
+				JOIN repositories p    ON p.id = i.repository
+				JOIN registries r      ON r.id = p.registry
+				WHERE b.digest = $3
+				  AND r.url = $1 AND p.path = $2
+				  AND m.state = 'approved'
+				  AND m.cache_registry IS NULL
+			)
+			RETURNING id
 		)
-		RETURNING id`,
-		registry, repository, string(configContains), string(layersContains),
+		SELECT i.id
+		FROM images i
+		JOIN affected a     ON a.id = i.manifest
+		JOIN repositories p ON p.id = i.repository
+		JOIN registries r   ON r.id = p.registry
+		WHERE r.url = $1 AND p.path = $2`,
+		registry, repository, digest,
 	)
 	if err != nil {
 		return nil, err
@@ -718,20 +953,20 @@ func (d *DB) VoidByBlob(registry, repository, digest string) ([]int64, error) {
 	return ids, rows.Err()
 }
 
-// Reject sets a platform image's state to rejected.
+// Reject sets the referenced manifest's state to rejected.
 func (d *DB) Reject(imageID int64) error {
 	return d.setImageState(imageID, StateRejected)
 }
 
-// SetError sets a platform image's state to error.
+// SetError sets the referenced manifest's state to errored.
 func (d *DB) SetError(imageID int64) error {
 	return d.setImageState(imageID, StateErrored)
 }
 
 func (d *DB) setImageState(imageID int64, state State) error {
 	_, err := d.db.Exec(`
-		UPDATE images SET state = $1, updated_at = NOW()
-		WHERE id = $2`,
+		UPDATE manifests SET state = $1, updated_at = NOW()
+		WHERE id = (SELECT manifest FROM images WHERE id = $2)`,
 		string(state), imageID,
 	)
 	return err
@@ -1002,42 +1237,32 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 // ── blob authorization ────────────────────────────────────────────────────────
 
 // BlobAuthorized reports whether the given blob digest belongs to an approved
-// image in (registry, repository).  A blob is authorized when it appears as
-// either the config digest or one of the layer digests of an approved image's
-// manifest.  The check uses jsonb containment so the GIN index on images.manifest
-// can answer it without scanning rows.
+// manifest in (registry, repository).  A blob is authorized when it appears
+// in manifest_blobs (config or layer role) for a manifest that is observed
+// at (registry, repository) and is currently approved.  The check is a
+// pure int-FK JOIN answered by the b-tree index on manifest_blobs(blob).
 //
 // The second return is the cache registry URL to forward the blob request to:
-// when at least one owning image has cache_registry set hermes serves the blob
-// from cache (protecting against upstream removal), preferring cached owners
-// over uncached ones and breaking ties by the smallest image id.  An empty
-// string means "forward to origin".
+// when the owning manifest has cache_registry set hermes serves the blob from
+// cache (protecting against upstream removal).  An empty string means
+// "forward to origin".
 func (d *DB) BlobAuthorized(registry, repository, digest string) (bool, string, error) {
-	configContains, err := json.Marshal(map[string]any{
-		"config": map[string]string{"digest": digest},
-	})
-	if err != nil {
-		return false, "", fmt.Errorf("marshal config containment: %w", err)
-	}
-	layersContains, err := json.Marshal(map[string]any{
-		"layers": []map[string]string{{"digest": digest}},
-	})
-	if err != nil {
-		return false, "", fmt.Errorf("marshal layers containment: %w", err)
-	}
-
 	var cacheURL sql.NullString
-	err = d.db.QueryRow(`
+	err := d.db.QueryRow(`
 		SELECT COALESCE(cr.url, '')
-		FROM images i
-		JOIN registries r        ON r.id  = i.registry
-		LEFT JOIN registries cr  ON cr.id = i.cache_registry
-		WHERE r.url = $1 AND i.repository = $2
-		  AND i.state = 'approved'
-		  AND (i.manifest @> $3::jsonb OR i.manifest @> $4::jsonb)
-		ORDER BY (i.cache_registry IS NULL), i.id
+		FROM blobs b
+		JOIN manifest_blobs mb ON mb.blob = b.id
+		JOIN manifests m       ON m.id = mb.manifest
+		JOIN images i          ON i.manifest = m.id
+		JOIN repositories p    ON p.id = i.repository
+		JOIN registries r      ON r.id = p.registry
+		LEFT JOIN registries cr ON cr.id = m.cache_registry
+		WHERE b.digest = $3
+		  AND r.url = $1 AND p.path = $2
+		  AND m.state = 'approved'
+		ORDER BY (m.cache_registry IS NULL), i.id
 		LIMIT 1`,
-		registry, repository, string(configContains), string(layersContains),
+		registry, repository, digest,
 	).Scan(&cacheURL)
 	if err == sql.ErrNoRows {
 		return false, "", nil
@@ -1051,10 +1276,11 @@ func (d *DB) BlobAuthorized(registry, repository, digest string) (bool, string, 
 // ── alternate-tag adoption ────────────────────────────────────────────────────
 
 // AdoptTagByDigest looks for image rows already linked to any tag in
-// (registry, repository) whose digest equals the given value, and links them
-// to a (newly created if needed) tag with the supplied name.  It returns true
-// when at least one of the adopted images is in the approved state, signalling
-// to the caller that the new tag may be served immediately.
+// (registry, repository) whose top-level manifest digest equals the given
+// value, and links them to a (newly created if needed) tag with the supplied
+// name.  It returns true when at least one of the adopted manifests is in
+// the approved state, signalling to the caller that the new tag may be
+// served immediately.
 //
 // This is the alternate-tag detection helper used by the API server: when an
 // unknown tag is requested but the upstream returns a manifest digest that is
@@ -1065,14 +1291,27 @@ func (d *DB) AdoptTagByDigest(ref ImageRef, digest string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("upsert registry: %w", err)
 	}
+	repoID, err := d.upsertRepository(registryID, ref.Repository)
+	if err != nil {
+		return false, fmt.Errorf("upsert repository: %w", err)
+	}
+
+	// Resolve the top-level manifest id for the requested digest, if any.
+	var topManifestID int64
+	err = d.db.QueryRow(`SELECT id FROM manifests WHERE digest = $1`, digest).Scan(&topManifestID)
+	if err != nil && err != sql.ErrNoRows {
+		return false, fmt.Errorf("lookup manifest: %w", err)
+	}
 
 	rows, err := d.db.Query(`
-		SELECT DISTINCT ti.image, i.state::text
+		SELECT DISTINCT ti.image, m.state::text
 		FROM tags t
+		JOIN manifests tm  ON tm.id = t.manifest
 		JOIN tag_images ti ON ti.tag = t.id
 		JOIN images i      ON i.id  = ti.image
-		WHERE t.registry = $1 AND t.repository = $2 AND t.digest = $3`,
-		registryID, ref.Repository, digest,
+		JOIN manifests m   ON m.id  = i.manifest
+		WHERE t.repository = $1 AND tm.digest = $2`,
+		repoID, digest,
 	)
 	if err != nil {
 		return false, fmt.Errorf("lookup digest: %w", err)
@@ -1100,7 +1339,7 @@ func (d *DB) AdoptTagByDigest(ref ImageRef, digest string) (bool, error) {
 		return false, nil
 	}
 
-	tagID, err := d.insertTag(registryID, ref.Repository, ref.Tag, digest)
+	tagID, err := d.insertTag(repoID, ref.Tag, topManifestID)
 	if err != nil {
 		return false, fmt.Errorf("insert tag: %w", err)
 	}
