@@ -394,6 +394,59 @@ func (d *DB) upsertRegistry(url string) (int64, error) {
 	return id, err
 }
 
+// CanonicalRegistryURL walks the mask chain for the given URL and returns
+// the canonical (unmasked) registry URL.  If the URL is not tracked in the
+// database, or is already canonical, the input is returned unchanged.
+// Used by the gateway to normalize a client-supplied registry (e.g.
+// `/v2/registry-1.docker.io/...`) onto the canonical URL stored against
+// approved images (`docker.io`) so lookups match.
+func (d *DB) CanonicalRegistryURL(url string) (string, error) {
+	var canon string
+	err := d.db.QueryRow(`
+		WITH RECURSIVE chain AS (
+			SELECT id, mask, url FROM registries WHERE url = $1
+			UNION ALL
+			SELECT r.id, r.mask, r.url
+			FROM registries r JOIN chain c ON r.id = c.mask
+		)
+		SELECT url FROM chain WHERE mask IS NULL LIMIT 1`,
+		url,
+	).Scan(&canon)
+	if err == sql.ErrNoRows {
+		return url, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return canon, nil
+}
+
+// UpstreamRegistryURL returns a concrete registry URL suitable for making
+// HTTPS calls.  If the input is a canonical (unmasked) URL with at least
+// one mask child (e.g. `docker.io` → `registry-1.docker.io`) the most
+// recently inserted child's URL is returned.  Otherwise the input is
+// returned unchanged.  Used by the gateway at every upstream-call site so
+// canonical names like `docker.io` don't leak into real HTTPS requests.
+func (d *DB) UpstreamRegistryURL(url string) (string, error) {
+	var child string
+	err := d.db.QueryRow(`
+		SELECT child.url
+		FROM registries child
+		JOIN registries root ON root.id = child.mask
+		WHERE root.url = $1
+		ORDER BY child.id DESC
+		LIMIT 1`,
+		url,
+	).Scan(&child)
+	if err == sql.ErrNoRows {
+		return url, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return child, nil
+}
+
 // upsertRepository inserts a (registry, path) pair if absent and returns its id.
 func (d *DB) upsertRepository(registryID int64, path string) (int64, error) {
 	var id int64

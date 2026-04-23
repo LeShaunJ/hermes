@@ -61,6 +61,8 @@ type storage interface {
 	BlobAuthorized(registry, repository, digest string) (authorized bool, cacheRegistry string, err error)
 	Void(imageID int64) error
 	VoidByBlob(registry, repository, digest string) ([]int64, error)
+	CanonicalRegistryURL(url string) (string, error)
+	UpstreamRegistryURL(url string) (string, error)
 	LogEvent(imageID *int64, source db.EventSource, eventType string, details map[string]interface{}) error
 }
 
@@ -140,15 +142,26 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// DB lookups key on the canonical registry URL, so a client pulling
+	// via a masked alias (`registry-1.docker.io`) still matches the row
+	// stored against `docker.io`.  The original p.Registry is preserved
+	// for path-level arithmetic and upstream forwarding.
+	lookupRegistry := p.Registry
+	if canon, cerr := s.db.CanonicalRegistryURL(p.Registry); cerr == nil {
+		lookupRegistry = canon
+	} else {
+		slog.Warn("canonical registry lookup", "registry", p.Registry, "err", cerr)
+	}
+
 	// Manifest request — check approval status.
 	var img *db.Image
 	switch p.Kind {
 	case refKindTag:
-		img, err = s.db.GetApproved(p.Registry, p.Repository, p.Tag)
+		img, err = s.db.GetApproved(lookupRegistry, p.Repository, p.Tag)
 	case refKindDigest:
-		img, err = s.db.GetApprovedByDigest(p.Registry, p.Repository, p.Digest)
+		img, err = s.db.GetApprovedByDigest(lookupRegistry, p.Repository, p.Digest)
 	case refKindTagAndDigest:
-		img, err = s.db.GetApprovedByTagAndDigest(p.Registry, p.Repository, p.Tag, p.Digest)
+		img, err = s.db.GetApprovedByTagAndDigest(lookupRegistry, p.Repository, p.Tag, p.Digest)
 	}
 	if err != nil {
 		slog.Error("db lookup", "registry", p.Registry, "repository", p.Repository, "err", err)
@@ -195,7 +208,7 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 	// Check if rejected.
 	if p.Tag != "" {
 		var rejected *db.Image
-		rejected, err = s.db.GetRejected(p.Registry, p.Repository, p.Tag)
+		rejected, err = s.db.GetRejected(lookupRegistry, p.Repository, p.Tag)
 		if err != nil {
 			slog.Warn("rejected lookup", "registry", p.Registry, "repository", p.Repository, "tag", p.Tag, "err", err)
 		}
@@ -362,13 +375,15 @@ func (s *Server) voidManifestHook(img *db.Image, p parsedPath, start time.Time) 
 
 // voidBlobHook returns a responseHook that voids every uncached approved
 // image whose manifest references digest when the upstream indicates the
-// blob is gone.
-func (s *Server) voidBlobHook(p parsedPath, start time.Time) responseHook {
+// blob is gone.  lookupRegistry is the canonical form used for DB keys;
+// p.Registry is kept for the event payload so operators see the URL the
+// client actually asked for.
+func (s *Server) voidBlobHook(p parsedPath, lookupRegistry string, start time.Time) responseHook {
 	return func(resp *http.Response) error {
 		if !shouldVoid(resp) {
 			return nil
 		}
-		ids, err := s.db.VoidByBlob(p.Registry, p.Repository, p.Digest)
+		ids, err := s.db.VoidByBlob(lookupRegistry, p.Repository, p.Digest)
 		if err != nil {
 			slog.Error("void by blob", "registry", p.Registry, "repository", p.Repository, "digest", p.Digest, "err", err)
 			return nil
@@ -417,7 +432,13 @@ func rewriteResponseOCIError(resp *http.Response, status int, code, message stri
 // When any owning approved image has been cached, the blob is served from the
 // cache registry so it stays available even if the origin has removed it.
 func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath, start time.Time) {
-	ok, cacheRegistry, err := s.db.BlobAuthorized(p.Registry, p.Repository, p.Digest)
+	lookupRegistry := p.Registry
+	if canon, cerr := s.db.CanonicalRegistryURL(p.Registry); cerr == nil {
+		lookupRegistry = canon
+	} else {
+		slog.Warn("canonical registry lookup", "registry", p.Registry, "err", cerr)
+	}
+	ok, cacheRegistry, err := s.db.BlobAuthorized(lookupRegistry, p.Repository, p.Digest)
 	if err != nil {
 		slog.Error("blob authz", "registry", p.Registry, "repository", p.Repository, "digest", p.Digest, "err", err)
 		s.writeOCIError(w, http.StatusInternalServerError, "UNKNOWN", "internal error")
@@ -449,17 +470,25 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath,
 	// Redirect mode also skips voiding since hermes never sees the response.
 	var hooks []responseHook
 	if !s.cfg.Server.Redirect && cacheRegistry == "" {
-		hooks = append(hooks, s.voidBlobHook(p, start))
+		hooks = append(hooks, s.voidBlobHook(p, lookupRegistry, start))
 	}
 	s.proxyOrRedirect(w, r, forwardRegistry, "/v2/"+p.Repository+"/blobs/"+p.Digest, hooks...)
 }
 
 // challengeRetrieve probes GET https://<registry>/v2/<path> and returns the
-// WWW-Authenticate header from the upstream's 401 response.
+// WWW-Authenticate header from the upstream's 401 response.  When <registry>
+// is a canonical display name (e.g. `docker.io`) it is translated to a
+// concrete child URL (e.g. `registry-1.docker.io`) via the mask chain before
+// the HTTPS call, since display names are not real endpoints.
 // Returns an empty string if the probe fails or returns no challenge.
 func (s *Server) challengeRetrieve(registry string, path string) string {
 	if s.challengeRetrieveFn != nil {
 		return s.challengeRetrieveFn(registry, path)
+	}
+	upstream, err := s.db.UpstreamRegistryURL(registry)
+	if err != nil {
+		slog.Warn("upstream registry lookup", "registry", registry, "err", err)
+		upstream = registry
 	}
 	client := &http.Client{
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -467,7 +496,7 @@ func (s *Server) challengeRetrieve(registry string, path string) string {
 		},
 		Timeout: 5 * time.Second,
 	}
-	resp, err := client.Get("https://" + registry + "/v2/" + path)
+	resp, err := client.Get("https://" + upstream + "/v2/" + path)
 	if err != nil {
 		return ""
 	}
@@ -595,8 +624,17 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 	var sessionID *int64
 	start := time.Now()
 
+	// Canonical display names (e.g. `docker.io`) are not real HTTPS
+	// endpoints — translate to a concrete child URL before any upstream
+	// call.  Unknown / already-concrete URLs pass through unchanged.
+	upstream, err := s.db.UpstreamRegistryURL(registry)
+	if err != nil {
+		slog.Warn("upstream registry lookup", "registry", registry, "err", err)
+		upstream = registry
+	}
+
 	if s.cfg.Server.Redirect && len(hooks) == 0 {
-		dest := "https://" + registry + path
+		dest := "https://" + upstream + path
 		if r.URL.RawQuery != "" {
 			dest += "?" + r.URL.RawQuery
 		}
@@ -614,7 +652,7 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 		// Tests inject an HTTP transport pointing at an httptest backend.
 		scheme = "http"
 	}
-	target, _ := url.Parse(scheme + "://" + registry)
+	target, _ := url.Parse(scheme + "://" + upstream)
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	if s.transport != nil {
 		proxy.Transport = s.transport
@@ -623,7 +661,7 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 	proxy.Director = func(req *http.Request) {
 		origDirector(req)
 		req.URL.Path = path
-		req.Host = registry
+		req.Host = upstream
 		req.Header.Set("X-Forwarded-Proto", "https")
 
 		_ = s.db.LogEvent(sessionID, db.SourceAPI, "content_proxied", map[string]interface{}{
