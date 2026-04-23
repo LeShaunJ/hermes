@@ -10,7 +10,15 @@ require (
 	github.com/spf13/cobra v1.9.1
 )
 
-require github.com/DATA-DOG/go-sqlmock v1.5.2 // indirect
+require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2 // indirect
+	github.com/containerd/stargz-snapshotter/estargz v0.16.3 // indirect
+	github.com/docker/distribution v2.8.3+incompatible // indirect
+	github.com/klauspost/compress v1.17.11 // indirect
+	github.com/opencontainers/image-spec v1.1.0 // indirect
+	github.com/vbatts/tar-split v0.11.6 // indirect
+	golang.org/x/sync v0.16.0 // indirect
+)
 
 require (
 	github.com/docker/cli v29.2.0+incompatible // indirect

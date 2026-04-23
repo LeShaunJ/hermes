@@ -104,6 +104,15 @@ func (s *Server) ListenAndServe() error {
 	return http.ListenAndServe(s.cfg.Server.Addr, s.mux)
 }
 
+// Handler returns the server's HTTP handler so callers (e.g. integration
+// tests) can mount the gateway on their own listener.
+func (s *Server) Handler() http.Handler { return s.mux }
+
+// SetTransport replaces the http.RoundTripper used for upstream proxy
+// dials.  Intended for integration tests that route hermes's outbound
+// traffic to an in-process upstream registry served over plain HTTP.
+func (s *Server) SetTransport(t http.RoundTripper) { s.transport = t }
+
 // ── OCI handler ───────────────────────────────────────────────────────────────
 
 func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
@@ -471,7 +480,8 @@ func (s *Server) challengeRetrieve(registry string, path string) string {
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-		Timeout: 5 * time.Second,
+		Timeout:   5 * time.Second,
+		Transport: s.transport,
 	}
 	resp, err := client.Get("https://" + upstream + "/v2/" + path)
 	if err != nil {
