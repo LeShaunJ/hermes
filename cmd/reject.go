@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -35,7 +34,7 @@ Examples:
 }
 
 func init() {
-	rejectCmd.Flags().StringVar(&rejectPlatform, "platform", "", "reject only this platform (os/arch, e.g. linux/amd64)")
+	addPlatformFlag(rejectCmd, &rejectPlatform, "reject")
 	rootCmd.AddCommand(rejectCmd)
 }
 
@@ -68,7 +67,7 @@ func runReject(_ *cobra.Command, args []string) error {
 		scope = fmt.Sprintf("%s/%s", images[0].OS, images[0].Arch)
 	}
 
-	answer, err := prompt(fmt.Sprintf(
+	answer, err := confirm(fmt.Sprintf(
 		"Reject %s/%s:%s (%s)? [YES / NO] (default: NO): ",
 		reg, repo, tag, scope,
 	))
@@ -76,7 +75,7 @@ func runReject(_ *cobra.Command, args []string) error {
 		return err
 	}
 
-	if strings.ToUpper(strings.TrimSpace(answer)) != "YES" {
+	if answer != "YES" {
 		fmt.Println("Cancelled.")
 		return nil
 	}

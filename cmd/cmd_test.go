@@ -18,20 +18,8 @@ import (
 
 // ── selectPlatform ────────────────────────────────────────────────────────────
 
-func makeImage(id int64, os, arch string, state db.State) *db.Image {
-	return &db.Image{
-		ID:        id,
-		OS:        os,
-		Arch:      arch,
-		State:     state,
-		Digest:    "sha256:abc" + arch,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-}
-
 func TestSelectPlatform_singleImage(t *testing.T) {
-	images := []*db.Image{makeImage(1, "linux", "amd64", db.StateQueued)}
+	images := []*db.Image{makeImg(1, "linux", "amd64", db.StateQueued)}
 	img, err := selectPlatform(images, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -43,8 +31,8 @@ func TestSelectPlatform_singleImage(t *testing.T) {
 
 func TestSelectPlatform_byPlatform(t *testing.T) {
 	images := []*db.Image{
-		makeImage(1, "linux", "amd64", db.StateQueued),
-		makeImage(2, "linux", "arm64", db.StateQueued),
+		makeImg(1, "linux", "amd64", db.StateQueued),
+		makeImg(2, "linux", "arm64", db.StateQueued),
 	}
 	img, err := selectPlatform(images, "linux/arm64")
 	if err != nil {
@@ -56,7 +44,7 @@ func TestSelectPlatform_byPlatform(t *testing.T) {
 }
 
 func TestSelectPlatform_platformNotFound(t *testing.T) {
-	images := []*db.Image{makeImage(1, "linux", "amd64", db.StateQueued)}
+	images := []*db.Image{makeImg(1, "linux", "amd64", db.StateQueued)}
 	_, err := selectPlatform(images, "linux/arm64")
 	if err == nil {
 		t.Error("expected error for missing platform, got nil")
@@ -65,8 +53,8 @@ func TestSelectPlatform_platformNotFound(t *testing.T) {
 
 func TestSelectPlatform_excludedState(t *testing.T) {
 	images := []*db.Image{
-		makeImage(1, "linux", "amd64", db.StateApproved),
-		makeImage(2, "linux", "arm64", db.StateQueued),
+		makeImg(1, "linux", "amd64", db.StateApproved),
+		makeImg(2, "linux", "arm64", db.StateQueued),
 	}
 	// amd64 is already approved — must not be selectable; arm64 auto-selected.
 	img, err := selectPlatform(images, "", db.StateApproved)
@@ -80,7 +68,7 @@ func TestSelectPlatform_excludedState(t *testing.T) {
 
 func TestSelectPlatform_allExcluded(t *testing.T) {
 	images := []*db.Image{
-		makeImage(1, "linux", "amd64", db.StateApproved),
+		makeImg(1, "linux", "amd64", db.StateApproved),
 	}
 	_, err := selectPlatform(images, "", db.StateApproved)
 	if err == nil {
@@ -90,7 +78,7 @@ func TestSelectPlatform_allExcluded(t *testing.T) {
 
 func TestSelectPlatform_excludedByFlag(t *testing.T) {
 	images := []*db.Image{
-		makeImage(1, "linux", "amd64", db.StateApproved),
+		makeImg(1, "linux", "amd64", db.StateApproved),
 	}
 	_, err := selectPlatform(images, "linux/amd64", db.StateApproved)
 	if err == nil {
@@ -131,9 +119,9 @@ func TestPrintJSON(t *testing.T) {
 
 func TestPlatformList(t *testing.T) {
 	images := []*db.Image{
-		makeImage(1, "linux", "amd64", db.StateQueued),
-		makeImage(2, "linux", "arm64", db.StateQueued),
-		makeImage(3, "windows", "amd64", db.StateQueued),
+		makeImg(1, "linux", "amd64", db.StateQueued),
+		makeImg(2, "linux", "arm64", db.StateQueued),
+		makeImg(3, "windows", "amd64", db.StateQueued),
 	}
 	got := platformList(images)
 	want := "linux/amd64, linux/arm64, windows/amd64"
@@ -162,8 +150,8 @@ func TestShortDigest(t *testing.T) {
 func TestSelectPlatform_multiPrompt_firstOption(t *testing.T) {
 	// Two selectable platforms → prompt; answer "1" selects first.
 	images := []*db.Image{
-		makeImage(1, "linux", "amd64", db.StateQueued),
-		makeImage(2, "linux", "arm64", db.StateQueued),
+		makeImg(1, "linux", "amd64", db.StateQueued),
+		makeImg(2, "linux", "arm64", db.StateQueued),
 	}
 	fakeStdin(t, "1")
 	img, err := selectPlatform(images, "")
@@ -177,8 +165,8 @@ func TestSelectPlatform_multiPrompt_firstOption(t *testing.T) {
 
 func TestSelectPlatform_multiPrompt_invalidAnswer(t *testing.T) {
 	images := []*db.Image{
-		makeImage(1, "linux", "amd64", db.StateQueued),
-		makeImage(2, "linux", "arm64", db.StateQueued),
+		makeImg(1, "linux", "amd64", db.StateQueued),
+		makeImg(2, "linux", "arm64", db.StateQueued),
 	}
 	fakeStdin(t, "99") // out of range
 	_, err := selectPlatform(images, "")
@@ -190,8 +178,8 @@ func TestSelectPlatform_multiPrompt_invalidAnswer(t *testing.T) {
 func TestSelectPlatform_multiPrompt_defaultFirst(t *testing.T) {
 	// Empty answer → default "1".
 	images := []*db.Image{
-		makeImage(1, "linux", "amd64", db.StateQueued),
-		makeImage(2, "linux", "arm64", db.StateQueued),
+		makeImg(1, "linux", "amd64", db.StateQueued),
+		makeImg(2, "linux", "arm64", db.StateQueued),
 	}
 	fakeStdin(t, "") // empty → default "1"
 	img, err := selectPlatform(images, "")
@@ -206,9 +194,9 @@ func TestSelectPlatform_multiPrompt_defaultFirst(t *testing.T) {
 func TestSelectPlatform_multiPrompt_withExcluded(t *testing.T) {
 	// One excluded (approved), two selectable.
 	images := []*db.Image{
-		makeImage(1, "linux", "amd64", db.StateApproved),
-		makeImage(2, "linux", "arm64", db.StateQueued),
-		makeImage(3, "windows", "amd64", db.StateQueued),
+		makeImg(1, "linux", "amd64", db.StateApproved),
+		makeImg(2, "linux", "arm64", db.StateQueued),
+		makeImg(3, "windows", "amd64", db.StateQueued),
 	}
 	fakeStdin(t, "2") // select second selectable (windows/amd64)
 	img, err := selectPlatform(images, "", db.StateApproved)

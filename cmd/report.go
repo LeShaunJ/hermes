@@ -38,7 +38,7 @@ Examples:
 }
 
 func init() {
-	reportCmd.Flags().StringVar(&reportPlatform, "platform", "", "platform to report on (os/arch, e.g. linux/amd64)")
+	addPlatformFlag(reportCmd, &reportPlatform, "report on")
 	reportCmd.Flags().StringVar(&reportFormat, "format", "table", "output format for trivy convert")
 	reportCmd.Flags().StringVar(&reportOutput, "output", "", "write output to FILE instead of stdout")
 	rootCmd.AddCommand(reportCmd)

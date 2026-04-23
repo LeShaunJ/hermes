@@ -46,7 +46,7 @@ Examples:
 func init() {
 	listCmd.Flags().StringArrayVar(&listStates, "state", nil, "filter by state or group (comma-separated or repeated)")
 	listCmd.Flags().BoolVar(&listJSON, "json", false, "output as JSON array")
-	listCmd.Flags().StringVar(&listPlatform, "platform", "", "filter by platform (os/arch, e.g. linux/amd64)")
+	addPlatformFlag(listCmd, &listPlatform, "filter by")
 	rootCmd.AddCommand(listCmd)
 }
 
@@ -131,17 +131,13 @@ func outputTable(images []db.Image) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(w, "REGISTRY\tREPOSITORY\tTAG\tOS\tARCH\tDIGEST\tSTATE\tUPDATED")
 	for _, img := range images {
-		digest := img.Digest
-		if len(digest) > 19 {
-			digest = digest[:19] // "sha256:" + 12 hex chars
-		}
 		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			img.RegistryURL,
 			img.Repository,
 			img.TagName,
 			dash(img.OS),
 			dash(img.Arch),
-			dash(digest),
+			dash(shortDigest(img.Digest)),
 			img.State,
 			img.UpdatedAt.Format("2006-01-02 15:04"),
 		)

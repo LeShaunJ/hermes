@@ -29,7 +29,7 @@ Examples:
 }
 
 func init() {
-	viewCmd.Flags().StringVar(&viewPlatform, "platform", "", "show only this platform (os/arch)")
+	addPlatformFlag(viewCmd, &viewPlatform, "show")
 	rootCmd.AddCommand(viewCmd)
 }
 

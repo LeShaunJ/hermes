@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -36,7 +35,7 @@ Examples:
 }
 
 func init() {
-	rescindCmd.Flags().StringVar(&rescindPlatform, "platform", "", "rescind only this platform (os/arch, e.g. linux/amd64)")
+	addPlatformFlag(rescindCmd, &rescindPlatform, "rescind")
 	rootCmd.AddCommand(rescindCmd)
 }
 
@@ -83,14 +82,14 @@ func runRescind(_ *cobra.Command, args []string) error {
 		target = img
 	}
 
-	answer, err := prompt(fmt.Sprintf(
+	answer, err := confirm(fmt.Sprintf(
 		"Rescind %s/%s:%s (%s/%s)? [YES / NO] (default: NO): ",
 		reg, repo, tag, target.OS, target.Arch,
 	))
 	if err != nil {
 		return err
 	}
-	if strings.ToUpper(strings.TrimSpace(answer)) != "YES" {
+	if answer != "YES" {
 		fmt.Println("Cancelled.")
 		return nil
 	}

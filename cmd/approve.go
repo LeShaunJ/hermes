@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -48,7 +47,7 @@ Examples:
 }
 
 func init() {
-	approveCmd.Flags().StringVar(&approvePlatform, "platform", "", "platform to approve (os/arch, e.g. linux/amd64)")
+	addPlatformFlag(approveCmd, &approvePlatform, "approve")
 	approveCmd.Flags().StringVar(&approveCache, "cache", "", "push image to this registry upon approval (uses cache_url from config if empty)")
 	approveCmd.Flags().Lookup("cache").NoOptDefVal = "__use_config__"
 	rootCmd.AddCommand(approveCmd)
@@ -124,12 +123,12 @@ func runApprove(cmd *cobra.Command, args []string) error {
 	fmt.Fprintln(os.Stderr)
 
 	// Prompt.
-	answer, err := prompt("Approve this image? [YES / NO / REJECT] (default: NO): ")
+	answer, err := confirm("Approve this image? [YES / NO / REJECT] (default: NO): ")
 	if err != nil {
 		return err
 	}
 
-	switch strings.ToUpper(strings.TrimSpace(answer)) {
+	switch answer {
 	case "YES":
 		// Push to cache if requested.
 		if cacheURL != "" {
@@ -168,19 +167,6 @@ func runApprove(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
-}
-
-// prompt writes the message to stderr and reads a line from stdin.
-func prompt(message string) (string, error) {
-	fmt.Fprint(os.Stderr, message)
-	scanner := bufio.NewScanner(os.Stdin)
-	if scanner.Scan() {
-		return scanner.Text(), nil
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-	return "", nil
 }
 
 // approveExecCommand is the constructor for external commands used by
