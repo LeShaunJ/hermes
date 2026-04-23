@@ -279,3 +279,19 @@ func ParseRef(imageRef string) (registry, repository, tag string, err error) {
 		t.TagStr(),
 		nil
 }
+
+// RefHasRegistry reports whether the given raw reference string includes an
+// explicit registry prefix.  A registry is detected using the standard Docker
+// heuristic: the first "/"-separated segment contains a "." or ":" or is
+// exactly "localhost".  This lets callers distinguish `myrepo:v1` (no
+// registry — go-containerregistry will default to docker.io) from
+// `example.com/myrepo:v1` (explicit registry) without re-implementing the
+// whole parser.
+func RefHasRegistry(imageRef string) bool {
+	i := strings.IndexByte(imageRef, '/')
+	if i < 0 {
+		return false
+	}
+	first := imageRef[:i]
+	return first == "localhost" || strings.ContainsAny(first, ".:")
+}

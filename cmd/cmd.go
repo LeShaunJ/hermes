@@ -22,6 +22,7 @@ type datastore interface {
 	LogEvent(imageID *int64, source db.EventSource, eventType string, details map[string]interface{}) error
 	List(f db.ListFilter) ([]db.Image, error)
 	GetByRef(ref db.ImageRef) ([]*db.Image, error)
+	FindRegistriesForRef(repository, tag string) ([]string, error)
 	Approve(imageID int64, cacheRegistry string) error
 	Reject(imageID int64) error
 	Rescind(imageID int64) error

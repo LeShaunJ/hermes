@@ -7,7 +7,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/leshaunj/hermes/internal/db"
-	"github.com/leshaunj/hermes/internal/oci"
 )
 
 var rejectPlatform string
@@ -41,11 +40,11 @@ func init() {
 }
 
 func runReject(_ *cobra.Command, args []string) error {
-	reg, repo, tag, err := oci.ParseRef(args[0])
+	ref, err := resolveRef(args[0], true)
 	if err != nil {
 		return err
 	}
-	ref := db.ImageRef{Registry: reg, Repository: repo, Tag: tag}
+	reg, repo, tag := ref.Registry, ref.Repository, ref.Tag
 
 	images, err := database.GetByRef(ref)
 	if err != nil {

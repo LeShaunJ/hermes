@@ -9,7 +9,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/leshaunj/hermes/internal/db"
-	"github.com/leshaunj/hermes/internal/oci"
 )
 
 var viewPlatform string
@@ -35,18 +34,17 @@ func init() {
 }
 
 func runView(_ *cobra.Command, args []string) error {
-	reg, repo, tag, err := oci.ParseRef(args[0])
+	ref, err := resolveRef(args[0], true)
 	if err != nil {
 		return err
 	}
-	ref := db.ImageRef{Registry: reg, Repository: repo, Tag: tag}
 
 	images, err := database.GetByRef(ref)
 	if err != nil {
 		return err
 	}
 	if len(images) == 0 {
-		return fmt.Errorf("image not found: %s/%s:%s", reg, repo, tag)
+		return fmt.Errorf("image not found: %s/%s:%s", ref.Registry, ref.Repository, ref.Tag)
 	}
 
 	// Filter by platform if requested.

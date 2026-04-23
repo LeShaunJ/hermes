@@ -242,6 +242,74 @@ func TestPrompt_emptyEOF(t *testing.T) {
 	}
 }
 
+// ── resolveRef ────────────────────────────────────────────────────────────────
+
+func TestResolveRef_explicitRegistryShortCircuits(t *testing.T) {
+	// Explicit registry — DB must not be consulted.
+	m := &mockDB{findRegistries: []string{"docker.io", "example.com"}}
+	database = m
+
+	ref, err := resolveRef("example.com/myrepo:v1.0", false)
+	if err != nil {
+		t.Fatalf("resolveRef: %v", err)
+	}
+	if ref.Registry != "example.com" || ref.Repository != "myrepo" || ref.Tag != "v1.0" {
+		t.Errorf("ref = %+v, want example.com/myrepo:v1.0", ref)
+	}
+}
+
+func TestResolveRef_unqualifiedSingleMatch(t *testing.T) {
+	m := &mockDB{findRegistries: []string{"example.com"}}
+	database = m
+
+	ref, err := resolveRef("myrepo:v1.0", true)
+	if err != nil {
+		t.Fatalf("resolveRef: %v", err)
+	}
+	if ref.Registry != "example.com" {
+		t.Errorf("registry = %q, want example.com", ref.Registry)
+	}
+}
+
+func TestResolveRef_unqualifiedMultiMatchPrompts(t *testing.T) {
+	m := &mockDB{findRegistries: []string{"docker.io", "example.com"}}
+	database = m
+	fakeStdin(t, "2")
+
+	ref, err := resolveRef("myrepo:v1.0", true)
+	if err != nil {
+		t.Fatalf("resolveRef: %v", err)
+	}
+	if ref.Registry != "example.com" {
+		t.Errorf("registry = %q, want example.com (second choice)", ref.Registry)
+	}
+}
+
+func TestResolveRef_unqualifiedNoMatchMustExist(t *testing.T) {
+	m := &mockDB{findRegistries: nil}
+	database = m
+
+	_, err := resolveRef("myrepo:v1.0", true)
+	if err == nil {
+		t.Error("expected not-found error when mustExist=true, got nil")
+	}
+}
+
+func TestResolveRef_unqualifiedNoMatchFallback(t *testing.T) {
+	// mustExist=false — fall back to oci.ParseRef's docker.io default.
+	m := &mockDB{findRegistries: nil}
+	database = m
+
+	ref, err := resolveRef("myrepo:v1.0", false)
+	if err != nil {
+		t.Fatalf("resolveRef: %v", err)
+	}
+	// oci.ParseRef normalises plain names to index.docker.io for docker.io.
+	if ref.Registry != "index.docker.io" {
+		t.Errorf("registry = %q, want index.docker.io fallback", ref.Registry)
+	}
+}
+
 // ── mock datastore ────────────────────────────────────────────────────────────
 
 type mockDB struct {
@@ -255,6 +323,10 @@ type mockDB struct {
 	approveErr  error
 	rejectErr   error
 	rescindErr  error
+
+	// FindRegistriesForRef behavior.
+	findRegistries    []string
+	findRegistriesErr error
 
 	// call captures — populated by the mock methods for tests to assert on.
 	listFilter    db.ListFilter
@@ -283,6 +355,9 @@ func (m *mockDB) List(f db.ListFilter) ([]db.Image, error) {
 	return m.listOut, m.listErr
 }
 func (m *mockDB) GetByRef(_ db.ImageRef) ([]*db.Image, error) { return m.images, m.getRefErr }
+func (m *mockDB) FindRegistriesForRef(_, _ string) ([]string, error) {
+	return m.findRegistries, m.findRegistriesErr
+}
 func (m *mockDB) Approve(id int64, cacheRegistry string) error {
 	m.approveIDs = append(m.approveIDs, id)
 	m.approveCaches = append(m.approveCaches, cacheRegistry)
@@ -1045,12 +1120,56 @@ func TestRunRescind_notApproved(t *testing.T) {
 
 func TestRunRescind_success(t *testing.T) {
 	img := makeImg(1, "linux", "amd64", db.StateApproved)
-	database = &mockDB{images: []*db.Image{img}}
+	m := &mockDB{images: []*db.Image{img}}
+	database = m
+	fakeStdin(t, "YES")
+
 	_ = captureStdout(t, func() {
 		if err := runRescind(rescindCmd, []string{"registry.example.com/myrepo:v1.0"}); err != nil {
 			t.Errorf("runRescind: %v", err)
 		}
 	})
+	if len(m.rescindIDs) != 1 || m.rescindIDs[0] != 1 {
+		t.Errorf("rescindIDs = %v, want [1]", m.rescindIDs)
+	}
+}
+
+func TestRunRescind_cancelled(t *testing.T) {
+	img := makeImg(1, "linux", "amd64", db.StateApproved)
+	m := &mockDB{images: []*db.Image{img}}
+	database = m
+	fakeStdin(t, "NO")
+
+	out := captureStdout(t, func() {
+		if err := runRescind(rescindCmd, []string{"registry.example.com/myrepo:v1.0"}); err != nil {
+			t.Errorf("runRescind cancelled: %v", err)
+		}
+	})
+	if !strings.Contains(out, "Cancelled") {
+		t.Errorf("expected Cancelled in output: %q", out)
+	}
+	if len(m.rescindIDs) != 0 {
+		t.Errorf("rescindIDs = %v, want empty", m.rescindIDs)
+	}
+}
+
+func TestRunRescind_autoSelectsSoleApproved(t *testing.T) {
+	// Two platforms, only one approved; rescind (no --platform) should pick
+	// the approved one without prompting for platform, and then confirm.
+	amd := makeImg(1, "linux", "amd64", db.StateApproved)
+	arm := makeImg(2, "linux", "arm64", db.StateScanned)
+	m := &mockDB{images: []*db.Image{amd, arm}}
+	database = m
+	fakeStdin(t, "YES")
+
+	_ = captureStdout(t, func() {
+		if err := runRescind(rescindCmd, []string{"registry.example.com/myrepo:v1.0"}); err != nil {
+			t.Errorf("runRescind auto-select: %v", err)
+		}
+	})
+	if len(m.rescindIDs) != 1 || m.rescindIDs[0] != 1 {
+		t.Errorf("rescindIDs = %v, want [1] (the approved amd64)", m.rescindIDs)
+	}
 }
 
 // ── runReject ─────────────────────────────────────────────────────────────────
@@ -1128,6 +1247,7 @@ func TestRunRescind_platformNarrows(t *testing.T) {
 	database = m
 	rescindPlatform = "linux/amd64"
 	t.Cleanup(func() { rescindPlatform = "" })
+	fakeStdin(t, "YES")
 
 	_ = captureStdout(t, func() {
 		if err := runRescind(rescindCmd, []string{"registry.example.com/myrepo:v1.0"}); err != nil {

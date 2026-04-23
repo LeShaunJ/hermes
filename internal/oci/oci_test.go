@@ -73,6 +73,31 @@ func TestParseRef(t *testing.T) {
 	}
 }
 
+// ── RefHasRegistry ────────────────────────────────────────────────────────────
+
+func TestRefHasRegistry(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"myapp", false},
+		{"myapp:v1", false},
+		{"myorg/myapp:v1", false},
+		{"example.com/myapp:v1", true},
+		{"example.com/myorg/myapp:v1", true},
+		{"example.com:5000/myapp:v1", true},
+		{"localhost/myapp:v1", true},
+		{"localhost:5000/myapp:v1", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := RefHasRegistry(tc.in); got != tc.want {
+				t.Errorf("RefHasRegistry(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // ── parseChallenge ────────────────────────────────────────────────────────────
 
 func TestParseChallenge(t *testing.T) {
