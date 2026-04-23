@@ -44,6 +44,9 @@ type mockStorage struct {
 	voidByBlobIDs   []int64
 	voidByBlobErr   error
 	voidByBlobCalls int
+
+	canonicalURL string // non-empty → CanonicalRegistryURL returns it
+	upstreamURL  string // non-empty → UpstreamRegistryURL returns it
 }
 
 func (m *mockStorage) GetApproved(_, _, _ string) (*db.Image, error) {
@@ -76,6 +79,18 @@ func (m *mockStorage) Void(imageID int64) error {
 func (m *mockStorage) VoidByBlob(_, _, _ string) ([]int64, error) {
 	m.voidByBlobCalls++
 	return m.voidByBlobIDs, m.voidByBlobErr
+}
+func (m *mockStorage) CanonicalRegistryURL(url string) (string, error) {
+	if m.canonicalURL != "" {
+		return m.canonicalURL, nil
+	}
+	return url, nil
+}
+func (m *mockStorage) UpstreamRegistryURL(url string) (string, error) {
+	if m.upstreamURL != "" {
+		return m.upstreamURL, nil
+	}
+	return url, nil
 }
 func (m *mockStorage) LogEvent(_ *int64, _ db.EventSource, _ string, _ map[string]interface{}) error {
 	return m.logEventErr
@@ -343,6 +358,33 @@ func TestServeOCI_approved_tag(t *testing.T) {
 	loc := rec.Header().Get("Location")
 	if loc == "" {
 		t.Error("Location header not set for approved redirect")
+	}
+}
+
+// TestServeOCI_approved_maskedAliasRedirects verifies that a request pulled
+// via a masked alias (e.g. /v2/registry-1.docker.io/...) redirects to the
+// concrete upstream even though the approved row is stored against the
+// canonical `docker.io`.  Canonical lookup matches the row; upstream
+// resolution picks the concrete child for the HTTPS redirect.
+func TestServeOCI_approved_maskedAliasRedirects(t *testing.T) {
+	img := makeTestImage(db.StateApproved)
+	store := &mockStorage{
+		approved:     img,
+		canonicalURL: "docker.io",            // alias → canonical for lookup
+		upstreamURL:  "registry-1.docker.io", // canonical → concrete for redirect
+	}
+	s := newMockServer(store, "http://localhost:8080", true)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry-1.docker.io/library/alpine/manifests/3.23.3", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Errorf("status = %d, want 307", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if loc == "" || !strings.HasPrefix(loc, "https://registry-1.docker.io/") {
+		t.Errorf("Location = %q, want https://registry-1.docker.io/...", loc)
 	}
 }
 

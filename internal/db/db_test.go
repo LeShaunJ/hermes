@@ -99,6 +99,70 @@ func TestUpsertRegistry_walksMask(t *testing.T) {
 	}
 }
 
+// ── CanonicalRegistryURL ──────────────────────────────────────────────────────
+
+func TestCanonicalRegistryURL_masked(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`WITH RECURSIVE chain AS`)).
+		WithArgs("registry-1.docker.io").
+		WillReturnRows(sqlmock.NewRows([]string{"url"}).AddRow("docker.io"))
+
+	got, err := d.CanonicalRegistryURL("registry-1.docker.io")
+	if err != nil {
+		t.Fatalf("CanonicalRegistryURL: %v", err)
+	}
+	if got != "docker.io" {
+		t.Errorf("got %q, want docker.io", got)
+	}
+}
+
+func TestCanonicalRegistryURL_unknownFallsBackToInput(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`WITH RECURSIVE chain AS`)).
+		WithArgs("quay.io").
+		WillReturnRows(sqlmock.NewRows([]string{"url"})) // no rows
+
+	got, err := d.CanonicalRegistryURL("quay.io")
+	if err != nil {
+		t.Fatalf("CanonicalRegistryURL unknown: %v", err)
+	}
+	if got != "quay.io" {
+		t.Errorf("got %q, want quay.io (input unchanged)", got)
+	}
+}
+
+// ── UpstreamRegistryURL ───────────────────────────────────────────────────────
+
+func TestUpstreamRegistryURL_canonicalPicksChild(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT child.url`)).
+		WithArgs("docker.io").
+		WillReturnRows(sqlmock.NewRows([]string{"url"}).AddRow("registry-1.docker.io"))
+
+	got, err := d.UpstreamRegistryURL("docker.io")
+	if err != nil {
+		t.Fatalf("UpstreamRegistryURL: %v", err)
+	}
+	if got != "registry-1.docker.io" {
+		t.Errorf("got %q, want registry-1.docker.io", got)
+	}
+}
+
+func TestUpstreamRegistryURL_concreteFallsBackToInput(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT child.url`)).
+		WithArgs("quay.io").
+		WillReturnRows(sqlmock.NewRows([]string{"url"})) // no rows
+
+	got, err := d.UpstreamRegistryURL("quay.io")
+	if err != nil {
+		t.Fatalf("UpstreamRegistryURL concrete: %v", err)
+	}
+	if got != "quay.io" {
+		t.Errorf("got %q, want quay.io (input unchanged)", got)
+	}
+}
+
 // ── upsertRepository ──────────────────────────────────────────────────────────
 
 func TestUpsertRepository(t *testing.T) {
