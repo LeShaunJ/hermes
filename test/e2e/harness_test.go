@@ -89,7 +89,7 @@ func newStack(t *testing.T, opts ...stackOption) *stack {
 	transport := &rewriteTransport{
 		base:   http.DefaultTransport,
 		scheme: "http",
-		from:   upstreamName,
+		from:   map[string]bool{upstreamName: true},
 		to:     upstreamReal,
 	}
 
@@ -146,24 +146,33 @@ func (s *stack) upstreamRef(repo, tag string) string {
 	return fmt.Sprintf("%s/%s:%s", s.upstreamName, repo, tag)
 }
 
-// rewriteTransport redirects requests whose Host equals `from` to `to`
-// under the given scheme.  Every other request passes through untouched,
-// so crane calls hermes directly while hermes's outbound calls to the
-// pseudo-host are transparently routed to the real httptest upstream.
+// rewriteTransport redirects requests whose Host matches any entry in
+// `from` to `to` under the given scheme.  Every other request passes
+// through untouched, so crane calls hermes directly while hermes's
+// outbound calls to the pseudo-host(s) are transparently routed to the
+// real httptest upstream.  Multi-host support lets tests exercise
+// registry-mask chains (docker.io / registry-1.docker.io).
 type rewriteTransport struct {
-	base         http.RoundTripper
-	scheme, from string
-	to           string
+	base   http.RoundTripper
+	scheme string
+	from   map[string]bool
+	to     string
 }
 
 func (rt *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Host == rt.from || req.Host == rt.from {
+	if rt.from[req.URL.Host] || rt.from[req.Host] {
 		req = req.Clone(req.Context())
 		req.URL.Scheme = rt.scheme
 		req.URL.Host = rt.to
 		req.Host = rt.to
 	}
 	return rt.base.RoundTrip(req)
+}
+
+// registerPseudoHost adds another name that rewriteTransport should map
+// onto the real upstream.  Safe to call before any test request runs.
+func (rt *rewriteTransport) registerPseudoHost(name string) {
+	rt.from[name] = true
 }
 
 // hostPortOf extracts "<host>:<port>" from a URL like "http://127.0.0.1:40123".
