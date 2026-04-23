@@ -16,8 +16,10 @@
 package e2e
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +28,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -258,17 +261,35 @@ func startPostgres(t *testing.T) *pgProcess {
 	if cred != nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	}
+	// Capture postgres stdout+stderr so startup failures surface in the
+	// test log instead of being swallowed.  Without this, a crash inside
+	// postgres (e.g. shm too small, bad locale, port taken) looks like a
+	// 20-second "connection refused" timeout with no diagnostic.
+	pgLog := &safeBuffer{}
+	cmd.Stdout = pgLog
+	cmd.Stderr = pgLog
+
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start postgres: %v", err)
 	}
+
+	// Watch for early exit so waitPGReady can short-circuit.
+	waitErrCh := make(chan error, 1)
+	go func() { waitErrCh <- cmd.Wait() }()
 	t.Cleanup(func() {
 		_ = cmd.Process.Signal(os.Interrupt)
-		_, _ = cmd.Process.Wait()
+		select {
+		case <-waitErrCh:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-waitErrCh
+		}
 	})
 
 	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=hermes dbname=postgres sslmode=disable", port)
-	if err := waitPGReady(dsn, 20*time.Second); err != nil {
-		t.Fatalf("postgres never became ready: %v", err)
+	if err := waitPGReady(dsn, 20*time.Second, waitErrCh); err != nil {
+		t.Fatalf("postgres never became ready: %v\npostgres binary: %s\npostgres log:\n%s",
+			err, postgres, pgLog.String())
 	}
 
 	runAs(t, cred, exec.Command(createdb, "-h", "127.0.0.1", "-p", fmt.Sprint(port), "-U", "hermes", "hermes"))
@@ -332,10 +353,19 @@ func resolvePGBin(t *testing.T, name string) string {
 	return ""
 }
 
-func waitPGReady(dsn string, timeout time.Duration) error {
+// waitPGReady pings dsn until postgres accepts a connection or until the
+// process exits (whichever comes first).  A crashed postgres returns a
+// dedicated error so callers can surface the captured log instead of
+// reporting only the generic connection-refused timeout.
+func waitPGReady(dsn string, timeout time.Duration, exited <-chan error) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-exited:
+			return fmt.Errorf("postgres exited before becoming ready: %v", err)
+		default:
+		}
 		conn, err := sql.Open("postgres", dsn)
 		if err == nil {
 			pingErr := conn.Ping()
@@ -351,6 +381,29 @@ func waitPGReady(dsn string, timeout time.Duration) error {
 	}
 	return fmt.Errorf("timed out: %w", lastErr)
 }
+
+// safeBuffer is a concurrency-safe io.Writer backed by bytes.Buffer.
+// postgres writes to stdout and stderr from separate goroutines inside
+// the stdlib exec wiring, so we need a lock around the buffer.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Ensure io import is used — safeBuffer satisfies io.Writer.
+var _ io.Writer = (*safeBuffer)(nil)
 
 func freePort() (int, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
