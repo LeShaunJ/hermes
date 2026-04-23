@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-flight runs when a PR receives a new push.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.7'
+          cache: true
+
+      - name: gofmt -l .
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "The following files need 'gofmt -s -w':"
+            echo "$out"
+            exit 1
+          fi
+
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  test:
+    name: unit + coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.7'
+          cache: true
+
+      - name: go test -race -cover
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -cover ./... | tee cover.log
+
+      - name: enforce per-package coverage ≥ 80%
+        shell: bash
+        run: |
+          awk '/^ok/ && /coverage:/ {
+            for (i=1; i<=NF; i++) if ($i == "coverage:") {
+              pct=$(i+1); gsub("%","",pct)
+              if (pct+0 < 80) { print "FAIL (<80%): " $0; fail=1 }
+            }
+          } END { exit fail }' cover.log
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.7'
+          cache: true
+
+      - name: install postgresql-16
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-16
+
+      - name: go test -tags e2e
+        run: go test -tags e2e -count=1 ./test/e2e/...
