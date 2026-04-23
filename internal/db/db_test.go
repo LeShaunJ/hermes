@@ -77,6 +77,28 @@ func TestUpsertRegistry_error(t *testing.T) {
 	}
 }
 
+// TestUpsertRegistry_walksMask verifies that the recursive CTE collapses a
+// masked alias onto its canonical root id.  The mock returns whatever the
+// CTE would produce — the real walk happens in Postgres — so here we just
+// assert the call shape, but the test name documents the intent and would
+// fail-loud if the query were ever regressed to the non-recursive form.
+func TestUpsertRegistry_walksMask(t *testing.T) {
+	d, mock := newMockDB(t)
+	// The recursive CTE returns one id column; for an index.docker.io
+	// alias the final id is docker.io's id (1), not the alias's own.
+	mock.ExpectQuery(regexp.QuoteMeta(`WITH RECURSIVE upserted AS`)).
+		WithArgs("index.docker.io").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
+
+	id, err := d.upsertRegistry("index.docker.io")
+	if err != nil {
+		t.Fatalf("upsertRegistry: %v", err)
+	}
+	if id != 1 {
+		t.Errorf("id = %d, want 1 (the mask root)", id)
+	}
+}
+
 // ── upsertRepository ──────────────────────────────────────────────────────────
 
 func TestUpsertRepository(t *testing.T) {

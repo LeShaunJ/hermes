@@ -366,14 +366,29 @@ func (d *DB) migrate() error {
 
 // ── internal helpers ──────────────────────────────────────────────────────────
 
-// upsertRegistry inserts a registry URL if absent and returns its id.
+// upsertRegistry inserts a registry URL if absent and returns its canonical
+// id — that is, if the row is a masked alias (e.g. index.docker.io or
+// registry-1.docker.io both seeded with mask = docker.io) the chain is
+// walked to the root so every call for any alias yields the same id.
+// Upstream fetches still use the caller's original URL; this only affects
+// storage/display identity.
 func (d *DB) upsertRegistry(url string) (int64, error) {
 	var id int64
 	err := d.db.QueryRow(`
-		INSERT INTO registries (url)
-		VALUES ($1)
-		ON CONFLICT (url) DO UPDATE SET updated_at = NOW()
-		RETURNING id`,
+		WITH RECURSIVE upserted AS (
+			INSERT INTO registries (url)
+			VALUES ($1)
+			ON CONFLICT (url) DO UPDATE SET updated_at = NOW()
+			RETURNING id, mask
+		),
+		chain AS (
+			SELECT id, mask FROM upserted
+			UNION ALL
+			SELECT r.id, r.mask
+			FROM registries r
+			JOIN chain c ON r.id = c.mask
+		)
+		SELECT id FROM chain WHERE mask IS NULL LIMIT 1`,
 		url,
 	).Scan(&id)
 	return id, err

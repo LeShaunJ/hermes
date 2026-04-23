@@ -549,6 +549,11 @@ hermes uses PostgreSQL and creates its tables automatically on first run via
 > 
 > `docker.io` is the registry the user will see in commands like `hermes list`,
 > when the actual registry is `registry-1.docker.io` or `index.docker.io`.
+> CLI operations also collapse masked aliases onto their canonical root
+> before writing anything, so `hermes approve docker.io/foo:v1`,
+> `hermes approve index.docker.io/foo:v1`, and
+> `hermes approve registry-1.docker.io/foo:v1` all target the same
+> (registry, repository, tag) row in the database.
 > Additionally, API requests to `/v2/docker.io/...` will resolve to
 > `/v2/registry-1.docker.io/...` (_the last of any rows with this mask_).
 
