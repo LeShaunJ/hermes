@@ -6,8 +6,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leshaunj/hermes/internal/db"
-	"github.com/leshaunj/hermes/internal/oci"
 	"github.com/leshaunj/hermes/internal/trivy"
 )
 
@@ -51,18 +49,17 @@ func runReport(_ *cobra.Command, args []string) error {
 		return err
 	}
 
-	reg, repo, tag, err := oci.ParseRef(args[0])
+	ref, err := resolveRef(args[0], true)
 	if err != nil {
 		return err
 	}
-	ref := db.ImageRef{Registry: reg, Repository: repo, Tag: tag}
 
 	images, err := database.GetByRef(ref)
 	if err != nil {
 		return err
 	}
 	if len(images) == 0 {
-		return fmt.Errorf("image not found: %s/%s:%s", reg, repo, tag)
+		return fmt.Errorf("image not found: %s/%s:%s", ref.Registry, ref.Repository, ref.Tag)
 	}
 
 	img, err := selectPlatform(images, reportPlatform)
@@ -72,7 +69,7 @@ func runReport(_ *cobra.Command, args []string) error {
 
 	if len(img.ScanReport) == 0 || string(img.ScanReport) == "null" {
 		return fmt.Errorf("no scan report available for %s/%s:%s %s/%s (state: %s)",
-			reg, repo, tag, img.OS, img.Arch, img.State)
+			ref.Registry, ref.Repository, ref.Tag, img.OS, img.Arch, img.State)
 	}
 
 	// json format — output the raw stored report directly.

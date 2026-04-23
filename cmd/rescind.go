@@ -2,11 +2,11 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/leshaunj/hermes/internal/db"
-	"github.com/leshaunj/hermes/internal/oci"
 )
 
 var rescindPlatform string
@@ -14,13 +14,17 @@ var rescindPlatform string
 var rescindCmd = &cobra.Command{
 	Use:   "rescind [--platform OS/ARCH] IMAGE",
 	Short: "Rescind approval for an OCI image tag",
-	Long: `rescind sets platform images for a previously approved IMAGE to the
-'rescinded' state, immediately preventing them from passing the API's
+	Long: `rescind sets a previously approved platform image for IMAGE to the
+'rescinded' state, immediately preventing it from passing the gateway's
 authorization check.
 
-Without --platform every platform for IMAGE must be in the 'approved' state
-and all of them are rescinded.  With --platform only the matching platform
-is rescinded; other platforms are left untouched.
+With --platform, only the matching platform is considered (and it must
+currently be approved).  Without --platform, hermes filters IMAGE to its
+approved platforms: if exactly one is approved it is selected automatically,
+and if several are approved you are prompted to pick one.
+
+You are asked to confirm before the rescind is recorded.  Enter YES to
+confirm; anything else cancels the operation.
 
 A rescinded image can be re-approved with 'hermes approve'.
 
@@ -37,11 +41,11 @@ func init() {
 }
 
 func runRescind(_ *cobra.Command, args []string) error {
-	reg, repo, tag, err := oci.ParseRef(args[0])
+	ref, err := resolveRef(args[0], true)
 	if err != nil {
 		return err
 	}
-	ref := db.ImageRef{Registry: reg, Repository: repo, Tag: tag}
+	reg, repo, tag := ref.Registry, ref.Repository, ref.Tag
 
 	images, err := database.GetByRef(ref)
 	if err != nil {
@@ -51,30 +55,51 @@ func runRescind(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("image not found: %s/%s:%s", reg, repo, tag)
 	}
 
-	// Narrow to a single platform when --platform is given.
+	var target *db.Image
 	if rescindPlatform != "" {
 		img, err := selectPlatform(images, rescindPlatform)
 		if err != nil {
 			return err
 		}
-		images = []*db.Image{img}
-	}
-
-	// Every target platform must currently be approved.
-	for _, img := range images {
 		if img.State != db.StateApproved {
 			return fmt.Errorf("platform %s/%s is %s, not approved — cannot rescind %s/%s:%s",
 				img.OS, img.Arch, img.State, reg, repo, tag)
 		}
-	}
-
-	for _, img := range images {
-		if err := database.Rescind(img.ID); err != nil {
+		target = img
+	} else {
+		approved := make([]*db.Image, 0, len(images))
+		for _, img := range images {
+			if img.State == db.StateApproved {
+				approved = append(approved, img)
+			}
+		}
+		if len(approved) == 0 {
+			return fmt.Errorf("no approved platforms for %s/%s:%s", reg, repo, tag)
+		}
+		img, err := selectPlatform(approved, "")
+		if err != nil {
 			return err
 		}
-		logEvent("rescind", img, nil)
+		target = img
 	}
 
-	fmt.Printf("rescinded  %s/%s:%s\n", reg, repo, tag)
+	answer, err := prompt(fmt.Sprintf(
+		"Rescind %s/%s:%s (%s/%s)? [YES / NO] (default: NO): ",
+		reg, repo, tag, target.OS, target.Arch,
+	))
+	if err != nil {
+		return err
+	}
+	if strings.ToUpper(strings.TrimSpace(answer)) != "YES" {
+		fmt.Println("Cancelled.")
+		return nil
+	}
+
+	if err := database.Rescind(target.ID); err != nil {
+		return err
+	}
+	logEvent("rescind", target, nil)
+
+	fmt.Printf("rescinded  %s/%s:%s  (%s/%s)\n", reg, repo, tag, target.OS, target.Arch)
 	return nil
 }

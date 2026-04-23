@@ -1141,6 +1141,56 @@ func (d *DB) GetRejected(registry, repository, tag string) (*Image, error) {
 	return scanImageRow(row)
 }
 
+// parseRefPattern splits "[registry/]repository[:tag]" into its three parts.
+// The Docker heuristic identifies a registry prefix: the first "/"-separated
+// segment must contain "." or ":", or be exactly "localhost".  All three
+// parts may be empty.
+func parseRefPattern(pattern string) (registry, repository, tag string) {
+	// Tag separator: the last ":" that comes after any "/".  Protects
+	// against registry-port colons (e.g. "example.com:5000/foo").
+	slash := strings.LastIndex(pattern, "/")
+	colon := strings.LastIndex(pattern, ":")
+	if colon > slash {
+		tag = pattern[colon+1:]
+		pattern = pattern[:colon]
+	}
+	if i := strings.IndexByte(pattern, '/'); i > 0 {
+		first := pattern[:i]
+		if first == "localhost" || strings.ContainsAny(first, ".:") {
+			return first, pattern[i+1:], tag
+		}
+	}
+	return "", pattern, tag
+}
+
+// FindRegistriesForRef returns the distinct registry URLs where the given
+// (repository, tag) pair is currently tracked.  Used by CLI commands to
+// disambiguate when the operator provides an unqualified ref that could
+// match images at multiple registries.  Results are sorted alphabetically.
+func (d *DB) FindRegistriesForRef(repository, tag string) ([]string, error) {
+	rows, err := d.db.Query(`
+		SELECT DISTINCT registry_url
+		FROM tag_image_rows
+		WHERE repository = $1 AND tag_name = $2
+		ORDER BY registry_url`,
+		repository, tag,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []string
+	for rows.Next() {
+		var url string
+		if err := rows.Scan(&url); err != nil {
+			return nil, err
+		}
+		out = append(out, url)
+	}
+	return out, rows.Err()
+}
+
 // ── list ──────────────────────────────────────────────────────────────────────
 
 // ListFilter specifies optional filters for List.
@@ -1185,25 +1235,30 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 	if len(f.Refs) > 0 {
 		var refConds []string
 		for _, r := range f.Refs {
-			tag := ""
-			if idx := strings.LastIndex(r, ":"); idx > 0 {
-				tag = r[idx+1:]
-				r = r[:idx]
-			}
-			if tag != "" {
-				refConds = append(refConds, fmt.Sprintf(
-					"(repository = $%d AND tag_name = $%d)",
-					argIdx, argIdx+1,
-				))
-				args = append(args, r, tag)
-				argIdx += 2
-			} else {
-				refConds = append(refConds, fmt.Sprintf("repository = $%d", argIdx))
-				args = append(args, r)
+			reg, repo, tag := parseRefPattern(r)
+			var parts []string
+			if reg != "" {
+				parts = append(parts, fmt.Sprintf("registry_url = $%d", argIdx))
+				args = append(args, reg)
 				argIdx++
 			}
+			if repo != "" {
+				parts = append(parts, fmt.Sprintf("repository = $%d", argIdx))
+				args = append(args, repo)
+				argIdx++
+			}
+			if tag != "" {
+				parts = append(parts, fmt.Sprintf("tag_name = $%d", argIdx))
+				args = append(args, tag)
+				argIdx++
+			}
+			if len(parts) > 0 {
+				refConds = append(refConds, "("+strings.Join(parts, " AND ")+")")
+			}
 		}
-		conditions = append(conditions, "("+strings.Join(refConds, " OR ")+")")
+		if len(refConds) > 0 {
+			conditions = append(conditions, "("+strings.Join(refConds, " OR ")+")")
+		}
 	}
 
 	where := ""

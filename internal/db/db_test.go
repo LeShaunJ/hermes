@@ -983,6 +983,87 @@ func TestList_withPlatformFilter_osOnly(t *testing.T) {
 	}
 }
 
+func TestList_withRefFilter_registryPrefix(t *testing.T) {
+	d, mock := newMockDB(t)
+	// "example.com/myorg/myapp:v1" → registry, repo, tag all bound.
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("example.com", "myorg/myapp", "v1").
+		WillReturnRows(testImageRow(42, "approved"))
+
+	imgs, err := d.List(ListFilter{Refs: []string{"example.com/myorg/myapp:v1"}})
+	if err != nil {
+		t.Fatalf("List registry-prefixed ref: %v", err)
+	}
+	if len(imgs) != 1 {
+		t.Errorf("len = %d, want 1", len(imgs))
+	}
+}
+
+// ── parseRefPattern ───────────────────────────────────────────────────────────
+
+func TestParseRefPattern(t *testing.T) {
+	cases := []struct {
+		in             string
+		reg, repo, tag string
+	}{
+		// No registry.
+		{"myapp", "", "myapp", ""},
+		{"myapp:v1", "", "myapp", "v1"},
+		{"myorg/myapp:v1", "", "myorg/myapp", "v1"},
+		// Registry with "." → detected.
+		{"example.com/myapp:v1", "example.com", "myapp", "v1"},
+		{"example.com/myorg/myapp:v1", "example.com", "myorg/myapp", "v1"},
+		{"example.com/myapp", "example.com", "myapp", ""},
+		// Registry with port (colon).
+		{"example.com:5000/myapp:v1", "example.com:5000", "myapp", "v1"},
+		// localhost special case.
+		{"localhost/myapp:v1", "localhost", "myapp", "v1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			reg, repo, tag := parseRefPattern(tc.in)
+			if reg != tc.reg || repo != tc.repo || tag != tc.tag {
+				t.Errorf("parseRefPattern(%q) = (%q, %q, %q), want (%q, %q, %q)",
+					tc.in, reg, repo, tag, tc.reg, tc.repo, tc.tag)
+			}
+		})
+	}
+}
+
+// ── FindRegistriesForRef ──────────────────────────────────────────────────────
+
+func TestFindRegistriesForRef(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT registry_url`)).
+		WithArgs("myrepo", "v1.0").
+		WillReturnRows(sqlmock.NewRows([]string{"registry_url"}).
+			AddRow("docker.io").
+			AddRow("example.com"))
+
+	got, err := d.FindRegistriesForRef("myrepo", "v1.0")
+	if err != nil {
+		t.Fatalf("FindRegistriesForRef: %v", err)
+	}
+	if len(got) != 2 || got[0] != "docker.io" || got[1] != "example.com" {
+		t.Errorf("got %v, want [docker.io example.com]", got)
+	}
+}
+
+func TestFindRegistriesForRef_empty(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT registry_url`)).
+		WithArgs("unknown", "v1").
+		WillReturnRows(sqlmock.NewRows([]string{"registry_url"}))
+
+	got, err := d.FindRegistriesForRef("unknown", "v1")
+	if err != nil {
+		t.Fatalf("FindRegistriesForRef empty: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v, want empty", got)
+	}
+}
+
 // ── QueueStub ─────────────────────────────────────────────────────────────────
 
 func TestQueueStub_newTag(t *testing.T) {

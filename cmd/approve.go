@@ -55,13 +55,11 @@ func init() {
 }
 
 func runApprove(cmd *cobra.Command, args []string) error {
-	imageRef := args[0]
-
-	reg, repo, tag, err := oci.ParseRef(imageRef)
+	ref, err := resolveRef(args[0], false)
 	if err != nil {
 		return err
 	}
-	ref := db.ImageRef{Registry: reg, Repository: repo, Tag: tag}
+	reg, repo, tag := ref.Registry, ref.Repository, ref.Tag
 
 	// Resolve cache URL.
 	cacheURL := ""
@@ -73,7 +71,7 @@ func runApprove(cmd *cobra.Command, args []string) error {
 	}
 
 	// Queue the image (fetches manifests if new).
-	fmt.Fprintf(os.Stderr, "Queuing %s...\n", imageRef)
+	fmt.Fprintf(os.Stderr, "Queuing %s/%s:%s...\n", reg, repo, tag)
 	images, err := database.Queue(ref, oci.NewDefaultClient())
 	if err != nil {
 		return fmt.Errorf("queue image: %w", err)
@@ -90,7 +88,7 @@ func runApprove(cmd *cobra.Command, args []string) error {
 		len(img.ScanReport) == 0 || string(img.ScanReport) == "null"
 
 	if needsScan {
-		scanRef := imageRef
+		scanRef := fmt.Sprintf("%s/%s:%s", reg, repo, tag)
 		if img.Digest != "" {
 			scanRef = fmt.Sprintf("%s/%s@%s", reg, repo, img.Digest)
 		}
@@ -136,7 +134,7 @@ func runApprove(cmd *cobra.Command, args []string) error {
 		// Push to cache if requested.
 		if cacheURL != "" {
 			// Build digest-pinned source ref for docker push.
-			pushSrc := imageRef
+			pushSrc := fmt.Sprintf("%s/%s:%s", reg, repo, tag)
 			if img.Digest != "" {
 				pushSrc = fmt.Sprintf("%s/%s@%s", reg, repo, img.Digest)
 			}

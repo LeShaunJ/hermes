@@ -49,14 +49,14 @@ func init() {
 func runScan(_ *cobra.Command, args []string) error {
 	imageRef := args[0]
 
-	reg, repo, tag, err := oci.ParseRef(imageRef)
+	ref, err := resolveRef(imageRef, false)
 	if err != nil {
 		return err
 	}
-	ref := db.ImageRef{Registry: reg, Repository: repo, Tag: tag}
+	reg, repo, tag := ref.Registry, ref.Repository, ref.Tag
 
 	// Ensure the image is in the DB (fetches manifests if new).
-	fmt.Fprintf(os.Stderr, "Queuing %s...\n", imageRef)
+	fmt.Fprintf(os.Stderr, "Queuing %s/%s:%s...\n", reg, repo, tag)
 	images, err := database.Queue(ref, oci.NewDefaultClient())
 	if err != nil {
 		return fmt.Errorf("queue image: %w", err)
@@ -75,7 +75,7 @@ func runScan(_ *cobra.Command, args []string) error {
 	}
 
 	// Build the digest-pinned ref for trivy so it scans the exact platform image.
-	scanRef := imageRef
+	scanRef := fmt.Sprintf("%s/%s:%s", reg, repo, tag)
 	if img.Digest != "" {
 		scanRef = fmt.Sprintf("%s/%s@%s", reg, repo, img.Digest)
 	}
@@ -98,6 +98,61 @@ func runScan(_ *cobra.Command, args []string) error {
 
 	logEvent("scan", img, map[string]interface{}{"digest": img.Digest})
 	return printScanReport(os.Stdout, img.ScanReport)
+}
+
+// ── ref resolution ────────────────────────────────────────────────────────────
+
+// resolveRef parses imageRef and picks the right registry.  When the operator
+// explicitly included a registry prefix (as detected by oci.RefHasRegistry),
+// the reference is used as-is.  Otherwise the DB is queried for every
+// registry currently hosting (repository, tag) so the command can act on the
+// one the operator meant rather than silently defaulting to docker.io:
+//
+//   - 0 matches — if mustExist, error out; otherwise fall back to the default
+//     registry so scan/approve can still queue a brand-new image from Docker
+//     Hub.
+//   - 1 match  — use that registry.
+//   - >1 match — prompt the operator to choose.
+func resolveRef(imageRef string, mustExist bool) (db.ImageRef, error) {
+	reg, repo, tag, err := oci.ParseRef(imageRef)
+	if err != nil {
+		return db.ImageRef{}, err
+	}
+	if oci.RefHasRegistry(imageRef) {
+		return db.ImageRef{Registry: reg, Repository: repo, Tag: tag}, nil
+	}
+
+	regs, err := database.FindRegistriesForRef(repo, tag)
+	if err != nil {
+		return db.ImageRef{}, fmt.Errorf("resolve registry: %w", err)
+	}
+	switch len(regs) {
+	case 0:
+		if mustExist {
+			return db.ImageRef{}, fmt.Errorf("image not found: %s:%s", repo, tag)
+		}
+		return db.ImageRef{Registry: reg, Repository: repo, Tag: tag}, nil
+	case 1:
+		return db.ImageRef{Registry: regs[0], Repository: repo, Tag: tag}, nil
+	}
+
+	fmt.Fprintf(os.Stderr, "Multiple registries host %s:%s:\n", repo, tag)
+	for i, r := range regs {
+		fmt.Fprintf(os.Stderr, "  [%d] %s\n", i+1, r)
+	}
+	answer, err := prompt("Select registry [1]: ")
+	if err != nil {
+		return db.ImageRef{}, err
+	}
+	answer = strings.TrimSpace(answer)
+	if answer == "" {
+		answer = "1"
+	}
+	idx := 0
+	if _, err := fmt.Sscan(answer, &idx); err != nil || idx < 1 || idx > len(regs) {
+		return db.ImageRef{}, fmt.Errorf("invalid selection %q", answer)
+	}
+	return db.ImageRef{Registry: regs[idx-1], Repository: repo, Tag: tag}, nil
 }
 
 // ── platform selection ────────────────────────────────────────────────────────

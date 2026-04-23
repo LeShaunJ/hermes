@@ -271,6 +271,16 @@ Environment variables prefixed with `HERMES_` override file values (e.g.
 
 All CLI commands accept `--config <path>` (default: `/etc/hermes.yaml`).
 
+Every command that takes an `IMAGE` argument accepts the form
+`[<registry>/][<namespace>/]<name>:<tag>`.  The registry prefix is detected
+using the standard Docker heuristic — the first segment must contain `.`,
+`:`, or be exactly `localhost`.  When no registry is supplied, hermes looks
+across its database for every registry currently hosting that
+`<name>[:<tag>]`: if exactly one matches it is used automatically, if several
+match you are prompted to pick one, and if none match hermes falls back to
+`docker.io` (so `hermes scan`/`hermes approve` can still queue a brand-new
+image from Docker Hub).
+
 ### scan
 
 ```
@@ -334,7 +344,11 @@ hermes rescind [--platform OS/ARCH] IMAGE
 ```
 
 Sets an `approved` image to `rescinded`, immediately blocking it from passing
-the gateway check. The image can be re-approved with `hermes approve`.
+the gateway check.  Without `--platform` hermes filters IMAGE to its approved
+platforms: if exactly one is approved it is selected automatically, and if
+several are approved you are prompted to pick one.  You are then asked to
+confirm before the rescind is recorded.  The image can be re-approved with
+`hermes approve`.
 
 > ```bash
 > hermes rescind registry.example.com/myapp:v1.2.3
@@ -378,7 +392,10 @@ hermes list [--platform OS/ARCH] [--state STATE[,...]] [--json] [REF ...]
 Lists tracked images in a table. `--state` accepts individual states
 (`queued`, `scanned`, `approved`, `rescinded`, `rejected`, `errored`) or group
 names (`pending`, `verified`). Multiple values can be comma-separated or given
-as repeated flags. `REF` arguments filter by `[namespace/]name[:tag]`.
+as repeated flags. `REF` arguments filter by
+`[<registry>/][<namespace>/]<name>[:<tag>]`; the registry prefix is detected
+using the standard Docker heuristic (first segment contains `.`, `:`, or is
+`localhost`).
 
 Images that have been stub-registered (seen at the gateway but not yet scanned)
 show `-` for OS, arch, and digest.
@@ -389,6 +406,7 @@ show `-` for OS, arch, and digest.
 > hermes list --platform linux/amd64 --state pending
 > hermes list --state verified --json
 > hermes list myapp:v1.2.3 otherapp
+> hermes list registry.example.com/myapp:v1.2.3
 > ```
 
 ### report
