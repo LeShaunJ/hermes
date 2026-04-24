@@ -1,5 +1,10 @@
 # Contributing
 
+> [!TIP]
+> _This project defines some [`ops`] actions for development convenience._
+> _Installing it is optional, but any `ops.yaml` files defined are representative_
+> _of the expected development environment._
+
 ## Quick-Start
 
 The `dev/` directory contains a ready-to-use Compose stack with hermes,
@@ -29,6 +34,9 @@ DOCKER_HOST=tcp://localhost:8888 docker pull registry.example.com/myapp:v1.2.3
 
     <!-- list of commit titles only; nest breaking changes if needed -->
     ```
+    > [!TIP]
+    > _If you're using [`ops`], run `ops changelog` to auto-generate a description. If not,_
+    > _see [`ops.yaml#/actions/changelog/command`](ops.yaml) for the direct command._
 - **Commits:** Follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
   - Plan your [changes](https://github.com/angular/angular/blob/22b96b9/CONTRIBUTING.md#type):
     | type | purpose |
@@ -43,26 +51,24 @@ DOCKER_HOST=tcp://localhost:8888 docker pull registry.example.com/myapp:v1.2.3
     | `style` | Changes that do not affect the meaning of the code. |
     | `test` | Adding missing tests or correcting existing tests. |
   - Scope changes where appropriate (ie: `refactor(cmd/approve): ...`)
+  - Add commit bodies if more context is needed; but keep them short, we don't need novels.
 
 ## Development
 
 - Adhere to [Go Proverbs](https://go-proverbs.github.io).
 - Always run `gofmt -s -w` on all `.go` files before committing.
-- Be sure to line (_ie: `golangci-lint run`_).
-- Ensure appropriate tests exist for all `.go` files.
-- Ensure `README.md` and `doc/*` are up-to-date.
-- Unit tests run with `go test ./...`; end-to-end tests (real Postgres
-  + in-process OCI registry + `crane.Pull` through hermes) live under
-  `test/e2e/` and run with `go test -tags e2e ./test/e2e/...`.
-  Postgres is sourced one of two ways:
-  - If a Docker-compatible daemon is reachable (Docker Desktop, Colima,
-    Rancher Desktop, `podman` with docker-compat socket, `dockerd`, …),
-    `testcontainers-go` starts `postgres:16-alpine` per test.
-  - Otherwise the suite falls back to a local Postgres addressed by the
-    same `HERMES_DB_*` env vars the CLI honours (defaults:
-    `localhost:5432`, user/pass/db `hermes`, `sslmode=disable`). Set
-    `HERMES_E2E_DSN=1` to force this path even when Docker is present.
-    Each test creates and drops its own `hermes_e2e_…` database.
-  A Postgres that can't be reached makes the suite **fail** — it never
-  silently skips, so broken-daemon CI runs don't pass as green. The
-  `postgres:16-alpine` image is pulled on first container run.
+  > [!TIP]
+  > _If you're using [`ops`], you can run `ops format`._
+- Be sure to lint before committing.
+  > [!TIP]
+  > _If you're using [`ops`], you can run `ops lint`._
+- Ensure appropriate tests exist for all `.go` files and major e2e scenarios.
+  - Ensure unit tests pass.
+    > [!TIP]
+    > _If you're using [`ops`], you can run `ops test-units`._
+  - Ensure end-to-end tests pass.
+    > [!TIP]
+    > _If you're using [`ops`], you can run `ops test-e2e`._
+- Ensure `README.md` and `docs/*` are up-to-date.
+
+[`ops`]: https://github.com/nickthecook/crops

@@ -1,17 +1,41 @@
 ---
+dependencies:
+  apt:
+    - golang-go
+  brew:
+    - go
+  custom:
+    - Golang-Lint:
+        up: curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b "${GOPATH?}/bin" v2.11.4
+        down: 'true'
 forwards:
   dev: dev
-actions: 
+actions:
+  all:
+    command: (ops format && ops build && ops lint && ops test) >&2 && ops changelog
+    description: perform all pre-merge tasks
   build:
     command: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o . .
     description: build `hermes` binary
+  changelog:
+    command: >-
+      printf '%s\n' "### Changelog" ""
+      "$(git log main..HEAD --pretty="tformat:- %s (%h)%n%w(0,2,2)%b%-")"
+    description: print the current changelog
+  format:
+    command: gofmt -s -w .
+  lint:
+    command: golangci-lint run
   test:
     command: ops test-units && ops test-e2e
     description: run all tests
   test-units:
-    command: go test -cover $(find . -type f -name '*_test.go' -exec dirname {} \; | uniq)
+    command: go test -cover $(find . -type f -name '*_test.go' -not -path '*/e2e/*' -exec dirname {} \; | uniq)
     description: run unit tests
   test-e2e:
     command: go test -tags e2e -count=1 -v ./test/e2e/...
     description: run end-to-end tests
+options:
+  environment: 
+    GOPATH: "$(go env GOPATH)"
 ...
