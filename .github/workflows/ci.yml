@@ -12,10 +12,12 @@ concurrency:
 
 permissions:
   contents: read
+  checks: write
+  pull-requests: write
 
 jobs:
   lint:
-    name: lint
+    name: Lint
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -36,10 +38,20 @@ jobs:
 
       - uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          version: v1.62
+          args: --out-format=colored-line-number,junit-xml:golangci.xml
+
+      - name: publish lint annotations
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: golangci.xml
+          check_name: lint
+          require_tests: false
+          annotate_only: true
 
   test:
-    name: unit + coverage
+    name: Units & Coverage
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -49,11 +61,15 @@ jobs:
           go-version: '1.24.7'
           cache: true
 
+      - name: install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
       - name: go test -race -cover
         shell: bash
         run: |
           set -o pipefail
-          go test -race -count=1 -cover ./... | tee cover.log
+          gotestsum --junitfile=unit.xml --format=pkgname -- \
+            -race -count=1 -cover ./... | tee cover.log
 
       - name: enforce per-package coverage ≥ 80%
         shell: bash
@@ -65,8 +81,16 @@ jobs:
             }
           } END { exit fail }' cover.log
 
+      - name: publish unit test annotations
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: unit.xml
+          check_name: unit
+          annotate_only: true
+
   e2e:
-    name: e2e
+    name: E2E
     runs-on: ubuntu-24.04
     # GitHub's ubuntu-24.04 runners ship with Docker pre-installed and
     # the daemon running, so testcontainers-go's postgres module can
@@ -79,5 +103,16 @@ jobs:
           go-version: '1.24.7'
           cache: true
 
+      - name: install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
       - name: go test -tags e2e
-        run: go test -tags e2e -count=1 ./test/e2e/...
+        run: gotestsum --junitfile=e2e.xml --format=pkgname -- -tags e2e -count=1 ./test/e2e/...
+
+      - name: publish e2e test annotations
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: e2e.xml
+          check_name: e2e
+          annotate_only: true
