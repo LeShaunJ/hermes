@@ -24,7 +24,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24.7'
+          go-version: '1.25.3'
           cache: true
 
       - name: gofmt -l .
@@ -36,10 +36,9 @@ jobs:
             exit 1
           fi
 
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v9
         with:
-          version: v1.62
-          args: --out-format=colored-line-number,junit-xml:golangci.xml
+          args: --output.text.path=stdout --output.text.colors=true --output.junit-xml.path=golangci.xml
 
       - name: publish lint annotations
         uses: mikepenz/action-junit-report@v4
@@ -58,7 +57,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24.7'
+          go-version: '1.25.3'
           cache: true
 
       - name: install gotestsum
@@ -100,7 +99,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24.7'
+          go-version: '1.25.3'
           cache: true
 
       - name: install gotestsum
