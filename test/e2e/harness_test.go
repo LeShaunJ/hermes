@@ -83,39 +83,48 @@ func newStack(t *testing.T, opts ...stackOption) *stack {
 
 	ctx := context.Background()
 
-	const (
-		pgUser     = "hermes"
-		pgPassword = "hermes"
-		pgDatabase = "hermes"
+	var (
+		pgContainer                               *postgres.PostgresContainer
+		dsn, host, pgUser, pgPassword, pgDatabase string
+		pgPort                                    int
 	)
 
-	pgContainer, err := postgres.Run(ctx,
-		"postgres:16-alpine",
-		postgres.WithDatabase(pgDatabase),
-		postgres.WithUsername(pgUser),
-		postgres.WithPassword(pgPassword),
-		testcontainers.WithWaitStrategy(
-			tcwait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(30*time.Second),
-		),
-	)
-	if err != nil {
-		t.Skipf("postgres container: %v (is Docker/Podman running?)", err)
-	}
-	t.Cleanup(func() { _ = testcontainers.TerminateContainer(pgContainer) })
+	if dockerReachable() {
+		const (
+			user = "hermes"
+			pass = "hermes"
+			name = "hermes"
+		)
+		c, err := postgres.Run(ctx,
+			"postgres:16-alpine",
+			postgres.WithDatabase(name),
+			postgres.WithUsername(user),
+			postgres.WithPassword(pass),
+			testcontainers.WithWaitStrategy(
+				tcwait.ForLog("database system is ready to accept connections").
+					WithOccurrence(2).
+					WithStartupTimeout(30*time.Second),
+			),
+		)
+		if err != nil {
+			t.Fatalf("postgres container: %v", err)
+		}
+		t.Cleanup(func() { _ = testcontainers.TerminateContainer(c) })
 
-	dsn, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("connection string: %v", err)
-	}
-	host, err := pgContainer.Host(ctx)
-	if err != nil {
-		t.Fatalf("container host: %v", err)
-	}
-	mapped, err := pgContainer.MappedPort(ctx, "5432/tcp")
-	if err != nil {
-		t.Fatalf("mapped port: %v", err)
+		if dsn, err = c.ConnectionString(ctx, "sslmode=disable"); err != nil {
+			t.Fatalf("connection string: %v", err)
+		}
+		if host, err = c.Host(ctx); err != nil {
+			t.Fatalf("container host: %v", err)
+		}
+		mapped, err := c.MappedPort(ctx, "5432/tcp")
+		if err != nil {
+			t.Fatalf("mapped port: %v", err)
+		}
+		pgContainer, pgPort = c, mapped.Int()
+		pgUser, pgPassword, pgDatabase = user, pass, name
+	} else {
+		host, pgPort, pgUser, pgPassword, pgDatabase, dsn = startLocalPG(t)
 	}
 
 	d, err := db.Open(dsn)
@@ -168,7 +177,7 @@ func newStack(t *testing.T, opts ...stackOption) *stack {
 		upstreamReal: upstreamReal,
 		transport:    transport,
 		pgHost:       host,
-		pgPort:       mapped.Int(),
+		pgPort:       pgPort,
 		pgUser:       pgUser,
 		pgPassword:   pgPassword,
 		pgDatabase:   pgDatabase,

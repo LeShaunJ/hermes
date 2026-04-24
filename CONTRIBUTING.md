@@ -52,10 +52,17 @@ DOCKER_HOST=tcp://localhost:8888 docker pull registry.example.com/myapp:v1.2.3
 - Ensure appropriate tests exist for all `.go` files.
 - Ensure `README.md` and `doc/*` are up-to-date.
 - Unit tests run with `go test ./...`; end-to-end tests (real Postgres
-  via `testcontainers-go` + in-process OCI registry + `crane.Pull`
-  through hermes) live under `test/e2e/` and run with
-  `go test -tags e2e ./test/e2e/...`.  They require a Docker-compatible
-  daemon (Docker Desktop, Colima, Rancher Desktop, `podman` with the
-  docker-compat socket, `dockerd`, etc.); the suite skips cleanly when
-  none is reachable.  The `postgres:16-alpine` image is pulled on
-  first run and cached thereafter.
+  + in-process OCI registry + `crane.Pull` through hermes) live under
+  `test/e2e/` and run with `go test -tags e2e ./test/e2e/...`.
+  Postgres is sourced one of two ways:
+  - If a Docker-compatible daemon is reachable (Docker Desktop, Colima,
+    Rancher Desktop, `podman` with docker-compat socket, `dockerd`, …),
+    `testcontainers-go` starts `postgres:16-alpine` per test.
+  - Otherwise the suite falls back to a local Postgres addressed by the
+    same `HERMES_DB_*` env vars the CLI honours (defaults:
+    `localhost:5432`, user/pass/db `hermes`, `sslmode=disable`). Set
+    `HERMES_E2E_DSN=1` to force this path even when Docker is present.
+    Each test creates and drops its own `hermes_e2e_…` database.
+  A Postgres that can't be reached makes the suite **fail** — it never
+  silently skips, so broken-daemon CI runs don't pass as green. The
+  `postgres:16-alpine` image is pulled on first container run.
