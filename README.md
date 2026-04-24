@@ -526,6 +526,33 @@ Returns `ok\n` with status `200`. Used as a container liveness probe.
 hermes uses PostgreSQL and creates its tables automatically on first run via
 `hermes serve`.
 
+The schema separates **content** (manifest body, blobs, scan report, approval
+state, cache registry — all keyed on manifest digest) from **location /
+provenance** (which `(registry, repository)` and which `tags` have served a
+given digest).  Because a manifest's digest uniquely identifies its bytes,
+every scan, approval verdict, and cache target is stored once per digest and
+shared by every location that hosts it.
+
+```mermaid
+---
+title: Hermes ERD
+config:
+  layout: elk
+---
+erDiagram
+  registries      ||--o{ repositories    : "scopes"
+  repositories    ||--o{ tags            : "holds"
+  repositories    ||--o{ images          : "holds"
+  manifests       ||--o{ tags            : "top-level ref"
+  manifests       ||--o{ images          : "observed at"
+  manifests       ||--o{ manifest_blobs  : "references"
+  blobs           ||--o{ manifest_blobs  : "appears in"
+  tags            ||--o{ tag_images      : "links"
+  images          ||--o{ tag_images      : "links"
+  images          ||--o{ events          : "audited by"
+  registries      ||--o{ manifests       : "cached at (optional)"
+```
+
 ### `registries`
 
 | Column       | Type          | Description |
@@ -556,28 +583,6 @@ hermes uses PostgreSQL and creates its tables automatically on first run via
 > (registry, repository, tag) row in the database.
 > Additionally, API requests to `/v2/docker.io/...` will resolve to
 > `/v2/registry-1.docker.io/...` (_the last of any rows with this mask_).
-
-The schema separates **content** (manifest body, blobs, scan report, approval
-state, cache registry — all keyed on manifest digest) from **location /
-provenance** (which `(registry, repository)` and which `tags` have served a
-given digest).  Because a manifest's digest uniquely identifies its bytes,
-every scan, approval verdict, and cache target is stored once per digest and
-shared by every location that hosts it.
-
-```mermaid
-erDiagram
-  registries      ||--o{ repositories    : "scopes"
-  repositories    ||--o{ tags            : "holds"
-  repositories    ||--o{ images          : "holds"
-  manifests       ||--o{ tags            : "top-level ref"
-  manifests       ||--o{ images          : "observed at"
-  manifests       ||--o{ manifest_blobs  : "references"
-  blobs           ||--o{ manifest_blobs  : "appears in"
-  tags            ||--o{ tag_images      : "links"
-  images          ||--o{ tag_images      : "links"
-  images          ||--o{ events          : "audited by"
-  registries      ||--o{ manifests       : "cached at (optional)"
-```
 
 ### `repositories`
 

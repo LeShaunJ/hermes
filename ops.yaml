@@ -6,6 +6,12 @@ actions:
     command: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o . .
     description: build `hermes` binary
   test:
+    command: ops test-units && ops test-e2e
+    description: run all tests
+  test-units:
     command: go test -cover $(find . -type f -name '*_test.go' -exec dirname {} \; | uniq)
-    description: run tests
+    description: run unit tests
+  test-e2e:
+    command: go test -tags e2e -count=1 -v ./test/e2e/...
+    description: run end-to-end tests
 ...
