@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -34,6 +35,16 @@ import (
 	"github.com/leshaunj/hermes/internal/config"
 	"github.com/leshaunj/hermes/internal/db"
 )
+
+// Disable testcontainers-go's Ryuk reaper sidecar.  Ryuk tries to attach
+// to a Docker network literally named `bridge`, which doesn't exist on
+// Colima, rootless Docker, and some podman setups — those environments
+// error out with "network not found" before the real container even
+// starts.  Our t.Cleanup callbacks already terminate containers on test
+// exit, so we only lose the belt-and-suspenders guarantee that a
+// SIGKILL-ed test process won't leak containers; `docker container
+// prune` mops any up after an unclean shutdown.
+func init() { _ = os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true") }
 
 // stack bundles every live dependency a test needs.
 type stack struct {
