@@ -51,3 +51,11 @@ DOCKER_HOST=tcp://localhost:8888 docker pull registry.example.com/myapp:v1.2.3
 - Be sure to line (_ie: `golangci-lint run`_).
 - Ensure appropriate tests exist for all `.go` files.
 - Ensure `README.md` and `doc/*` are up-to-date.
+- Unit tests run with `go test ./...`; end-to-end tests (real Postgres
+  via `testcontainers-go` + in-process OCI registry + `crane.Pull`
+  through hermes) live under `test/e2e/` and run with
+  `go test -tags e2e ./test/e2e/...`.  They require a Docker-compatible
+  daemon (Docker Desktop, Colima, Rancher Desktop, `podman` with the
+  docker-compat socket, `dockerd`, etc.); the suite skips cleanly when
+  none is reachable.  The `postgres:16-alpine` image is pulled on
+  first run and cached thereafter.

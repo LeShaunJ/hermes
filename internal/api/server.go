@@ -104,6 +104,15 @@ func (s *Server) ListenAndServe() error {
 	return http.ListenAndServe(s.cfg.Server.Addr, s.mux)
 }
 
+// Handler returns the server's HTTP handler so callers (e.g. integration
+// tests) can mount the gateway on their own listener.
+func (s *Server) Handler() http.Handler { return s.mux }
+
+// SetTransport replaces the http.RoundTripper used for upstream proxy
+// dials.  Intended for integration tests that route hermes's outbound
+// traffic to an in-process upstream registry served over plain HTTP.
+func (s *Server) SetTransport(t http.RoundTripper) { s.transport = t }
+
 // ── OCI handler ───────────────────────────────────────────────────────────────
 
 func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
@@ -146,12 +155,7 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 	// via a masked alias (`registry-1.docker.io`) still matches the row
 	// stored against `docker.io`.  The original p.Registry is preserved
 	// for path-level arithmetic and upstream forwarding.
-	lookupRegistry := p.Registry
-	if canon, cerr := s.db.CanonicalRegistryURL(p.Registry); cerr == nil {
-		lookupRegistry = canon
-	} else {
-		slog.Warn("canonical registry lookup", "registry", p.Registry, "err", cerr)
-	}
+	lookupRegistry := s.canonicalRegistry(p.Registry)
 
 	// Manifest request — check approval status.
 	var img *db.Image
@@ -182,13 +186,12 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 		if img.CacheRegistry != "" {
 			forwardRegistry = img.CacheRegistry
 		}
-		_ = s.db.LogEvent(&img.ID, db.SourceAPI, "validate_approved", map[string]interface{}{
+		s.logAPIEvent(&img.ID, "validate_approved", start, map[string]interface{}{
 			"registry":         p.Registry,
 			"repository":       p.Repository,
 			"tag":              p.Tag,
 			"digest":           p.Digest,
 			"forward_registry": forwardRegistry,
-			"latency_ms":       time.Since(start).Milliseconds(),
 		})
 		// Only attach the void hook when forwarding to the origin for a
 		// digest-addressed request: cached images stay servable from the
@@ -213,12 +216,11 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("rejected lookup", "registry", p.Registry, "repository", p.Repository, "tag", p.Tag, "err", err)
 		}
 		if rejected != nil {
-			_ = s.db.LogEvent(&rejected.ID, db.SourceAPI, "validate_rejected", map[string]interface{}{
+			s.logAPIEvent(&rejected.ID, "validate_rejected", start, map[string]interface{}{
 				"registry":   p.Registry,
 				"repository": p.Repository,
 				"tag":        p.Tag,
 				"digest":     p.Digest,
-				"latency_ms": time.Since(start).Milliseconds(),
 			})
 			s.writeOCIError(w, http.StatusForbidden, "DENIED", "image has been rejected")
 			return
@@ -248,12 +250,11 @@ func (s *Server) serveOCI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_ = s.db.LogEvent(queuedID, db.SourceAPI, "validate_denied", map[string]interface{}{
+	s.logAPIEvent(queuedID, "validate_denied", start, map[string]interface{}{
 		"registry":   p.Registry,
 		"repository": p.Repository,
 		"tag":        p.Tag,
 		"digest":     p.Digest,
-		"latency_ms": time.Since(start).Milliseconds(),
 	})
 
 	s.writeOCIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "approval required")
@@ -280,12 +281,11 @@ func (s *Server) adoptTagResponseHook(ref db.ImageRef, start time.Time) response
 					slog.Warn("adopt tag", "registry", ref.Registry, "repository", ref.Repository, "tag", ref.Tag, "err", err)
 				}
 				if adopted {
-					_ = s.db.LogEvent(nil, db.SourceAPI, "validate_adopted", map[string]interface{}{
+					s.logAPIEvent(nil, "validate_adopted", start, map[string]interface{}{
 						"registry":   ref.Registry,
 						"repository": ref.Repository,
 						"tag":        ref.Tag,
 						"digest":     digest,
-						"latency_ms": time.Since(start).Milliseconds(),
 					})
 					return nil
 				}
@@ -297,12 +297,11 @@ func (s *Server) adoptTagResponseHook(ref db.ImageRef, start time.Time) response
 		if qErr := s.db.QueueStub(ref); qErr != nil {
 			slog.Warn("queue stub", "registry", ref.Registry, "repository", ref.Repository, "tag", ref.Tag, "err", qErr)
 		}
-		_ = s.db.LogEvent(nil, db.SourceAPI, "validate_denied", map[string]interface{}{
+		s.logAPIEvent(nil, "validate_denied", start, map[string]interface{}{
 			"registry":      ref.Registry,
 			"repository":    ref.Repository,
 			"tag":           ref.Tag,
 			"upstream_code": resp.StatusCode,
-			"latency_ms":    time.Since(start).Milliseconds(),
 		})
 		return rewriteResponseOCIError(resp, http.StatusUnauthorized, "UNAUTHORIZED", "approval required")
 	}
@@ -361,13 +360,12 @@ func (s *Server) voidManifestHook(img *db.Image, p parsedPath, start time.Time) 
 			slog.Error("void image", "image_id", img.ID, "err", err)
 			return nil
 		}
-		_ = s.db.LogEvent(&img.ID, db.SourceAPI, "validate_voided", map[string]interface{}{
+		s.logAPIEvent(&img.ID, "validate_voided", start, map[string]interface{}{
 			"registry":      p.Registry,
 			"repository":    p.Repository,
 			"tag":           p.Tag,
 			"digest":        p.Digest,
 			"upstream_code": resp.StatusCode,
-			"latency_ms":    time.Since(start).Milliseconds(),
 		})
 		return nil
 	}
@@ -391,13 +389,12 @@ func (s *Server) voidBlobHook(p parsedPath, lookupRegistry string, start time.Ti
 		if len(ids) == 0 {
 			return nil
 		}
-		_ = s.db.LogEvent(nil, db.SourceAPI, "blob_voided", map[string]interface{}{
+		s.logAPIEvent(nil, "blob_voided", start, map[string]interface{}{
 			"registry":         p.Registry,
 			"repository":       p.Repository,
 			"digest":           p.Digest,
 			"voided_image_ids": ids,
 			"upstream_code":    resp.StatusCode,
-			"latency_ms":       time.Since(start).Milliseconds(),
 		})
 		return nil
 	}
@@ -432,12 +429,7 @@ func rewriteResponseOCIError(resp *http.Response, status int, code, message stri
 // When any owning approved image has been cached, the blob is served from the
 // cache registry so it stays available even if the origin has removed it.
 func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath, start time.Time) {
-	lookupRegistry := p.Registry
-	if canon, cerr := s.db.CanonicalRegistryURL(p.Registry); cerr == nil {
-		lookupRegistry = canon
-	} else {
-		slog.Warn("canonical registry lookup", "registry", p.Registry, "err", cerr)
-	}
+	lookupRegistry := s.canonicalRegistry(p.Registry)
 	ok, cacheRegistry, err := s.db.BlobAuthorized(lookupRegistry, p.Repository, p.Digest)
 	if err != nil {
 		slog.Error("blob authz", "registry", p.Registry, "repository", p.Repository, "digest", p.Digest, "err", err)
@@ -445,11 +437,10 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath,
 		return
 	}
 	if !ok {
-		_ = s.db.LogEvent(nil, db.SourceAPI, "blob_denied", map[string]interface{}{
+		s.logAPIEvent(nil, "blob_denied", start, map[string]interface{}{
 			"registry":   p.Registry,
 			"repository": p.Repository,
 			"digest":     p.Digest,
-			"latency_ms": time.Since(start).Milliseconds(),
 		})
 		s.writeOCIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "blob not part of an approved image")
 		return
@@ -458,12 +449,11 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, p parsedPath,
 	if cacheRegistry != "" {
 		forwardRegistry = cacheRegistry
 	}
-	_ = s.db.LogEvent(nil, db.SourceAPI, "blob_approved", map[string]interface{}{
+	s.logAPIEvent(nil, "blob_approved", start, map[string]interface{}{
 		"registry":         p.Registry,
 		"repository":       p.Repository,
 		"digest":           p.Digest,
 		"forward_registry": forwardRegistry,
-		"latency_ms":       time.Since(start).Milliseconds(),
 	})
 	// Void hook runs only on the origin-forward branch — cached blobs live
 	// in the cache registry and cannot meaningfully "disappear" upstream.
@@ -485,16 +475,13 @@ func (s *Server) challengeRetrieve(registry string, path string) string {
 	if s.challengeRetrieveFn != nil {
 		return s.challengeRetrieveFn(registry, path)
 	}
-	upstream, err := s.db.UpstreamRegistryURL(registry)
-	if err != nil {
-		slog.Warn("upstream registry lookup", "registry", registry, "err", err)
-		upstream = registry
-	}
+	upstream := s.upstreamRegistry(registry)
 	client := &http.Client{
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-		Timeout: 5 * time.Second,
+		Timeout:   5 * time.Second,
+		Transport: s.transport,
 	}
 	resp, err := client.Get("https://" + upstream + "/v2/" + path)
 	if err != nil {
@@ -595,10 +582,9 @@ func (s *Server) serveIdent(w http.ResponseWriter, r *http.Request) {
 		req.Host = target.Host
 		req.Header.Set("X-Forwarded-Proto", "https")
 
-		_ = s.db.LogEvent(sessionID, db.SourceAPI, "token_proxied", map[string]interface{}{
+		s.logAPIEvent(sessionID, "token_proxied", start, map[string]interface{}{
 			"downstream": r.URL.String(),
 			"upstream":   req.URL.String(),
-			"latency_ms": time.Since(start).Milliseconds(),
 		})
 	}
 	proxy.ModifyResponse = func(res *http.Response) error {
@@ -627,21 +613,16 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 	// Canonical display names (e.g. `docker.io`) are not real HTTPS
 	// endpoints — translate to a concrete child URL before any upstream
 	// call.  Unknown / already-concrete URLs pass through unchanged.
-	upstream, err := s.db.UpstreamRegistryURL(registry)
-	if err != nil {
-		slog.Warn("upstream registry lookup", "registry", registry, "err", err)
-		upstream = registry
-	}
+	upstream := s.upstreamRegistry(registry)
 
 	if s.cfg.Server.Redirect && len(hooks) == 0 {
 		dest := "https://" + upstream + path
 		if r.URL.RawQuery != "" {
 			dest += "?" + r.URL.RawQuery
 		}
-		_ = s.db.LogEvent(sessionID, db.SourceAPI, "content_redirected", map[string]interface{}{
+		s.logAPIEvent(sessionID, "content_redirected", start, map[string]interface{}{
 			"downstream": r.URL.String(),
 			"upstream":   dest,
-			"latency_ms": time.Since(start).Milliseconds(),
 		})
 		http.Redirect(w, r, dest, http.StatusTemporaryRedirect)
 		return
@@ -664,10 +645,9 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 		req.Host = upstream
 		req.Header.Set("X-Forwarded-Proto", "https")
 
-		_ = s.db.LogEvent(sessionID, db.SourceAPI, "content_proxied", map[string]interface{}{
+		s.logAPIEvent(sessionID, "content_proxied", start, map[string]interface{}{
 			"downstream": r.URL.String(),
 			"upstream":   req.URL.String(),
-			"latency_ms": time.Since(start).Milliseconds(),
 		})
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
@@ -680,6 +660,43 @@ func (s *Server) proxyOrRedirect(w http.ResponseWriter, r *http.Request, registr
 		return nil
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+// ── registry lookup helpers ───────────────────────────────────────────────────
+
+// canonicalRegistry returns the canonical (display) URL for reg, or reg
+// itself on lookup failure.  DB lookups key on the canonical URL so clients
+// pulling via a masked alias (e.g. `registry-1.docker.io`) still match rows
+// stored against `docker.io`.
+func (s *Server) canonicalRegistry(reg string) string {
+	canon, err := s.db.CanonicalRegistryURL(reg)
+	if err != nil {
+		slog.Warn("canonical registry lookup", "registry", reg, "err", err)
+		return reg
+	}
+	return canon
+}
+
+// upstreamRegistry returns the concrete endpoint URL for reg (e.g. turns
+// the display name `docker.io` into `registry-1.docker.io` via the mask
+// chain), or reg itself on lookup failure.
+func (s *Server) upstreamRegistry(reg string) string {
+	up, err := s.db.UpstreamRegistryURL(reg)
+	if err != nil {
+		slog.Warn("upstream registry lookup", "registry", reg, "err", err)
+		return reg
+	}
+	return up
+}
+
+// logAPIEvent records an API event, adding latency_ms derived from start.
+// Callers populate details with the event-specific fields; registry/repo/tag
+// and similar path context are set by the caller since not every event
+// shape carries the same keys (manifest events include a tag, blob events
+// do not, and session events carry downstream/upstream URLs instead).
+func (s *Server) logAPIEvent(imgID *int64, event string, start time.Time, details map[string]interface{}) {
+	details["latency_ms"] = time.Since(start).Milliseconds()
+	_ = s.db.LogEvent(imgID, db.SourceAPI, event, details)
 }
 
 // ── OCI error response ────────────────────────────────────────────────────────

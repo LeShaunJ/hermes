@@ -460,6 +460,22 @@ func (d *DB) upsertRepository(registryID int64, path string) (int64, error) {
 	return id, err
 }
 
+// resolveRepository upserts the registry and repository rows for ref and
+// returns their ids.  It is the common prologue for methods that need a
+// `(registry, repository)` handle before doing tag-level work (Queue,
+// QueueStub, AdoptTagByDigest).
+func (d *DB) resolveRepository(ref ImageRef) (registryID, repoID int64, err error) {
+	registryID, err = d.upsertRegistry(ref.Registry)
+	if err != nil {
+		return 0, 0, fmt.Errorf("upsert registry: %w", err)
+	}
+	repoID, err = d.upsertRepository(registryID, ref.Repository)
+	if err != nil {
+		return 0, 0, fmt.Errorf("upsert repository: %w", err)
+	}
+	return registryID, repoID, nil
+}
+
 // upsertManifest inserts a manifest row keyed on digest (or updates arch/os
 // when better values arrive, without ever overwriting with blanks) and returns
 // its id.  Existing rows preserve state, scan_report, and cache_registry —
@@ -602,13 +618,9 @@ func (d *DB) imagesByTagID(tagID int64) ([]*Image, error) {
 // first time the operator runs scan/approve (or when the API later adopts the
 // tag via AdoptTagByDigest).
 func (d *DB) QueueStub(ref ImageRef) error {
-	registryID, err := d.upsertRegistry(ref.Registry)
+	_, repoID, err := d.resolveRepository(ref)
 	if err != nil {
-		return fmt.Errorf("upsert registry: %w", err)
-	}
-	repoID, err := d.upsertRepository(registryID, ref.Repository)
-	if err != nil {
-		return fmt.Errorf("upsert repository: %w", err)
+		return err
 	}
 	tagID, err := d.getTagID(repoID, ref.Tag)
 	if err != nil {
@@ -632,13 +644,9 @@ func (d *DB) QueueStub(ref ImageRef) error {
 // Returns all image rows linked to the tag.
 func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 	// 1. Upsert registry + repository.
-	registryID, err := d.upsertRegistry(ref.Registry)
+	_, repoID, err := d.resolveRepository(ref)
 	if err != nil {
-		return nil, fmt.Errorf("upsert registry: %w", err)
-	}
-	repoID, err := d.upsertRepository(registryID, ref.Repository)
-	if err != nil {
-		return nil, fmt.Errorf("upsert repository: %w", err)
+		return nil, err
 	}
 
 	// 2. Check whether the tag already exists and is fully populated.
@@ -1410,13 +1418,9 @@ func (d *DB) BlobAuthorized(registry, repository, digest string) (bool, string, 
 // already known and approved in the DB, the new tag inherits the existing
 // approval state without re-fetching or re-scanning.
 func (d *DB) AdoptTagByDigest(ref ImageRef, digest string) (bool, error) {
-	registryID, err := d.upsertRegistry(ref.Registry)
+	_, repoID, err := d.resolveRepository(ref)
 	if err != nil {
-		return false, fmt.Errorf("upsert registry: %w", err)
-	}
-	repoID, err := d.upsertRepository(registryID, ref.Repository)
-	if err != nil {
-		return false, fmt.Errorf("upsert repository: %w", err)
+		return false, err
 	}
 
 	// Resolve the top-level manifest id for the requested digest, if any.
