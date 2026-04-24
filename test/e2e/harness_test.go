@@ -1,6 +1,6 @@
 //go:build e2e
 
-// Package e2e exercises the full stack: a real PostgreSQL process, an
+// Package e2e exercises the full stack: a real PostgreSQL instance, an
 // in-process OCI upstream registry, and hermes's gateway wired to both.
 // Tests use github.com/google/go-containerregistry as the OCI client so
 // they catch protocol bugs that unit tests against mockStorage / sqlmock
@@ -10,30 +10,25 @@
 //
 // Run with: go test -tags e2e ./test/e2e/...
 //
-// Requirements: the host must have PostgreSQL 16 binaries (initdb,
-// pg_ctl, postgres) on PATH or at /usr/lib/postgresql/16/bin.  No Docker
-// daemon is required — the upstream registry runs in-process.
+// Requirements: a Docker-compatible daemon reachable via the standard
+// DOCKER_HOST discovery (Docker Desktop, Colima, Rancher Desktop, podman
+// with docker-compat socket, dockerd, etc.).  Tests skip cleanly when no
+// daemon is available.  The postgres image (postgres:16-alpine) is pulled
+// on first run and cached thereafter.
 package e2e
 
 import (
-	"bytes"
-	"database/sql"
+	"context"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
-	"os/user"
-	"path/filepath"
-	"strconv"
-	"sync"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/registry"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	tcwait "github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/leshaunj/hermes/internal/api"
 	"github.com/leshaunj/hermes/internal/config"
@@ -42,7 +37,7 @@ import (
 
 // stack bundles every live dependency a test needs.
 type stack struct {
-	pg       *pgProcess
+	pg       *postgres.PostgresContainer
 	db       *db.DB
 	upstream *httptest.Server // in-process OCI registry acting as upstream
 	hermes   *httptest.Server // hermes gateway under test
@@ -58,6 +53,11 @@ type stack struct {
 	// transport is the rewriting RoundTripper clients need to dial the
 	// pseudo-host.  Tests pass this to crane.WithTransport(...).
 	transport http.RoundTripper
+
+	// Postgres connection details exposed for blackbox CLI tests that
+	// need to materialise a hermes.yaml pointing at this instance.
+	pgHost, pgUser, pgPassword, pgDatabase string
+	pgPort                                 int
 }
 
 // newStack starts Postgres, the upstream registry, and hermes.  Every
@@ -70,8 +70,44 @@ func newStack(t *testing.T, opts ...stackOption) *stack {
 		f(&o)
 	}
 
-	pg := startPostgres(t)
-	d, err := db.Open(pg.dsn)
+	ctx := context.Background()
+
+	const (
+		pgUser     = "hermes"
+		pgPassword = "hermes"
+		pgDatabase = "hermes"
+	)
+
+	pgContainer, err := postgres.Run(ctx,
+		"postgres:16-alpine",
+		postgres.WithDatabase(pgDatabase),
+		postgres.WithUsername(pgUser),
+		postgres.WithPassword(pgPassword),
+		testcontainers.WithWaitStrategy(
+			tcwait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(30*time.Second),
+		),
+	)
+	if err != nil {
+		t.Skipf("postgres container: %v (is Docker/Podman running?)", err)
+	}
+	t.Cleanup(func() { _ = testcontainers.TerminateContainer(pgContainer) })
+
+	dsn, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("connection string: %v", err)
+	}
+	host, err := pgContainer.Host(ctx)
+	if err != nil {
+		t.Fatalf("container host: %v", err)
+	}
+	mapped, err := pgContainer.MappedPort(ctx, "5432/tcp")
+	if err != nil {
+		t.Fatalf("mapped port: %v", err)
+	}
+
+	d, err := db.Open(dsn)
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
@@ -113,13 +149,18 @@ func newStack(t *testing.T, opts ...stackOption) *stack {
 	cfg.Server.URL = hermes.URL
 
 	return &stack{
-		pg:           pg,
+		pg:           pgContainer,
 		db:           d,
 		upstream:     upstream,
 		hermes:       hermes,
 		upstreamName: upstreamName,
 		upstreamReal: upstreamReal,
 		transport:    transport,
+		pgHost:       host,
+		pgPort:       mapped.Int(),
+		pgUser:       pgUser,
+		pgPassword:   pgPassword,
+		pgDatabase:   pgDatabase,
 	}
 }
 
@@ -189,227 +230,4 @@ func hostPortOf(t *testing.T, rawURL string) string {
 	}
 	t.Fatalf("unexpected httptest URL: %q", rawURL)
 	return ""
-}
-
-// ── Postgres harness ──────────────────────────────────────────────────────────
-
-type pgProcess struct {
-	dataDir string
-	sockDir string
-	port    int
-	dsn     string
-	cmd     *exec.Cmd
-}
-
-const pgBinDir = "/usr/lib/postgresql/16/bin"
-
-// startPostgres provisions a fresh Postgres cluster in a tmpdir, starts the
-// server on a random port + unix socket, creates the hermes database, and
-// registers cleanup.  Skips the test if Postgres binaries aren't installed.
-// When invoked as root, drops privileges to the local `postgres` account
-// because initdb refuses to run as root.
-func startPostgres(t *testing.T) *pgProcess {
-	t.Helper()
-	initdb := resolvePGBin(t, "initdb")
-	postgres := resolvePGBin(t, "postgres")
-	createdb := resolvePGBin(t, "createdb")
-
-	cred := unprivilegedCredential(t)
-
-	root := t.TempDir()
-	dataDir := filepath.Join(root, "data")
-	sockDir := filepath.Join(root, "sock")
-	if err := os.MkdirAll(sockDir, 0o755); err != nil {
-		t.Fatalf("mkdir sock: %v", err)
-	}
-	if cred != nil {
-		// initdb-as-postgres needs traverse rights on every ancestor of
-		// dataDir.  t.TempDir() creates pid dirs with mode 0700, so relax
-		// the whole chain to 0755 for this ephemeral test fixture.
-		for d := root; d != "/" && d != "."; d = filepath.Dir(d) {
-			_ = os.Chmod(d, 0o755)
-		}
-		for _, d := range []string{root, sockDir} {
-			if err := os.Chown(d, int(cred.Uid), int(cred.Gid)); err != nil {
-				t.Fatalf("chown %s: %v", d, err)
-			}
-		}
-	}
-
-	runAs(t, cred, exec.Command(initdb,
-		"-D", dataDir,
-		"-U", "hermes",
-		"--auth=trust",
-		"--encoding=UTF8",
-		"--no-sync",
-	))
-
-	port, err := freePort()
-	if err != nil {
-		t.Fatalf("free port: %v", err)
-	}
-
-	cmd := exec.Command(postgres,
-		"-D", dataDir,
-		"-p", fmt.Sprint(port),
-		"-k", sockDir,
-		"-c", "listen_addresses=127.0.0.1",
-		"-c", "fsync=off",
-		"-c", "full_page_writes=off",
-		"-c", "synchronous_commit=off",
-	)
-	if cred != nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
-	}
-	// Capture postgres stdout+stderr so startup failures surface in the
-	// test log instead of being swallowed.  Without this, a crash inside
-	// postgres (e.g. shm too small, bad locale, port taken) looks like a
-	// 20-second "connection refused" timeout with no diagnostic.
-	pgLog := &safeBuffer{}
-	cmd.Stdout = pgLog
-	cmd.Stderr = pgLog
-
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start postgres: %v", err)
-	}
-
-	// Watch for early exit so waitPGReady can short-circuit.
-	waitErrCh := make(chan error, 1)
-	go func() { waitErrCh <- cmd.Wait() }()
-	t.Cleanup(func() {
-		_ = cmd.Process.Signal(os.Interrupt)
-		select {
-		case <-waitErrCh:
-		case <-time.After(5 * time.Second):
-			_ = cmd.Process.Kill()
-			<-waitErrCh
-		}
-	})
-
-	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=hermes dbname=postgres sslmode=disable", port)
-	if err := waitPGReady(dsn, 20*time.Second, waitErrCh); err != nil {
-		t.Fatalf("postgres never became ready: %v\npostgres binary: %s\npostgres log:\n%s",
-			err, postgres, pgLog.String())
-	}
-
-	runAs(t, cred, exec.Command(createdb, "-h", "127.0.0.1", "-p", fmt.Sprint(port), "-U", "hermes", "hermes"))
-
-	return &pgProcess{
-		dataDir: dataDir,
-		sockDir: sockDir,
-		port:    port,
-		dsn:     fmt.Sprintf("host=127.0.0.1 port=%d user=hermes dbname=hermes sslmode=disable", port),
-		cmd:     cmd,
-	}
-}
-
-// unprivilegedCredential returns a *syscall.Credential for the local
-// `postgres` account when the test is running as root, or nil otherwise.
-// initdb refuses to run as root, so CI or dev sandboxes that execute tests
-// as uid 0 need to drop privileges for the Postgres subprocesses.
-func unprivilegedCredential(t *testing.T) *syscall.Credential {
-	t.Helper()
-	if os.Geteuid() != 0 {
-		return nil
-	}
-	u, err := user.Lookup("postgres")
-	if err != nil {
-		t.Skipf("running as root and no 'postgres' user available to drop privileges to: %v", err)
-		return nil
-	}
-	uid, err := strconv.Atoi(u.Uid)
-	if err != nil {
-		t.Fatalf("parse postgres uid: %v", err)
-	}
-	gid, err := strconv.Atoi(u.Gid)
-	if err != nil {
-		t.Fatalf("parse postgres gid: %v", err)
-	}
-	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
-}
-
-// runAs executes c, optionally under the given credential, and fails the
-// test with command output on error.
-func runAs(t *testing.T, cred *syscall.Credential, c *exec.Cmd) {
-	t.Helper()
-	if cred != nil {
-		c.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
-	}
-	if out, err := c.CombinedOutput(); err != nil {
-		t.Fatalf("%s: %v: %s", filepath.Base(c.Path), err, string(out))
-	}
-}
-
-func resolvePGBin(t *testing.T, name string) string {
-	t.Helper()
-	if p, err := exec.LookPath(name); err == nil {
-		return p
-	}
-	candidate := filepath.Join(pgBinDir, name)
-	if _, err := os.Stat(candidate); err == nil {
-		return candidate
-	}
-	t.Skipf("postgres tool %q not found (looked in PATH and %s)", name, pgBinDir)
-	return ""
-}
-
-// waitPGReady pings dsn until postgres accepts a connection or until the
-// process exits (whichever comes first).  A crashed postgres returns a
-// dedicated error so callers can surface the captured log instead of
-// reporting only the generic connection-refused timeout.
-func waitPGReady(dsn string, timeout time.Duration, exited <-chan error) error {
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		select {
-		case err := <-exited:
-			return fmt.Errorf("postgres exited before becoming ready: %v", err)
-		default:
-		}
-		conn, err := sql.Open("postgres", dsn)
-		if err == nil {
-			pingErr := conn.Ping()
-			_ = conn.Close()
-			if pingErr == nil {
-				return nil
-			}
-			lastErr = pingErr
-		} else {
-			lastErr = err
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return fmt.Errorf("timed out: %w", lastErr)
-}
-
-// safeBuffer is a concurrency-safe io.Writer backed by bytes.Buffer.
-// postgres writes to stdout and stderr from separate goroutines inside
-// the stdlib exec wiring, so we need a lock around the buffer.
-type safeBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *safeBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *safeBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-// Ensure io import is used — safeBuffer satisfies io.Writer.
-var _ io.Writer = (*safeBuffer)(nil)
-
-func freePort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = l.Close() }()
-	return l.Addr().(*net.TCPAddr).Port, nil
 }

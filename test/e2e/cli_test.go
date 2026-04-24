@@ -52,23 +52,23 @@ func hermesBinary(t *testing.T) string {
 // and returns its path.  Keeping the YAML file on disk (rather than
 // passing everything via HERMES_* env) exercises the viper load path
 // that CLI tests otherwise miss.
-func writeConfig(t *testing.T, port int) string {
+func writeConfig(t *testing.T, s *stack) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "hermes.yaml")
 	body := fmt.Sprintf(`server:
   addr: ":0"
 db:
-  host:     127.0.0.1
+  host:     %s
   port:     %d
-  user:     hermes
-  password: ""
-  name:     hermes
+  user:     %s
+  password: %s
+  name:     %s
   sslmode:  disable
 log:
   format: json
   level:  warn
-`, port)
+`, s.pgHost, s.pgPort, s.pgUser, s.pgPassword, s.pgDatabase)
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestCLI_Help(t *testing.T) {
 // encoder — all of which the in-process tests stub out.
 func TestCLI_ListJSON_Empty(t *testing.T) {
 	s := newStack(t)
-	cfg := writeConfig(t, s.pg.port)
+	cfg := writeConfig(t, s)
 
 	out, stderr, code := runHermes(t, cfg, "", "list", "--json")
 	if code != 0 {
@@ -142,7 +142,7 @@ func TestCLI_ListJSON_Empty(t *testing.T) {
 // catches a cobra flag wiring or bufio.Scanner regression end-to-end.
 func TestCLI_RescindYesFlow(t *testing.T) {
 	s := newStack(t)
-	cfg := writeConfig(t, s.pg.port)
+	cfg := writeConfig(t, s)
 
 	img := mustRandomImage(t)
 	mustPush(t, s, img, s.upstreamRef("myorg/app", "v1"))
@@ -165,7 +165,7 @@ func TestCLI_RescindYesFlow(t *testing.T) {
 // helper (e.g. accepting "y" as "yes") would flip state unexpectedly.
 func TestCLI_RejectCancel(t *testing.T) {
 	s := newStack(t)
-	cfg := writeConfig(t, s.pg.port)
+	cfg := writeConfig(t, s)
 
 	img := mustRandomImage(t)
 	mustPush(t, s, img, s.upstreamRef("myorg/app", "v1"))
@@ -190,13 +190,16 @@ func TestCLI_RejectCancel(t *testing.T) {
 // and isn't touched by any in-process test.
 func TestCLI_ConfigEnvOverride(t *testing.T) {
 	s := newStack(t)
-	cfg := writeConfig(t, 1 /* deliberately wrong port in YAML */)
+	// Write a YAML pointing at a deliberately wrong port; HERMES_DB_PORT
+	// must win.
+	wrong := *s
+	wrong.pgPort = 1
+	cfg := writeConfig(t, &wrong)
 
 	bin := hermesBinary(t)
 	cmd := exec.Command(bin, "--config", cfg, "list", "--json")
 	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("HERMES_DB_PORT=%d", s.pg.port),
-		"HERMES_DB_PASSWORD=",
+		fmt.Sprintf("HERMES_DB_PORT=%d", s.pgPort),
 	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr

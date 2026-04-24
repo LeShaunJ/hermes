@@ -68,6 +68,9 @@ jobs:
   e2e:
     name: e2e
     runs-on: ubuntu-24.04
+    # GitHub's ubuntu-24.04 runners ship with Docker pre-installed and
+    # the daemon running, so testcontainers-go's postgres module can
+    # pull postgres:16-alpine on demand.  No extra setup required.
     steps:
       - uses: actions/checkout@v4
 
@@ -75,11 +78,6 @@ jobs:
         with:
           go-version: '1.24.7'
           cache: true
-
-      - name: install postgresql-16
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends postgresql-16
 
       - name: go test -tags e2e
         run: go test -tags e2e -count=1 ./test/e2e/...
