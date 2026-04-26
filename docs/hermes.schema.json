@@ -29,6 +29,24 @@
         }
       }
     },
+    "ui": {
+      "description": "Operator web console settings (used by 'hermes ui').",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "addr": {
+          "description": "TCP address the operator UI listens on (e.g. ':8090', '0.0.0.0:8090').",
+          "type": "string",
+          "default": ":8090",
+          "examples": [":8090", "0.0.0.0:9595"]
+        },
+        "url": {
+          "description": "Public base URL of the operator UI. Defaults to http://<hostname>:<port> when not set. The UI itself does not enforce auth; deploy behind a reverse proxy that does.",
+          "type": "string",
+          "examples": ["http://hermes.internal:8090", "https://hermes.example.com/ui"]
+        }
+      }
+    },
     "db": {
       "description": "PostgreSQL connection settings.",
       "type": "object",

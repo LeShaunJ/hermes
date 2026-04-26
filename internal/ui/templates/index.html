@@ -1,0 +1,44 @@
+{{define "content"}}
+<section class="dashboard">
+  <h1>Dashboard</h1>
+  <p class="muted">{{.Total}} tracked image{{if ne .Total 1}}s{{end}}.</p>
+
+  <div class="tiles">
+    {{range .Tiles}}
+      <a class="tile" href="/images?state={{.State}}">
+        <div class="tile-count">{{.Count}}</div>
+        <div class="{{stateClass .State}}">{{.State}}</div>
+      </a>
+    {{end}}
+  </div>
+
+  <h2>Recent activity</h2>
+  {{if .Recent}}
+    <table class="images compact">
+      <thead>
+        <tr>
+          <th>state</th>
+          <th>image</th>
+          <th>platform</th>
+          <th>updated</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Recent}}
+          <tr>
+            <td><span class="{{stateClass .State}}">{{.State}}</span></td>
+            <td>
+              <a href="/images/{{.ID}}">{{.RegistryURL}}/{{.Repository}}:{{.TagName}}</a>
+              {{if isStub .}}<span class="muted">(stub)</span>{{end}}
+            </td>
+            <td class="muted">{{if .OS}}{{.OS}}/{{.Arch}}{{else}}—{{end}}</td>
+            <td class="muted" title="{{formatTime .UpdatedAt}}">{{formatRelative .UpdatedAt}}</td>
+          </tr>
+        {{end}}
+      </tbody>
+    </table>
+  {{else}}
+    <p class="muted">No images tracked yet. Pull through the gateway or run <code>hermes scan IMAGE</code>.</p>
+  {{end}}
+</section>
+{{end}}

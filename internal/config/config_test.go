@@ -202,5 +202,45 @@ server:
 	}
 }
 
+func TestLoad_uiDefaults(t *testing.T) {
+	cfg, err := Load("/nonexistent/path/hermes.yaml")
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.UI.Addr != ":8090" {
+		t.Errorf("UI.Addr = %q, want :8090", cfg.UI.Addr)
+	}
+	if !strings.HasPrefix(cfg.UI.URL, "http://") || !strings.HasSuffix(cfg.UI.URL, ":8090") {
+		t.Errorf("UI.URL = %q, want http://<host>:8090", cfg.UI.URL)
+	}
+}
+
+func TestLoad_uiFromYAML(t *testing.T) {
+	yaml := `
+ui:
+  addr: ":9595"
+  url: "https://hermes.example.com"
+`
+	f, err := os.CreateTemp(t.TempDir(), "hermes*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(yaml); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	cfg, err := Load(f.Name())
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.UI.Addr != ":9595" {
+		t.Errorf("UI.Addr = %q, want :9595", cfg.UI.Addr)
+	}
+	if cfg.UI.URL != "https://hermes.example.com" {
+		t.Errorf("UI.URL = %q, want https://hermes.example.com", cfg.UI.URL)
+	}
+}
+
 // Ensure the test file is in the right directory.
 var _ = filepath.Join

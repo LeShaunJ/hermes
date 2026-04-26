@@ -59,10 +59,11 @@ authoritative gateway for OCI Distribution registries.`,
 			Level:  cfg.Log.Level,
 		}, loggerSinkFor(cmd.Name()))
 
-		// serve opens its own DB connection, and health doesn't need one at
-		// all — skip the connect for both so a dead DB doesn't block either.
+		// serve and ui open their own DB connection, and health doesn't need
+		// one at all — skip the connect for all three so a dead DB doesn't
+		// block them either.
 		switch cmd.Name() {
-		case "serve", "health":
+		case "serve", "ui", "health":
 			return nil
 		}
 
@@ -94,12 +95,13 @@ func init() {
 }
 
 // loggerSinkFor picks the io.Writer the global slog logger should use for
-// the given cobra command name.  Only `serve` writes to os.Stderr so its
-// long-running gateway can be tailed via journalctl/Loki; everything else
-// (one-shot CLI commands) routes to io.Discard so the per-event slog
-// mirror cannot interleave with interactive output.
+// the given cobra command name.  Only the long-running daemons (`serve` and
+// `ui`) write to os.Stderr so their logs can be tailed via journalctl/Loki;
+// everything else (one-shot CLI commands) routes to io.Discard so the
+// per-event slog mirror cannot interleave with interactive output.
 func loggerSinkFor(cmdName string) io.Writer {
-	if cmdName == "serve" {
+	switch cmdName {
+	case "serve", "ui":
 		return os.Stderr
 	}
 	return io.Discard

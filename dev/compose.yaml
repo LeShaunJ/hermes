@@ -18,12 +18,26 @@ services:
       timeout: 5s
       retries: 10
 
-  # ── hermes ───────────────────────────────────────────────────────────────────
+  # ── hermes (gateway) ─────────────────────────────────────────────────────────
   hermes:
     privileged: true
     build:
       context: ..
       dockerfile: Containerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./hermes.yaml:/etc/hermes.yaml:ro
+
+  # ── hermes (operator UI) ─────────────────────────────────────────────────────
+  hermes-ui:
+    build:
+      context: ..
+      dockerfile: Containerfile
+    command: ["ui"]
     restart: unless-stopped
     depends_on:
       postgres:
@@ -39,6 +53,8 @@ services:
     depends_on:
       hermes:
         condition: service_healthy
+      hermes-ui:
+        condition: service_started
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./default.conf:/etc/nginx/conf.d/default.conf:ro

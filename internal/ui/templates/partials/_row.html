@@ -1,0 +1,15 @@
+{{define "_row.html"}}
+<tr id="image-{{.ID}}">
+  <td><span class="{{stateClass .State}}">{{.State}}</span></td>
+  <td>
+    <a href="/images/{{.ID}}">{{.RegistryURL}}/{{.Repository}}:{{.TagName}}</a>
+    {{if isStub .}}<span class="muted">(stub)</span>{{end}}
+  </td>
+  <td class="muted">{{if .OS}}{{.OS}}/{{.Arch}}{{else}}—{{end}}</td>
+  <td class="muted"><code>{{shortDigest .Digest}}</code></td>
+  <td class="muted" title="{{formatTime .UpdatedAt}}">{{formatRelative .UpdatedAt}}</td>
+  <td class="row-actions">
+    {{template "_actions.html" .}}
+  </td>
+</tr>
+{{end}}

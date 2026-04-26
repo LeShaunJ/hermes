@@ -24,6 +24,8 @@ before forwarding client requests to upstream registries.
   - [list](#list)
   - [report](#report)
   - [serve](#serve)
+  - [ui](#ui)
+- [Web UI](#web-ui)
 - [Gateway API](#gateway-api)
   - [`GET /v2/`](#get-v2)
   - [`GET /v2/<registry>/…`](#get-v2registry)
@@ -208,6 +210,10 @@ server:
   addr: ":8080"          # listen address
   url:  ""               # public base URL (default: http://<hostname>:<port>)
   redirect: false        # 307-redirect upstream traffic instead of proxying
+
+ui:
+  addr: ":8090"          # listen address for `hermes ui`
+  url:  ""               # public base URL (default: http://<hostname>:<port>)
 
 db:
   host:     localhost
@@ -438,6 +444,27 @@ Starts the OCI gateway server.
 > hermes serve --config /path/to/hermes.yaml
 > ```
 
+### ui
+
+```
+hermes ui [--addr ADDR] [--config PATH]
+```
+
+Starts the operator web console.  See [Web UI](#web-ui) for the full
+endpoint list.  The console is a separate process from `hermes serve` and
+listens on its own [`ui.addr`](#configuration) so you can firewall it
+independently.
+
+> [!IMPORTANT]
+> `hermes ui` does **not** terminate TLS or perform authentication.
+> Always deploy it behind a reverse proxy (nginx, oauth2-proxy,
+> Tailscale Funnel, etc.) that handles both.
+
+> ```bash
+> hermes ui
+> hermes ui --addr :9595 --config /path/to/hermes.yaml
+> ```
+
 ### health
 
 ```
@@ -449,6 +476,39 @@ CLI version of the [`GET /healthz`](#get-healthz) endpoint.
 > [!NOTE]
 > This mostly exists to function as the `CMD` for `HEALTHCHECK` in the `Containerfile`, 
 > as it would otherwise be unsure of what [`server.addr`](#configuration) is.
+
+---
+
+## Web UI
+
+`hermes ui` serves a server-rendered HTML console that mirrors the CLI's
+operator capabilities.  It talks to the same database and emits the same
+audit events, so CLI and UI activity remain interleaved in one event log.
+
+| Method | Path                       | Purpose                                              |
+|:-------|:---------------------------|:-----------------------------------------------------|
+| `GET`  | `/`                        | Dashboard — state counts and recent activity.        |
+| `GET`  | `/images`                  | Filterable image table; htmx-driven inline filters.  |
+| `GET`  | `/images/{id}`             | Image detail — manifest, scan summary, full report.  |
+| `POST` | `/images/{id}/approve`     | Set state to `approved` (form: `cache_url`).         |
+| `POST` | `/images/{id}/reject`      | Set state to `rejected`.                             |
+| `POST` | `/images/{id}/rescind`     | Set state to `rescinded`.                            |
+| `POST` | `/images/{id}/scan`        | Kick a trivy scan in the background; 202 + row swap. |
+| `GET`  | `/events`                  | Server-Sent Events feed of every new audit event.    |
+| `GET`  | `/static/...`              | Embedded CSS + minimal htmx shim.                    |
+| `GET`  | `/healthz`                 | Liveness probe — returns `ok\n`.                     |
+
+The dashboard subscribes to `/events` over SSE so the table and the live
+indicator update in place when any source — UI clicks, CLI commands, or
+the gateway itself — writes to the events table.  Slow consumers drop
+events rather than back-pressuring the listener; the feed is a tail, not
+a queue.
+
+> [!NOTE]
+> The shipped `static/htmx.min.js` is a small in-tree shim that handles
+> the `hx-get`/`hx-post`/`sse-*` attributes the templates use.  Drop in
+> the official htmx.min.js (https://htmx.org) for full feature
+> compatibility — the templates target the standard attribute set.
 
 ---
 

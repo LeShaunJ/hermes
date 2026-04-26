@@ -1,0 +1,44 @@
+{{define "content"}}
+<section class="images">
+  <h1>Images</h1>
+
+  <form class="filters" method="get" action="/images"
+        hx-get="/images" hx-target="#image-rows" hx-trigger="change, submit"
+        hx-headers='{"Hx-Target": "image-rows"}' hx-push-url="true">
+    <label>state
+      <select name="state">
+        <option value="">all</option>
+        <option value="pending">pending</option>
+        <option value="verified">verified</option>
+        <option value="queued">queued</option>
+        <option value="scanned">scanned</option>
+        <option value="approved">approved</option>
+        <option value="rejected">rejected</option>
+        <option value="rescinded">rescinded</option>
+        <option value="voided">voided</option>
+        <option value="errored">errored</option>
+      </select>
+    </label>
+    <label>os <input type="text" name="os" value="{{.Filter.OS}}" placeholder="linux"></label>
+    <label>arch <input type="text" name="arch" value="{{.Filter.Arch}}" placeholder="amd64"></label>
+    <label>ref <input type="text" name="ref" placeholder="myorg/myapp:v1"></label>
+    <button type="submit">filter</button>
+  </form>
+
+  <table class="images">
+    <thead>
+      <tr>
+        <th>state</th>
+        <th>image</th>
+        <th>platform</th>
+        <th>digest</th>
+        <th>updated</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="image-rows">
+      {{template "_rows.html" .}}
+    </tbody>
+  </table>
+</section>
+{{end}}

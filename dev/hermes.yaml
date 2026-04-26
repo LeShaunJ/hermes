@@ -3,6 +3,10 @@ server:
   addr: ":8080"
   url: http://localhost:8888
 
+ui:
+  addr: ":8090"
+  url: http://localhost:8888/ui
+
 db:
   host: postgres
   port: 5432

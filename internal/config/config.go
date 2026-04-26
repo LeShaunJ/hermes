@@ -17,6 +17,7 @@ const DefaultPath = "/etc/hermes.yaml"
 // Config is the top-level hermes configuration.
 type Config struct {
 	Server   ServerConfig `mapstructure:"server"`
+	UI       UIConfig     `mapstructure:"ui"`
 	DB       DBConfig     `mapstructure:"db"`
 	Trivy    TrivyConfig  `mapstructure:"trivy"`
 	Log      LogConfig    `mapstructure:"log"`
@@ -36,6 +37,12 @@ type ServerConfig struct {
 	Addr     string `mapstructure:"addr"`
 	URL      string `mapstructure:"url"`      // public base URL (default: http://hostname:port)
 	Redirect bool   `mapstructure:"redirect"` // use HTTP 307 for blob paths instead of proxying
+}
+
+// UIConfig configures the operator web console served by `hermes ui`.
+type UIConfig struct {
+	Addr string `mapstructure:"addr"`
+	URL  string `mapstructure:"url"` // public base URL (default: http://hostname:port)
 }
 
 // DBConfig configures the PostgreSQL connection.
@@ -75,6 +82,7 @@ func Load(path string) (*Config, error) {
 
 	// Defaults mirror the zero-value behaviour of the previous implementation.
 	v.SetDefault("server.addr", ":8080")
+	v.SetDefault("ui.addr", ":8090")
 	v.SetDefault("db.host", "localhost")
 	v.SetDefault("db.port", 5432)
 	v.SetDefault("db.user", "hermes")
@@ -99,18 +107,27 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
 
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "localhost"
+	}
+
 	// Compute default server.url from hostname + port when not set.
 	if cfg.Server.URL == "" {
-		hostname, _ := os.Hostname()
-		if hostname == "" {
-			hostname = "localhost"
-		}
-		_, port, err := net.SplitHostPort(cfg.Server.Addr)
-		if err != nil {
-			port = strings.TrimPrefix(cfg.Server.Addr, ":")
-		}
-		cfg.Server.URL = "http://" + hostname + ":" + port
+		cfg.Server.URL = "http://" + hostname + ":" + addrPort(cfg.Server.Addr)
+	}
+	if cfg.UI.URL == "" {
+		cfg.UI.URL = "http://" + hostname + ":" + addrPort(cfg.UI.Addr)
 	}
 
 	return &cfg, nil
+}
+
+// addrPort returns the port portion of a "host:port" or ":port" address.
+func addrPort(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return strings.TrimPrefix(addr, ":")
+	}
+	return port
 }

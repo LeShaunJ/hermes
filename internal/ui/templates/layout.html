@@ -1,0 +1,29 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} · hermes</title>
+  <link rel="stylesheet" href="/static/hermes.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body hx-ext="sse" sse-connect="/events">
+  <header class="topbar">
+    <div class="brand"><a href="/">hermes</a></div>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/images">Images</a>
+      <a href="/images?state=pending">Pending</a>
+      <a href="/images?state=verified">Verified</a>
+    </nav>
+    <div class="live" title="live event feed">
+      <span class="dot"></span>
+      <span sse-swap="event" hx-swap="innerHTML">idle</span>
+    </div>
+  </header>
+  <main>
+    {{template "content" .}}
+  </main>
+  <footer>hermes operator console · pre-alpha · authentication is the responsibility of an upstream proxy</footer>
+</body>
+</html>{{end}}
