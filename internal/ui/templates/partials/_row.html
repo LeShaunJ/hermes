@@ -9,10 +9,11 @@
 {{if eq $indent 2}}{{$cls = "tree-row tree-lvl-3"}}{{end}}
 <tr id="image-{{$img.ID}}"{{if $cls}} class="{{$cls}}"{{end}}{{if $group}} data-group="{{$group}}" hidden{{end}}>
   <td class="tree-col-1 {{$indentClass}}">
-    <a href="{{base}}/images/{{$img.ID}}">{{$img.TagName}}</a>
+    <a href="{{base}}/images/{{$img.ID}}">
+      {{if $img.OS}}{{$img.OS}}/{{$img.Arch}}{{else}}{{$img.TagName}}{{end}}
+    </a>
     {{if isStub $img}}<span class="muted">(stub)</span>{{end}}
   </td>
-  <td class="muted">{{if $img.OS}}{{$img.OS}}/{{$img.Arch}}{{else}}—{{end}}</td>
   <td class="muted"><code title="{{$img.Digest}}">{{shortDigest $img.Digest}}</code></td>
   <td><span class="{{stateClass $img.State}}">{{$img.State}}</span></td>
   <td class="muted" title="{{formatTime $img.UpdatedAt}}">{{formatRelative $img.UpdatedAt}}</td>

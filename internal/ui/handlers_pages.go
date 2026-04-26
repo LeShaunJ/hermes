@@ -83,22 +83,19 @@ func (s *Server) imageTree(w http.ResponseWriter, r *http.Request) {
 	s.tmpl.render(w, "images.html", data)
 }
 
-// listRepos renders /repos — one row per (registry, repository).
+// listRepos renders /repos — same three-level tree as /images, just
+// with no filter form and a simpler intro.  The tree view replaces an
+// older flat repo summary; expand toggles surface tag-sets and
+// per-platform images inline.
 func (s *Server) listRepos(w http.ResponseWriter, r *http.Request) {
-	filter, stateTokens, err := s.parseListFilter(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	repos, err := s.db.ListRepos(filter)
+	imgs, err := s.db.List(db.ListFilter{})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	s.tmpl.render(w, "repos.html", pageData{
-		Title:       "Repositories",
-		Repos:       repos,
-		StateTokens: stateTokens,
+		Title: "Repositories",
+		Tree:  groupTree(imgs),
 	})
 }
 

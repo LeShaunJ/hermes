@@ -1,31 +1,22 @@
 {{define "content"}}
 <section class="repos">
   <h1>Repositories</h1>
-  {{if .Repos}}
-    <table class="images">
-      <thead>
-        <tr>
-          <th>repository</th>
-          <th>tag-sets</th>
-          <th>images</th>
-          <th>state</th>
-          <th>updated</th>
-        </tr>
-      </thead>
-      <tbody>
-        {{range .Repos}}
-          <tr>
-            <td><a href="{{base}}/repos/{{.RegistryURL}}/{{.Repository}}">{{.RegistryURL}}/{{.Repository}}</a></td>
-            <td class="muted">{{.TagSetCount}}</td>
-            <td class="muted">{{.ImageCount}}</td>
-            <td>{{template "_state_summary.html" .States}}</td>
-            <td class="muted" title="{{formatTime .UpdatedAt}}">{{formatRelative .UpdatedAt}}</td>
-          </tr>
-        {{end}}
-      </tbody>
-    </table>
-  {{else}}
-    <p class="muted">No repositories tracked yet.</p>
-  {{end}}
+  <p class="muted">Click a row to expand its tag-sets and per-platform images.</p>
+
+  <table class="images tree">
+    <thead>
+      <tr>
+        <th>repository / tag(s) / platform</th>
+        <th>digest</th>
+        <th>state</th>
+        <th>updated</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Tree}}{{template "_repo_row.html" .}}{{end}}
+      {{if not .Tree}}<tr><td colspan="5" class="muted">no repositories tracked yet</td></tr>{{end}}
+    </tbody>
+  </table>
 </section>
 {{end}}

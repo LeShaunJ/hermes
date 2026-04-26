@@ -21,7 +21,6 @@
   <table class="images">
     <thead>
       <tr>
-        <th>tag</th>
         <th>platform</th>
         <th>digest</th>
         <th>state</th>
@@ -30,16 +29,7 @@
       </tr>
     </thead>
     <tbody>
-      {{range .Images}}
-        <tr id="image-{{.ID}}">
-          <td><a href="{{base}}/images/{{.ID}}">{{.TagName}}</a></td>
-          <td class="muted">{{if .OS}}{{.OS}}/{{.Arch}}{{else}}—{{end}}</td>
-          <td class="muted"><code title="{{.Digest}}">{{shortDigest .Digest}}</code></td>
-          <td><span class="{{stateClass .State}}">{{.State}}</span></td>
-          <td class="muted" title="{{formatTime .UpdatedAt}}">{{formatRelative .UpdatedAt}}</td>
-          <td class="row-actions">{{template "_actions.html" .}}</td>
-        </tr>
-      {{end}}
+      {{range .Images}}{{template "_row.html" (dict "Image" . "Group" "" "Indent" 0)}}{{end}}
     </tbody>
   </table>
 </section>

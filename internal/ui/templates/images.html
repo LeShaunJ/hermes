@@ -29,8 +29,7 @@
   <table class="images tree">
     <thead>
       <tr>
-        <th>repository / tag(s)</th>
-        <th>platform</th>
+        <th>repository / tag(s) / platform</th>
         <th>digest</th>
         <th>state</th>
         <th>updated</th>
@@ -39,7 +38,7 @@
     </thead>
     <tbody id="image-tree">
       {{range .Tree}}{{template "_repo_row.html" .}}{{end}}
-      {{if not .Tree}}<tr><td colspan="6" class="muted">no images match</td></tr>{{end}}
+      {{if not .Tree}}<tr><td colspan="5" class="muted">no images match</td></tr>{{end}}
     </tbody>
   </table>
 </section>

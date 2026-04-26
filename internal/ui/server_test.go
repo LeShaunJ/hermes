@@ -898,15 +898,18 @@ func TestRowPartial_stubHasFetchAction(t *testing.T) {
 }
 
 func TestListRepos_render(t *testing.T) {
+	// /repos now renders the same three-level tree as /images, sourced
+	// from db.List + groupTree.  Confirm the toggle button and
+	// state-summary chips render alongside the repo link.
 	mock := &mockStorage{
-		listReposResp: []db.RepoSummary{{
-			RegistryURL: "docker.io",
-			Repository:  "library/alpine",
-			TagSetCount: 2,
-			ImageCount:  9,
-			UpdatedAt:   time.Now(),
-			States:      map[string]int{"approved": 1, "queued": 8},
-		}},
+		listImages: []db.Image{
+			{
+				ID: 1, RegistryURL: "docker.io", Repository: "library/alpine",
+				TagName: "latest", TagDigest: "sha256:topAA",
+				Digest: "sha256:platAMD", Arch: "amd64", OS: "linux",
+				State: db.StateApproved, UpdatedAt: time.Now(),
+			},
+		},
 	}
 	srv := newTestServer(t, mock)
 	w := httptest.NewRecorder()
@@ -920,7 +923,8 @@ func TestListRepos_render(t *testing.T) {
 		`docker.io/library/alpine`,
 		`href="/repos/docker.io/library/alpine"`,
 		`approved: <strong>1</strong>`,
-		`queued: <strong>8</strong>`,
+		`data-row-id="repo:docker.io|library/alpine"`,
+		`expand (1)`, // one tag-set under the repo
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q\n%s", want, body)

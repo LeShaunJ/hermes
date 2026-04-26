@@ -14,8 +14,7 @@
     <table class="images tree">
       <thead>
         <tr>
-          <th>tag(s)</th>
-          <th>images</th>
+          <th>tag(s) / platform</th>
           <th>digest</th>
           <th>state</th>
           <th>updated</th>
@@ -28,8 +27,9 @@
           {{$rowID := printf "ts:%s|%s|%s" $.RegistryURL $.RepoPath $digestKey}}
           {{$childGroup := printf "tg-%s" $rowID}}
           {{$digestHref := pathEscape .TagDigest}}
+          {{$imgs := index $.ImagesByTag .TagDigest}}
           <tr class="tree-row tree-lvl-1" id="row-{{$rowID}}">
-            <td>
+            <td class="tree-col-1">
               {{if .TagDigest}}
                 <a href="{{base}}/repos/{{$.RegistryURL}}/{{$.RepoPath}}/tags/{{$digestHref}}">
                   {{range .Tags}}<code class="tag">{{.}}</code> {{end}}
@@ -39,12 +39,10 @@
                 {{range .Tags}}<code class="tag">{{.}}</code> {{end}}
               {{end}}
             </td>
-            <td class="muted">{{.ImageCount}}</td>
             <td class="muted">{{if .TagDigest}}<code title="{{.TagDigest}}">{{shortDigest .TagDigest}}</code>{{else}}—{{end}}</td>
             <td>{{template "_state_summary.html" .States}}</td>
             <td class="muted" title="{{formatTime .UpdatedAt}}">{{formatRelative .UpdatedAt}}</td>
             <td class="row-actions">
-              {{$imgs := index $.ImagesByTag .TagDigest}}
               {{if $imgs}}
                 <button type="button"
                         class="toggle"
@@ -55,17 +53,7 @@
               {{end}}
             </td>
           </tr>
-          {{$imgs := index $.ImagesByTag .TagDigest}}
-          {{range $imgs}}
-            <tr class="tree-row tree-lvl-2" id="image-{{.ID}}" data-group="{{$childGroup}}" hidden>
-              <td><a href="{{base}}/images/{{.ID}}">{{.TagName}}</a></td>
-              <td class="muted">{{if .OS}}{{.OS}}/{{.Arch}}{{else}}—{{end}}</td>
-              <td class="muted"><code title="{{.Digest}}">{{shortDigest .Digest}}</code></td>
-              <td><span class="{{stateClass .State}}">{{.State}}</span></td>
-              <td class="muted" title="{{formatTime .UpdatedAt}}">{{formatRelative .UpdatedAt}}</td>
-              <td class="row-actions">{{template "_actions.html" .}}</td>
-            </tr>
-          {{end}}
+          {{range $imgs}}{{template "_row.html" (dict "Image" . "Group" $childGroup "Indent" 1)}}{{end}}
         {{end}}
       </tbody>
     </table>
