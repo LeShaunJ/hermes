@@ -227,5 +227,13 @@ func (s *Server) respondAction(w http.ResponseWriter, r *http.Request, id int64)
 		http.NotFound(w, r)
 		return
 	}
-	s.tmpl.render(w, "_row.html", *img)
+	// Always wrap the image in a dict so `_row.html` sees the same shape
+	// whether it is rendered inside the tree or as an htmx swap response.
+	// Indent is intentionally 0 here — the row will lose its tree-lvl-N
+	// CSS class until the next full page render; tracked as a follow-up.
+	s.tmpl.render(w, "_row.html", map[string]interface{}{
+		"Image":  *img,
+		"Group":  "",
+		"Indent": 0,
+	})
 }

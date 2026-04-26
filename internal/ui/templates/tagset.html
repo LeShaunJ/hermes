@@ -1,0 +1,46 @@
+{{define "content"}}
+<section class="tagset-detail">
+  <h1>
+    <a href="{{base}}/repos">repos</a> /
+    <a href="{{base}}/repos/{{.RegistryURL}}/{{.RepoPath}}">{{.RegistryURL}}/{{.RepoPath}}</a> /
+    {{shortDigest .TagSet.TagDigest}}
+  </h1>
+
+  <div class="meta">
+    <div><span class="muted">tags</span> {{range .TagSet.Tags}}<code class="tag">{{.}}</code> {{end}}</div>
+    <div><span class="muted">digest</span> <code title="{{.TagSet.TagDigest}}">{{.TagSet.TagDigest}}</code></div>
+    <div><span class="muted">images</span> {{.TagSet.ImageCount}}</div>
+    <div><span class="muted">updated</span> {{formatTime .TagSet.UpdatedAt}}</div>
+  </div>
+
+  <div class="state-summary">
+    {{range .StateSummary}}<span class="{{stateClass .State}}">{{.State}}: <strong>{{.Count}}</strong></span> {{end}}
+  </div>
+
+  <h2>Per-platform images</h2>
+  <table class="images">
+    <thead>
+      <tr>
+        <th>tag</th>
+        <th>platform</th>
+        <th>digest</th>
+        <th>state</th>
+        <th>updated</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Images}}
+        <tr id="image-{{.ID}}">
+          <td><a href="{{base}}/images/{{.ID}}">{{.TagName}}</a></td>
+          <td class="muted">{{if .OS}}{{.OS}}/{{.Arch}}{{else}}—{{end}}</td>
+          <td class="muted"><code title="{{.Digest}}">{{shortDigest .Digest}}</code></td>
+          <td><span class="{{stateClass .State}}">{{.State}}</span></td>
+          <td class="muted" title="{{formatTime .UpdatedAt}}">{{formatRelative .UpdatedAt}}</td>
+          <td class="row-actions">{{template "_actions.html" .}}</td>
+        </tr>
+      {{end}}
+    </tbody>
+  </table>
+</section>
+{{end}}

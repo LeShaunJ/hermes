@@ -38,6 +38,8 @@ import (
 // *db.DB satisfies this interface automatically.
 type storage interface {
 	List(f db.ListFilter) ([]db.Image, error)
+	ListRepos(f db.ListFilter) ([]db.RepoSummary, error)
+	ListTagSets(registry, repository string, f db.ListFilter) ([]db.TagSet, error)
 	GetByID(id int64) (*db.Image, error)
 	Queue(ref db.ImageRef, fetcher db.Fetcher) ([]*db.Image, error)
 	Approve(imageID int64, cacheRegistry string) error
@@ -90,8 +92,10 @@ func New(database storage, cfg *config.Config) *Server {
 	}
 
 	s.mux.HandleFunc("GET /{$}", s.dashboard)
-	s.mux.HandleFunc("GET /images", s.listImages)
+	s.mux.HandleFunc("GET /images", s.imageTree)
 	s.mux.HandleFunc("GET /images/{id}", s.viewImage)
+	s.mux.HandleFunc("GET /repos", s.listRepos)
+	s.mux.HandleFunc("GET /repos/{registry}/{path...}", s.viewRepoOrTagSet)
 	s.mux.HandleFunc("POST /images/{id}/approve", s.actionApprove)
 	s.mux.HandleFunc("POST /images/{id}/reject", s.actionReject)
 	s.mux.HandleFunc("POST /images/{id}/rescind", s.actionRescind)

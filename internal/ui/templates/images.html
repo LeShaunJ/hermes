@@ -3,9 +3,7 @@
 <section class="images">
   <h1>Images</h1>
 
-  <form class="filters" method="get" action="{{base}}/images"
-        hx-get="{{base}}/images" hx-target="#image-rows" hx-trigger="change, submit"
-        hx-headers='{"Hx-Target": "image-rows"}' hx-push-url="true">
+  <form class="filters" method="get" action="{{base}}/images">
     <label>state
       <select name="state">
         <option value=""          {{if eq $selected ""}}selected{{end}}>all</option>
@@ -26,19 +24,22 @@
     <button type="submit">filter</button>
   </form>
 
-  <table class="images">
+  <p class="muted">Click a row to expand its tag-sets and per-platform images. State persists across reloads.</p>
+
+  <table class="images tree">
     <thead>
       <tr>
-        <th>state</th>
-        <th>image</th>
+        <th>repository / tag(s)</th>
         <th>platform</th>
         <th>digest</th>
+        <th>state</th>
         <th>updated</th>
         <th></th>
       </tr>
     </thead>
-    <tbody id="image-rows">
-      {{template "_rows.html" .}}
+    <tbody id="image-tree">
+      {{range .Tree}}{{template "_repo_row.html" .}}{{end}}
+      {{if not .Tree}}<tr><td colspan="6" class="muted">no images match</td></tr>{{end}}
     </tbody>
   </table>
 </section>

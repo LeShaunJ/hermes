@@ -1,0 +1,10 @@
+{{define "_state_summary.html"}}
+{{$states := .}}
+{{with index $states "queued"}}{{if .}}<span class="state state-pending">queued: <strong>{{.}}</strong></span> {{end}}{{end}}
+{{with index $states "scanned"}}{{if .}}<span class="state state-pending">scanned: <strong>{{.}}</strong></span> {{end}}{{end}}
+{{with index $states "rescinded"}}{{if .}}<span class="state state-pending">rescinded: <strong>{{.}}</strong></span> {{end}}{{end}}
+{{with index $states "voided"}}{{if .}}<span class="state state-pending">voided: <strong>{{.}}</strong></span> {{end}}{{end}}
+{{with index $states "approved"}}{{if .}}<span class="state state-approved">approved: <strong>{{.}}</strong></span> {{end}}{{end}}
+{{with index $states "rejected"}}{{if .}}<span class="state state-rejected">rejected: <strong>{{.}}</strong></span> {{end}}{{end}}
+{{with index $states "errored"}}{{if .}}<span class="state state-errored">errored: <strong>{{.}}</strong></span> {{end}}{{end}}
+{{end}}

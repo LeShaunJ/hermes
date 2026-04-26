@@ -1,0 +1,33 @@
+{{define "_tagset_row.html"}}
+{{$reg := .Repo}}{{$path := .Path}}{{$ts := .TagSet}}{{$parentGroup := .Group}}
+{{$digestKey := $ts.TagDigest}}{{if eq $digestKey ""}}{{$digestKey = "stub"}}{{end}}
+{{$rowID := printf "ts:%s|%s|%s" $reg $path $digestKey}}
+{{$childGroup := printf "tg-%s" $rowID}}
+{{$digestHref := pathEscape $ts.TagDigest}}
+<tr class="tree-row tree-lvl-2" id="row-{{$rowID}}" data-group="{{$parentGroup}}" hidden>
+  <td class="tree-col-1 indent-1">
+    {{if $ts.Images}}
+      <button type="button"
+              class="toggle"
+              data-row-id="{{$rowID}}"
+              data-expand-label="expand ({{len $ts.Images}})"
+              aria-expanded="false"
+              aria-controls="{{$childGroup}}">expand ({{len $ts.Images}})</button>
+    {{end}}
+    {{if $ts.TagDigest}}
+      <a href="{{base}}/repos/{{$reg}}/{{$path}}/tags/{{$digestHref}}">
+        {{range $ts.Tags}}<code class="tag">{{.}}</code> {{end}}
+      </a>
+    {{else}}
+      <span class="muted">unresolved</span>
+      {{range $ts.Tags}}<code class="tag">{{.}}</code> {{end}}
+    {{end}}
+  </td>
+  <td></td>
+  <td class="muted">{{if $ts.TagDigest}}<code title="{{$ts.TagDigest}}">{{shortDigest $ts.TagDigest}}</code>{{else}}—{{end}}</td>
+  <td>{{template "_state_summary.html" $ts.States}}</td>
+  <td class="muted" title="{{formatTime $ts.UpdatedAt}}">{{formatRelative $ts.UpdatedAt}}</td>
+  <td></td>
+</tr>
+{{range $ts.Images}}{{template "_row.html" (dict "Image" . "Group" $childGroup "Indent" 2)}}{{end}}
+{{end}}

@@ -137,3 +137,43 @@ button:hover { filter: brightness(1.1); }
 .sev-MEDIUM   { background: var(--warn); color: #1a1a1a; }
 .sev-LOW      { background: var(--info); color: #fff; }
 .sev-UNKNOWN  { background: var(--muted); color: #fff; }
+
+/* ── tree view ─────────────────────────────────────────────────────────── */
+table.images.tree td { vertical-align: middle; }
+table.images.tree td.indent-1 { width: 28px; }
+table.images.tree td.indent-2 { width: 56px; }
+.tree-lvl-2 > td:first-child { padding-left: 28px; }
+.tree-lvl-3 > td:first-child { padding-left: 56px; }
+.tree-row[hidden] { display: none; }
+button.toggle {
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 2px 10px; font-size: 12px; cursor: pointer;
+}
+button.toggle:hover { color: var(--fg); border-color: var(--accent); }
+button.toggle[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
+
+/* Tag chip — used in tag-set rows. */
+code.tag {
+  display: inline-block;
+  padding: 1px 6px; margin: 0 2px;
+  background: var(--line); color: var(--fg);
+  border-radius: 3px; font-size: 11px;
+}
+
+/* State summary chip cluster. */
+.state-summary { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 16px 0; }
+
+/* ── CVE table ─────────────────────────────────────────────────────────── */
+table.cves, table.packages { width: 100%; border-collapse: collapse; margin: 8px 0 24px 0; }
+table.cves th, table.cves td,
+table.packages th, table.packages td {
+  text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+table.cves th, table.packages th {
+  font-size: 11px; text-transform: uppercase; color: var(--muted);
+}
+.cve-title { color: var(--muted); }
+.cve-row.sev-row-CRITICAL { background: rgba(249, 65, 68, 0.06); }
+.cve-row.sev-row-HIGH     { background: rgba(214, 90, 49, 0.05); }

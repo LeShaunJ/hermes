@@ -84,6 +84,7 @@ type Image struct {
 	TagName       string // from tags.name
 	CacheRegistry string // URL from registries join; empty if null
 	Digest        string // platform-specific manifest digest
+	TagDigest     string // top-level (manifest or index) digest the tag resolves to
 	Arch          string
 	OS            string
 	Manifest      json.RawMessage // jsonb column
@@ -1081,10 +1082,11 @@ func (d *DB) setImageState(imageID int64, state State) error {
 // imageCols is the default SELECT column list for queries against the
 // tag_image_rows view.  It returns the platform image digest (image_digest)
 // as the .Digest field, which is what callers want for digest-addressed
-// lookups and general listing.
+// lookups and general listing; the top-level (`tag_digest`) is also
+// included so callers can group images by tag-set without a second query.
 const imageCols = `
 	image_id, tag_id, registry_url, repository, tag_name,
-	cache_registry_url, image_digest, arch, os,
+	cache_registry_url, image_digest, tag_digest, arch, os,
 	manifest, scan_report, state, created_at, updated_at`
 
 // imageColsTagDigest is the column list for queries that want the tag's
@@ -1093,7 +1095,7 @@ const imageCols = `
 // upstream digest.
 const imageColsTagDigest = `
 	image_id, tag_id, registry_url, repository, tag_name,
-	cache_registry_url, tag_digest, arch, os,
+	cache_registry_url, tag_digest, tag_digest, arch, os,
 	manifest, scan_report, state, created_at, updated_at`
 
 func scanImageRow(row *sql.Row) (*Image, error) {
@@ -1102,7 +1104,7 @@ func scanImageRow(row *sql.Row) (*Image, error) {
 	err := row.Scan(
 		&img.ID, &img.TagID, &img.RegistryURL, &img.Repository, &img.TagName,
 		&img.CacheRegistry,
-		&img.Digest, &img.Arch, &img.OS,
+		&img.Digest, &img.TagDigest, &img.Arch, &img.OS,
 		&manifestStr, &scanReportStr,
 		&stateStr, &img.CreatedAt, &img.UpdatedAt,
 	)
@@ -1126,7 +1128,7 @@ func scanImageRows(rows *sql.Rows) ([]*Image, error) {
 		if err := rows.Scan(
 			&img.ID, &img.TagID, &img.RegistryURL, &img.Repository, &img.TagName,
 			&img.CacheRegistry,
-			&img.Digest, &img.Arch, &img.OS,
+			&img.Digest, &img.TagDigest, &img.Arch, &img.OS,
 			&manifestStr, &scanReportStr,
 			&stateStr, &img.CreatedAt, &img.UpdatedAt,
 		); err != nil {
@@ -1297,18 +1299,45 @@ func (d *DB) FindRegistriesForRef(repository, tag string) ([]string, error) {
 
 // ── list ──────────────────────────────────────────────────────────────────────
 
-// ListFilter specifies optional filters for List.
+// ListFilter specifies optional filters for List, ListRepos, ListTagSets.
 type ListFilter struct {
-	States []State  // empty = all
-	Refs   []string // "namespace/name[:tag]" patterns; empty = all
-	OS     string   // exact match, "" = any
-	Arch   string   // exact match, "" = any
+	States    []State  // empty = all
+	Refs      []string // "namespace/name[:tag]" patterns; empty = all
+	OS        string   // exact match, "" = any
+	Arch      string   // exact match, "" = any
+	TagDigest string   // exact match against tag_digest, "" = any
 }
 
-// List returns images ordered by updated_at DESC, with optional filtering.
-// Stub tags (no linked images) are included as synthesised rows with state
-// 'queued' and empty digest/arch/os fields.
-func (d *DB) List(f ListFilter) ([]Image, error) {
+// RepoSummary is one row of `ListRepos` — a (registry, repository)
+// aggregate with tag-set/image counts and per-state breakdown.  States
+// only carries entries with non-zero counts so the template can render
+// just the relevant chips.  The state key is the plain string form so
+// html/template's `index` can look it up with a literal key.
+type RepoSummary struct {
+	RegistryURL string
+	Repository  string
+	TagSetCount int
+	ImageCount  int
+	UpdatedAt   time.Time
+	States      map[string]int
+}
+
+// TagSet is one row of `ListTagSets` — a top-level manifest digest and
+// the tag names that resolve to it, for one repository.  Stub tags fall
+// into the `TagDigest == ""` bucket.
+type TagSet struct {
+	TagDigest  string
+	Tags       []string
+	ImageCount int
+	UpdatedAt  time.Time
+	States     map[string]int
+}
+
+// buildListWhere produces a WHERE-clause body and the matching argument
+// slice from a ListFilter.  Used by List, ListRepos, and ListTagSets so
+// every list query treats filtering identically.  Returns ("", nil) when
+// the filter is empty.
+func buildListWhere(f ListFilter) (string, []interface{}) {
 	var (
 		conditions []string
 		args       []interface{}
@@ -1333,6 +1362,12 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 	if f.Arch != "" {
 		conditions = append(conditions, fmt.Sprintf("arch = $%d", argIdx))
 		args = append(args, f.Arch)
+		argIdx++
+	}
+
+	if f.TagDigest != "" {
+		conditions = append(conditions, fmt.Sprintf("tag_digest = $%d", argIdx))
+		args = append(args, f.TagDigest)
 		argIdx++
 	}
 
@@ -1365,10 +1400,17 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 		}
 	}
 
-	where := ""
-	if len(conditions) > 0 {
-		where = "WHERE " + strings.Join(conditions, " AND ")
+	if len(conditions) == 0 {
+		return "", nil
 	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+// List returns images ordered by updated_at DESC, with optional filtering.
+// Stub tags (no linked images) are included as synthesised rows with state
+// 'queued' and empty digest/arch/os fields.
+func (d *DB) List(f ListFilter) ([]Image, error) {
+	where, args := buildListWhere(f)
 
 	query := fmt.Sprintf(`
 		SELECT `+imageCols+`
@@ -1391,6 +1433,138 @@ func (d *DB) List(f ListFilter) ([]Image, error) {
 		out[i] = *p
 	}
 	return out, nil
+}
+
+// ListRepos returns one row per (registry, repository) with tag-set,
+// image, and per-state aggregates.  Two passes against `tag_image_rows`
+// stitch together — clearer than a single CTE and the row volume is
+// modest.  Filtering accepts the same ListFilter as List.
+func (d *DB) ListRepos(f ListFilter) ([]RepoSummary, error) {
+	where, args := buildListWhere(f)
+
+	rows, err := d.db.Query(fmt.Sprintf(`
+		SELECT registry_url,
+		       repository,
+		       COUNT(DISTINCT NULLIF(tag_digest, '')) AS tagset_count,
+		       COUNT(DISTINCT NULLIF(image_id, 0))    AS image_count,
+		       MAX(updated_at)                        AS updated_at
+		FROM   tag_image_rows
+		%s
+		GROUP BY registry_url, repository
+		ORDER BY MAX(updated_at) DESC, registry_url, repository`, where), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list repos: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	type repoKey struct{ Reg, Path string }
+	idx := make(map[repoKey]int)
+	var out []RepoSummary
+	for rows.Next() {
+		var s RepoSummary
+		if err := rows.Scan(&s.RegistryURL, &s.Repository, &s.TagSetCount, &s.ImageCount, &s.UpdatedAt); err != nil {
+			return nil, err
+		}
+		s.States = make(map[string]int)
+		idx[repoKey{s.RegistryURL, s.Repository}] = len(out)
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	stateRows, err := d.db.Query(fmt.Sprintf(`
+		SELECT registry_url, repository, state, COUNT(*)
+		FROM   tag_image_rows
+		%s
+		GROUP BY registry_url, repository, state`, where), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list repos states: %w", err)
+	}
+	defer func() { _ = stateRows.Close() }()
+
+	for stateRows.Next() {
+		var reg, repo, st string
+		var count int
+		if err := stateRows.Scan(&reg, &repo, &st, &count); err != nil {
+			return nil, err
+		}
+		if i, ok := idx[repoKey{reg, repo}]; ok {
+			out[i].States[st] = count
+		}
+	}
+	return out, stateRows.Err()
+}
+
+// ListTagSets groups one repository's rows by `tag_digest` — every tag
+// pointing at the same top-level manifest digest collapses to a single
+// TagSet (so floating aliases like `latest` and the version they
+// currently resolve to share a row).  Stub tags fall into the
+// `TagDigest == ""` bucket.  Filter is applied after the implicit
+// (registry, repository) scope.
+func (d *DB) ListTagSets(registry, repository string, f ListFilter) ([]TagSet, error) {
+	where, args := buildListWhere(f)
+
+	scope := fmt.Sprintf("registry_url = $%d AND repository = $%d", len(args)+1, len(args)+2)
+	args = append(args, registry, repository)
+	if where == "" {
+		where = "WHERE " + scope
+	} else {
+		where = where + " AND " + scope
+	}
+
+	rows, err := d.db.Query(fmt.Sprintf(`
+		SELECT tag_digest,
+		       array_agg(DISTINCT tag_name ORDER BY tag_name) AS tags,
+		       COUNT(DISTINCT NULLIF(image_id, 0))            AS image_count,
+		       MAX(updated_at)                                 AS updated_at
+		FROM   tag_image_rows
+		%s
+		GROUP BY tag_digest
+		ORDER BY MAX(updated_at) DESC, tag_digest`, where), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list tag-sets: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	idx := make(map[string]int)
+	var out []TagSet
+	for rows.Next() {
+		var ts TagSet
+		var tags pq.StringArray
+		if err := rows.Scan(&ts.TagDigest, &tags, &ts.ImageCount, &ts.UpdatedAt); err != nil {
+			return nil, err
+		}
+		ts.Tags = []string(tags)
+		ts.States = make(map[string]int)
+		idx[ts.TagDigest] = len(out)
+		out = append(out, ts)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	stateRows, err := d.db.Query(fmt.Sprintf(`
+		SELECT tag_digest, state, COUNT(*)
+		FROM   tag_image_rows
+		%s
+		GROUP BY tag_digest, state`, where), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list tag-sets states: %w", err)
+	}
+	defer func() { _ = stateRows.Close() }()
+
+	for stateRows.Next() {
+		var digest, st string
+		var count int
+		if err := stateRows.Scan(&digest, &st, &count); err != nil {
+			return nil, err
+		}
+		if i, ok := idx[digest]; ok {
+			out[i].States[st] = count
+		}
+	}
+	return out, stateRows.Err()
 }
 
 // ── blob authorization ────────────────────────────────────────────────────────

@@ -25,11 +25,11 @@ func newMockDB(t *testing.T) (*DB, sqlmock.Sqlmock) {
 	return &DB{db: sqlDB}, mock
 }
 
-// imageRowCols matches the column order returned by imageColumns.
+// imageRowCols matches the column order returned by imageCols.
 var imageRowCols = []string{
 	"id", "tag", "url", "repository", "name",
 	"cache_url",
-	"digest", "arch", "os",
+	"digest", "tag_digest", "arch", "os",
 	"manifest", "scan_report",
 	"state", "created_at", "updated_at",
 }
@@ -40,7 +40,7 @@ func testImageRow(id int64, state string) *sqlmock.Rows {
 	return sqlmock.NewRows(imageRowCols).AddRow(
 		id, int64(1), "registry.example.com", "myrepo", "v1.0",
 		"",
-		"sha256:abc123", "amd64", "linux",
+		"sha256:abc123", "sha256:topdigest", "amd64", "linux",
 		`{"schemaVersion":2}`, "null",
 		state, now, now,
 	)
@@ -1507,6 +1507,120 @@ func TestQueue_unknownMediaType(t *testing.T) {
 	_, err := d.Queue(ref, fetcher)
 	if err != nil {
 		t.Fatalf("Queue unknown media type: %v", err)
+	}
+}
+
+// ── ListRepos / ListTagSets ───────────────────────────────────────────────────
+
+func TestListRepos(t *testing.T) {
+	d, mock := newMockDB(t)
+
+	t1 := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT registry_url`)).
+		WillReturnRows(sqlmock.NewRows([]string{"registry_url", "repository", "tagset_count", "image_count", "updated_at"}).
+			AddRow("docker.io", "library/alpine", 2, 9, t1).
+			AddRow("docker.io", "library/golang", 1, 1, t2))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT registry_url, repository, state`)).
+		WillReturnRows(sqlmock.NewRows([]string{"registry_url", "repository", "state", "count"}).
+			AddRow("docker.io", "library/alpine", "approved", 1).
+			AddRow("docker.io", "library/alpine", "queued", 8).
+			AddRow("docker.io", "library/golang", "scanned", 1))
+
+	repos, err := d.ListRepos(ListFilter{})
+	if err != nil {
+		t.Fatalf("ListRepos: %v", err)
+	}
+	if len(repos) != 2 {
+		t.Fatalf("len = %d, want 2", len(repos))
+	}
+	if repos[0].Repository != "library/alpine" || repos[0].TagSetCount != 2 || repos[0].ImageCount != 9 {
+		t.Errorf("alpine summary = %+v", repos[0])
+	}
+	if got := repos[0].States["approved"]; got != 1 {
+		t.Errorf("approved = %d, want 1", got)
+	}
+	if got := repos[0].States["queued"]; got != 8 {
+		t.Errorf("queued = %d, want 8", got)
+	}
+	if got := repos[1].States["scanned"]; got != 1 {
+		t.Errorf("golang scanned = %d, want 1", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestListRepos_filterArgsThreaded(t *testing.T) {
+	d, mock := newMockDB(t)
+
+	// Both passes must receive the same filter args so the state breakdown
+	// matches the summary scope.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT registry_url`)).
+		WithArgs(sqlmock.AnyArg(), "linux"). // states + os
+		WillReturnRows(sqlmock.NewRows([]string{"registry_url", "repository", "tagset_count", "image_count", "updated_at"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT registry_url, repository, state`)).
+		WithArgs(sqlmock.AnyArg(), "linux").
+		WillReturnRows(sqlmock.NewRows([]string{"registry_url", "repository", "state", "count"}))
+
+	if _, err := d.ListRepos(ListFilter{
+		States: []State{StateApproved},
+		OS:     "linux",
+	}); err != nil {
+		t.Fatalf("ListRepos: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestListTagSets(t *testing.T) {
+	d, mock := newMockDB(t)
+
+	t1 := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tag_digest`)).
+		WithArgs("docker.io", "library/alpine").
+		WillReturnRows(sqlmock.NewRows([]string{"tag_digest", "tags", "image_count", "updated_at"}).
+			AddRow("sha256:aaa", `{3.23.4,latest}`, 8, t1).
+			AddRow("sha256:bbb", `{3.9.6}`, 1, t1))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tag_digest, state`)).
+		WithArgs("docker.io", "library/alpine").
+		WillReturnRows(sqlmock.NewRows([]string{"tag_digest", "state", "count"}).
+			AddRow("sha256:aaa", "approved", 1).
+			AddRow("sha256:aaa", "queued", 7).
+			AddRow("sha256:bbb", "scanned", 1))
+
+	sets, err := d.ListTagSets("docker.io", "library/alpine", ListFilter{})
+	if err != nil {
+		t.Fatalf("ListTagSets: %v", err)
+	}
+	if len(sets) != 2 {
+		t.Fatalf("len = %d, want 2", len(sets))
+	}
+	if got := sets[0].Tags; len(got) != 2 || got[0] != "3.23.4" || got[1] != "latest" {
+		t.Errorf("first tag-set tags = %v, want [3.23.4 latest]", got)
+	}
+	if got := sets[0].States["approved"]; got != 1 {
+		t.Errorf("aaa approved = %d, want 1", got)
+	}
+	if got := sets[1].States["scanned"]; got != 1 {
+		t.Errorf("bbb scanned = %d, want 1", got)
+	}
+}
+
+func TestList_tagDigestFilter(t *testing.T) {
+	d, mock := newMockDB(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`tag_digest = $1`)).
+		WithArgs("sha256:abc").
+		WillReturnRows(sqlmock.NewRows(imageRowCols))
+
+	if _, err := d.List(ListFilter{TagDigest: "sha256:abc"}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
 	}
 }
 

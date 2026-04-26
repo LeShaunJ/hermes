@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -33,7 +34,14 @@ type templates struct {
 
 // pageNames lists every full-page template file under templates/.  Adding
 // a new page requires appending its filename here.
-var pageNames = []string{"index.html", "images.html", "image.html"}
+var pageNames = []string{
+	"index.html",
+	"images.html",
+	"image.html",
+	"repos.html",
+	"repo.html",
+	"tagset.html",
+}
 
 func loadTemplates(basePath string) (*templates, error) {
 	partialFiles, err := fs.Glob(templateFS, "templates/partials/*.html")
@@ -95,11 +103,35 @@ func buildFuncMap(basePath string) template.FuncMap {
 		"formatTime":     formatTime,
 		"formatRelative": formatRelative,
 		"vulnSummary":    vulnSummary,
+		"vulnList":       vulnList,
+		"packageList":    packageList,
+		"cveURL":         cveURL,
 		"prettyJSON":     prettyJSON,
 		"isStub":         isStub,
+		"pathEscape":     url.PathEscape,
 		"join":           strings.Join,
 		"add":            func(a, b int) int { return a + b },
+		"dict":           dict,
 	}
+}
+
+// dict returns a map[string]any built from alternating key/value pairs.
+// Lets templates pass labelled arguments to sub-templates without
+// declaring a struct for every shape.  Panics on misuse so a typo'd
+// template breaks loudly rather than silently producing nil values.
+func dict(pairs ...interface{}) map[string]interface{} {
+	if len(pairs)%2 != 0 {
+		panic("dict: odd argument count")
+	}
+	out := make(map[string]interface{}, len(pairs)/2)
+	for i := 0; i < len(pairs); i += 2 {
+		key, ok := pairs[i].(string)
+		if !ok {
+			panic(fmt.Sprintf("dict: key %d is not a string", i))
+		}
+		out[key] = pairs[i+1]
+	}
+	return out
 }
 
 // stateClass maps a db.State to a CSS class for badge styling.
@@ -227,4 +259,191 @@ func prettyJSON(raw json.RawMessage) string {
 		return string(raw)
 	}
 	return buf.String()
+}
+
+// CVE is one row in the vulnerability table on the image detail page.
+// Mirrors the trivy `Results[].Vulnerabilities[]` shape, flattened with
+// the parent Result's Target so a multi-OS scan still distinguishes
+// where the finding came from.
+type CVE struct {
+	ID               string
+	PkgName          string
+	InstalledVersion string
+	FixedVersion     string
+	Severity         string
+	Title            string
+	Target           string
+}
+
+// Package is one row in the SBOM table on the image detail page.
+// Sourced from `Results[].Packages[]` when present (trivy emits it for
+// SBOM-formatted outputs); falls back to deduped vulnerability rows.
+type Package struct {
+	Name    string
+	Version string
+	Type    string
+	Source  string
+	Target  string
+}
+
+// severityRank orders trivy severities so the CVE table can be sorted
+// worst-first.  Unknown / non-canonical severities sink below LOW.
+var severityRank = map[string]int{
+	"CRITICAL": 0,
+	"HIGH":     1,
+	"MEDIUM":   2,
+	"LOW":      3,
+	"UNKNOWN":  4,
+}
+
+// vulnList flattens every Result.Vulnerabilities[] into a sorted slice
+// (worst severity first, then alphabetical CVE id).  Missing or
+// malformed reports return nil.
+func vulnList(report json.RawMessage) []CVE {
+	if len(report) == 0 || string(report) == "null" {
+		return nil
+	}
+	var doc struct {
+		Results []struct {
+			Target          string `json:"Target"`
+			Vulnerabilities []struct {
+				VulnerabilityID  string `json:"VulnerabilityID"`
+				PkgName          string `json:"PkgName"`
+				InstalledVersion string `json:"InstalledVersion"`
+				FixedVersion     string `json:"FixedVersion"`
+				Severity         string `json:"Severity"`
+				Title            string `json:"Title"`
+			} `json:"Vulnerabilities"`
+		} `json:"Results"`
+	}
+	if err := json.Unmarshal(report, &doc); err != nil {
+		return nil
+	}
+	var out []CVE
+	for _, r := range doc.Results {
+		for _, v := range r.Vulnerabilities {
+			out = append(out, CVE{
+				ID:               v.VulnerabilityID,
+				PkgName:          v.PkgName,
+				InstalledVersion: v.InstalledVersion,
+				FixedVersion:     v.FixedVersion,
+				Severity:         strings.ToUpper(v.Severity),
+				Title:            v.Title,
+				Target:           r.Target,
+			})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := severityRank[out[i].Severity], severityRank[out[j].Severity]
+		if ri == 0 && out[i].Severity != "CRITICAL" {
+			ri = 99
+		}
+		if rj == 0 && out[j].Severity != "CRITICAL" {
+			rj = 99
+		}
+		if ri != rj {
+			return ri < rj
+		}
+		if out[i].PkgName != out[j].PkgName {
+			return out[i].PkgName < out[j].PkgName
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+// packageList flattens every Result.Packages[] into a sorted slice for
+// the SBOM table.  When the report has no Packages array (typical for
+// vulnerability-only scans), falls back to the distinct
+// (PkgName, InstalledVersion, Target) tuples observed in
+// Vulnerabilities so operators always see something useful.
+func packageList(report json.RawMessage) []Package {
+	if len(report) == 0 || string(report) == "null" {
+		return nil
+	}
+	var doc struct {
+		Results []struct {
+			Target   string `json:"Target"`
+			Type     string `json:"Type"`
+			Class    string `json:"Class"`
+			Packages []struct {
+				Name    string `json:"Name"`
+				Version string `json:"Version"`
+				SrcName string `json:"SrcName"`
+				Layer   struct {
+					Digest string `json:"Digest"`
+				} `json:"Layer"`
+			} `json:"Packages"`
+			Vulnerabilities []struct {
+				PkgName          string `json:"PkgName"`
+				InstalledVersion string `json:"InstalledVersion"`
+			} `json:"Vulnerabilities"`
+		} `json:"Results"`
+	}
+	if err := json.Unmarshal(report, &doc); err != nil {
+		return nil
+	}
+
+	var out []Package
+	seen := map[string]struct{}{}
+	for _, r := range doc.Results {
+		if len(r.Packages) > 0 {
+			for _, p := range r.Packages {
+				key := p.Name + "@" + p.Version + "|" + r.Target
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				out = append(out, Package{
+					Name:    p.Name,
+					Version: p.Version,
+					Type:    r.Type,
+					Source:  p.SrcName,
+					Target:  r.Target,
+				})
+			}
+		}
+	}
+	if len(out) == 0 {
+		// Fall back to distinct (pkg, version, target) from vulns.
+		for _, r := range doc.Results {
+			for _, v := range r.Vulnerabilities {
+				key := v.PkgName + "@" + v.InstalledVersion + "|" + r.Target
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				out = append(out, Package{
+					Name:    v.PkgName,
+					Version: v.InstalledVersion,
+					Type:    r.Type,
+					Target:  r.Target,
+				})
+			}
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Target != out[j].Target {
+			return out[i].Target < out[j].Target
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// cveURL builds a stable lookup link for a vulnerability identifier.
+// CVE ids resolve to NVD; everything else (Alpine ALAS, GHSA, etc.)
+// falls back to a Google search so operators can still click through.
+func cveURL(id string) string {
+	id = strings.ToUpper(strings.TrimSpace(id))
+	if id == "" {
+		return ""
+	}
+	if strings.HasPrefix(id, "CVE-") {
+		return "https://nvd.nist.gov/vuln/detail/" + id
+	}
+	if strings.HasPrefix(id, "GHSA-") {
+		return "https://github.com/advisories/" + id
+	}
+	return "https://www.google.com/search?q=" + url.QueryEscape(id)
 }

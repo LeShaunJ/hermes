@@ -1,0 +1,26 @@
+{{define "_packages.html"}}
+{{if .}}
+<table class="packages">
+  <thead>
+    <tr>
+      <th>package</th>
+      <th>version</th>
+      <th>type</th>
+      <th>source</th>
+      <th>target</th>
+    </tr>
+  </thead>
+  <tbody>
+    {{range .}}
+      <tr>
+        <td><code>{{.Name}}</code></td>
+        <td class="muted"><code>{{.Version}}</code></td>
+        <td class="muted">{{.Type}}</td>
+        <td class="muted">{{if .Source}}<code>{{.Source}}</code>{{else}}—{{end}}</td>
+        <td class="muted">{{.Target}}</td>
+      </tr>
+    {{end}}
+  </tbody>
+</table>
+{{end}}
+{{end}}

@@ -2,8 +2,11 @@ package ui
 
 import (
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/leshaunj/hermes/internal/db"
 )
@@ -51,47 +54,16 @@ func (s *Server) dashboard(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// listImages renders the table of tracked images.  Query params:
-//
-//	state  one or more (comma-separated or repeated) states/groups
-//	ref    filter pattern, "[<registry>/][<namespace>/]<name>[:<tag>]"
-//	os     exact OS match
-//	arch   exact arch match
-//
-// htmx GETs targeting the table body include `Hx-Request: true`, in which
-// case only the rows partial is returned so the swap is in-place.
-func (s *Server) listImages(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-
-	filter := db.ListFilter{
-		OS:   q.Get("os"),
-		Arch: q.Get("arch"),
-	}
-
-	if refs := q["ref"]; len(refs) > 0 {
-		filter.Refs = refs
-	}
-
-	// Preserve every state token the operator typed so the form can
-	// re-render the same selection on refresh / direct load.  Each token
-	// may be a state name, a group name (`pending`/`verified`), or a
-	// comma-separated combination — flatten to a string slice for both
-	// DB filtering and the rendered <select>'s `selected` lookup.
-	var stateTokens []string
-	for _, raw := range q["state"] {
-		for _, item := range strings.Split(raw, ",") {
-			item = strings.TrimSpace(item)
-			if item == "" {
-				continue
-			}
-			states, err := db.ParseStateOrGroup(item)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			filter.States = append(filter.States, states...)
-			stateTokens = append(stateTokens, item)
-		}
+// imageTree renders the unified three-level tree view of tracked images.
+// All rows are emitted server-side; level 2 / 3 rows start `hidden` and
+// the htmx shim flips visibility on click + persists state in
+// localStorage.  Query params match the previous flat listing
+// (`state`, `os`, `arch`, `ref`) so deep-links keep working.
+func (s *Server) imageTree(w http.ResponseWriter, r *http.Request) {
+	filter, stateTokens, err := s.parseListFilter(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	imgs, err := s.db.List(filter)
@@ -102,18 +74,163 @@ func (s *Server) listImages(w http.ResponseWriter, r *http.Request) {
 
 	data := pageData{
 		Title:       "Images",
-		Images:      imgs,
+		Tree:        groupTree(imgs),
 		Filter:      filter,
 		StateTokens: stateTokens,
 		RefFilter:   strings.Join(filter.Refs, " "),
-		Query:       q.Encode(),
-	}
-
-	if r.Header.Get("Hx-Request") == "true" && r.Header.Get("Hx-Target") == "image-rows" {
-		s.tmpl.render(w, "_rows.html", data)
-		return
+		Query:       r.URL.Query().Encode(),
 	}
 	s.tmpl.render(w, "images.html", data)
+}
+
+// listRepos renders /repos — one row per (registry, repository).
+func (s *Server) listRepos(w http.ResponseWriter, r *http.Request) {
+	filter, stateTokens, err := s.parseListFilter(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	repos, err := s.db.ListRepos(filter)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.tmpl.render(w, "repos.html", pageData{
+		Title:       "Repositories",
+		Repos:       repos,
+		StateTokens: stateTokens,
+	})
+}
+
+// viewRepoOrTagSet handles both `/repos/{registry}/{path...}` and the
+// `/repos/{registry}/{path...}/tags/{digest}` drill-down.  Go's stdlib
+// mux requires the `{path...}` wildcard to be the last segment, so we
+// peel off any trailing `/tags/{digest}` here ourselves.
+func (s *Server) viewRepoOrTagSet(w http.ResponseWriter, r *http.Request) {
+	registry := r.PathValue("registry")
+	rest := r.PathValue("path")
+
+	// Detect a trailing /tags/<digest> segment.  rest contains literal
+	// slashes (e.g. `library/alpine` or `library/alpine/tags/sha256:abc`).
+	repoPath := rest
+	digest := ""
+	if i := strings.Index(rest, "/tags/"); i >= 0 {
+		repoPath = rest[:i]
+		raw := rest[i+len("/tags/"):]
+		if d, err := url.PathUnescape(raw); err == nil {
+			digest = d
+		} else {
+			digest = raw
+		}
+	}
+	if registry == "" || repoPath == "" {
+		http.Error(w, "missing registry or repository", http.StatusBadRequest)
+		return
+	}
+
+	if digest != "" {
+		s.viewTagSet(w, r, registry, repoPath, digest)
+		return
+	}
+	s.viewRepo(w, r, registry, repoPath)
+}
+
+func (s *Server) viewRepo(w http.ResponseWriter, r *http.Request, registry, repoPath string) {
+	tagSets, err := s.db.ListTagSets(registry, repoPath, db.ListFilter{})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	imgs, err := s.db.List(db.ListFilter{
+		Refs: []string{registry + "/" + repoPath},
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	summary := summarizeImages(imgs)
+	images := groupByTagDigest(imgs)
+
+	s.tmpl.render(w, "repo.html", pageData{
+		Title:        registry + "/" + repoPath,
+		RegistryURL:  registry,
+		RepoPath:     repoPath,
+		TagSets:      tagSets,
+		ImagesByTag:  images,
+		StateSummary: summary,
+	})
+}
+
+func (s *Server) viewTagSet(w http.ResponseWriter, r *http.Request, registry, repoPath, digest string) {
+	imgs, err := s.db.List(db.ListFilter{
+		Refs:      []string{registry + "/" + repoPath},
+		TagDigest: digest,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(imgs) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+
+	tagSet := db.TagSet{TagDigest: digest, States: map[string]int{}, UpdatedAt: imgs[0].UpdatedAt}
+	tagsSeen := map[string]struct{}{}
+	for _, img := range imgs {
+		if _, ok := tagsSeen[img.TagName]; !ok {
+			tagSet.Tags = append(tagSet.Tags, img.TagName)
+			tagsSeen[img.TagName] = struct{}{}
+		}
+		if img.ID != 0 {
+			tagSet.ImageCount++
+		}
+		tagSet.States[string(img.State)]++
+		if img.UpdatedAt.After(tagSet.UpdatedAt) {
+			tagSet.UpdatedAt = img.UpdatedAt
+		}
+	}
+	sort.Strings(tagSet.Tags)
+
+	s.tmpl.render(w, "tagset.html", pageData{
+		Title:        registry + "/" + repoPath + " · " + shortDigest(digest),
+		RegistryURL:  registry,
+		RepoPath:     repoPath,
+		TagSet:       &tagSet,
+		Images:       imgs,
+		StateSummary: summarizeImages(imgs),
+	})
+}
+
+// parseListFilter pulls state / os / arch / ref query params out of r and
+// returns the corresponding ListFilter and the raw state-token slice
+// (for re-rendering the form).
+func (s *Server) parseListFilter(r *http.Request) (db.ListFilter, []string, error) {
+	q := r.URL.Query()
+	filter := db.ListFilter{
+		OS:   q.Get("os"),
+		Arch: q.Get("arch"),
+	}
+	if refs := q["ref"]; len(refs) > 0 {
+		filter.Refs = refs
+	}
+	var stateTokens []string
+	for _, raw := range q["state"] {
+		for _, item := range strings.Split(raw, ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			states, err := db.ParseStateOrGroup(item)
+			if err != nil {
+				return db.ListFilter{}, nil, err
+			}
+			filter.States = append(filter.States, states...)
+			stateTokens = append(stateTokens, item)
+		}
+	}
+	return filter, stateTokens, nil
 }
 
 // viewImage renders the detail page for one image.
@@ -152,9 +269,171 @@ type pageData struct {
 	Image       *db.Image
 	Total       int
 	FlashMsg    string
+
+	// Tree view (/images): ordered list of repo nodes with nested tag-sets
+	// and per-platform image rows.
+	Tree []RepoNode
+
+	// /repos: flat list of repo summaries.
+	Repos []db.RepoSummary
+
+	// /repos/{registry}/{path...}: focused on one repo.
+	RegistryURL string
+	RepoPath    string
+	TagSets     []db.TagSet
+	ImagesByTag map[string][]db.Image // key = tag_digest; "" bucket = stub
+
+	// /repos/{registry}/{path...}/tags/{digest}: focused on one tag-set.
+	TagSet *db.TagSet
+
+	// State-summary chip data shared by repo / tag-set pages.
+	StateSummary []stateTile
 }
 
 type stateTile struct {
 	State db.State
 	Count int
+}
+
+// RepoNode is the level-1 tree entry feeding `templates/images.html`.
+type RepoNode struct {
+	RegistryURL string
+	Repository  string
+	UpdatedAt   time.Time
+	States      map[string]int
+	TagSets     []TagSetNode
+}
+
+// TagSetNode is the level-2 tree entry — a single top-level manifest
+// digest and the tag(s)/per-platform images it carries.
+type TagSetNode struct {
+	TagDigest string
+	Tags      []string
+	UpdatedAt time.Time
+	States    map[string]int
+	Images    []db.Image
+}
+
+// groupTree assembles imgs into the (repo → tag-set → image) tree the
+// images.html template iterates.  Repos are ordered by most-recent
+// activity; tag-sets within a repo similarly; tag names within a
+// tag-set are sorted lexicographically.  Stub images (empty TagDigest)
+// share the "" bucket so the unresolved-tags pile is visible at a
+// glance.
+func groupTree(imgs []db.Image) []RepoNode {
+	type repoKey struct{ Reg, Path string }
+	type tsKey struct {
+		Reg, Path, Digest string
+	}
+
+	repoIdx := map[repoKey]int{}
+	tsIdx := map[tsKey]int{}
+	tagSeen := map[tsKey]map[string]struct{}{}
+
+	var repos []RepoNode
+
+	for _, img := range imgs {
+		rk := repoKey{img.RegistryURL, img.Repository}
+		ri, ok := repoIdx[rk]
+		if !ok {
+			ri = len(repos)
+			repoIdx[rk] = ri
+			repos = append(repos, RepoNode{
+				RegistryURL: img.RegistryURL,
+				Repository:  img.Repository,
+				UpdatedAt:   img.UpdatedAt,
+				States:      map[string]int{},
+			})
+		}
+		repo := &repos[ri]
+		if img.UpdatedAt.After(repo.UpdatedAt) {
+			repo.UpdatedAt = img.UpdatedAt
+		}
+		repo.States[string(img.State)]++
+
+		tk := tsKey{img.RegistryURL, img.Repository, img.TagDigest}
+		ti, ok := tsIdx[tk]
+		if !ok {
+			ti = len(repo.TagSets)
+			tsIdx[tk] = ti
+			repo.TagSets = append(repo.TagSets, TagSetNode{
+				TagDigest: img.TagDigest,
+				UpdatedAt: img.UpdatedAt,
+				States:    map[string]int{},
+			})
+			tagSeen[tk] = map[string]struct{}{}
+		}
+		ts := &repo.TagSets[ti]
+		if img.UpdatedAt.After(ts.UpdatedAt) {
+			ts.UpdatedAt = img.UpdatedAt
+		}
+		ts.States[string(img.State)]++
+		ts.Images = append(ts.Images, img)
+		if _, seen := tagSeen[tk][img.TagName]; !seen {
+			ts.Tags = append(ts.Tags, img.TagName)
+			tagSeen[tk][img.TagName] = struct{}{}
+		}
+	}
+
+	// Order tag-sets within each repo by most-recent first; sort tag
+	// names alphabetically; sort repos by most-recent first.
+	for ri := range repos {
+		ts := repos[ri].TagSets
+		sort.SliceStable(ts, func(i, j int) bool {
+			if ts[i].UpdatedAt.Equal(ts[j].UpdatedAt) {
+				return ts[i].TagDigest < ts[j].TagDigest
+			}
+			return ts[i].UpdatedAt.After(ts[j].UpdatedAt)
+		})
+		for ti := range ts {
+			sort.Strings(ts[ti].Tags)
+		}
+	}
+	sort.SliceStable(repos, func(i, j int) bool {
+		if repos[i].UpdatedAt.Equal(repos[j].UpdatedAt) {
+			if repos[i].RegistryURL == repos[j].RegistryURL {
+				return repos[i].Repository < repos[j].Repository
+			}
+			return repos[i].RegistryURL < repos[j].RegistryURL
+		}
+		return repos[i].UpdatedAt.After(repos[j].UpdatedAt)
+	})
+	return repos
+}
+
+// groupByTagDigest buckets imgs by their top-level (`tag_digest`).
+// Stubs share the empty-digest bucket.  Used by the repo detail page so
+// the level-2 rows mirror the level-1 expanded view from `/images`.
+func groupByTagDigest(imgs []db.Image) map[string][]db.Image {
+	out := map[string][]db.Image{}
+	for _, img := range imgs {
+		out[img.TagDigest] = append(out[img.TagDigest], img)
+	}
+	return out
+}
+
+// summarizeImages returns ordered state-tile chips (non-zero counts only)
+// for a flat slice — used as the header summary on the repo and
+// tag-set pages.
+func summarizeImages(imgs []db.Image) []stateTile {
+	counts := map[db.State]int{}
+	for _, img := range imgs {
+		counts[img.State]++
+	}
+	order := []db.State{
+		db.StateQueued,
+		db.StateScanned,
+		db.StateRescinded,
+		db.StateVoided,
+		db.StateApproved,
+		db.StateRejected,
+		db.StateErrored,
+	}
+	out := make([]stateTile, 0, len(order))
+	for _, st := range order {
+		if c := counts[st]; c > 0 {
+			out = append(out, stateTile{State: st, Count: c})
+		}
+	}
+	return out
 }

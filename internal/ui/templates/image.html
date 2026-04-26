@@ -29,6 +29,18 @@
     <p class="muted">No scan report on file. Run a scan to populate.</p>
   {{end}}
 
+  {{$cves := vulnList .ScanReport}}
+  {{if $cves}}
+    <h2>Vulnerabilities ({{len $cves}})</h2>
+    {{template "_cves.html" $cves}}
+  {{end}}
+
+  {{$pkgs := packageList .ScanReport}}
+  {{if $pkgs}}
+    <h2>Packages ({{len $pkgs}})</h2>
+    {{template "_packages.html" $pkgs}}
+  {{end}}
+
   <h2>Manifest</h2>
   <pre class="json">{{prettyJSON .Manifest}}</pre>
 

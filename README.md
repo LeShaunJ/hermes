@@ -486,18 +486,22 @@ CLI version of the [`GET /healthz`](#get-healthz) endpoint.
 operator capabilities.  It talks to the same database and emits the same
 audit events, so CLI and UI activity remain interleaved in one event log.
 
-| Method | Path                       | Purpose                                              |
-|:-------|:---------------------------|:-----------------------------------------------------|
-| `GET`  | `/`                        | Dashboard — state counts and recent activity.        |
-| `GET`  | `/images`                  | Filterable image table; htmx-driven inline filters.  |
-| `GET`  | `/images/{id}`             | Image detail — manifest, scan summary, full report.  |
-| `POST` | `/images/{id}/approve`     | Set state to `approved` (form: `cache_url`).         |
-| `POST` | `/images/{id}/reject`      | Set state to `rejected`.                             |
-| `POST` | `/images/{id}/rescind`     | Set state to `rescinded`.                            |
-| `POST` | `/images/{id}/scan`        | Kick a trivy scan in the background; 202 + row swap. |
-| `GET`  | `/events`                  | Server-Sent Events feed of every new audit event.    |
-| `GET`  | `/static/...`              | Embedded CSS + minimal htmx shim.                    |
-| `GET`  | `/healthz`                 | Liveness probe — returns `ok\n`.                     |
+| Method | Path                                              | Purpose                                                          |
+|:-------|:--------------------------------------------------|:-----------------------------------------------------------------|
+| `GET`  | `/`                                               | Dashboard — state counts and recent activity.                    |
+| `GET`  | `/images`                                         | Three-level tree: repos → tag-sets → per-platform images. State persists via `localStorage`. |
+| `GET`  | `/images/{id}`                                    | Image detail — manifest, vulnerability table, SBOM, raw report. |
+| `GET`  | `/repos`                                          | Flat list of `(registry, repository)` summaries.                 |
+| `GET`  | `/repos/{registry}/{path...}`                     | Repo detail — tag-sets + per-platform drill-down.                |
+| `GET`  | `/repos/{registry}/{path...}/tags/{digest}`       | Tag-set detail — per-platform images for one top-level digest.   |
+| `POST` | `/images/{id}/approve`                            | Set state to `approved` (form: `cache_url`).                     |
+| `POST` | `/images/{id}/reject`                             | Set state to `rejected`.                                         |
+| `POST` | `/images/{id}/rescind`                            | Set state to `rescinded`.                                        |
+| `POST` | `/images/{id}/scan`                               | Kick a trivy scan in the background; 202 + row swap.             |
+| `POST` | `/images/{id}/fetch`                              | Promote a stub: fetch the manifest and replace with platform rows. |
+| `GET`  | `/events`                                         | Server-Sent Events feed of every new audit event.                |
+| `GET`  | `/static/...`                                     | Embedded CSS + minimal htmx shim.                                |
+| `GET`  | `/healthz`                                        | Liveness probe — returns `ok\n`.                                 |
 
 The dashboard subscribes to `/events` over SSE so the table and the live
 indicator update in place when any source — UI clicks, CLI commands, or

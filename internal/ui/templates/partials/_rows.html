@@ -1,7 +1,0 @@
-{{define "_rows.html"}}
-{{if .Images}}
-  {{range .Images}}{{template "_row.html" .}}{{end}}
-{{else}}
-  <tr><td colspan="6" class="muted">no images match</td></tr>
-{{end}}
-{{end}}

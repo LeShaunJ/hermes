@@ -1,0 +1,76 @@
+{{define "content"}}
+<section class="repo-detail">
+  <h1>
+    <a href="{{base}}/repos">repos</a> / {{.RegistryURL}}/{{.RepoPath}}
+  </h1>
+
+  <div class="state-summary">
+    {{range .StateSummary}}<span class="{{stateClass .State}}">{{.State}}: <strong>{{.Count}}</strong></span> {{end}}
+    {{if not .StateSummary}}<span class="muted">no images</span>{{end}}
+  </div>
+
+  <h2>Tag-sets</h2>
+  {{if .TagSets}}
+    <table class="images tree">
+      <thead>
+        <tr>
+          <th>tag(s)</th>
+          <th>images</th>
+          <th>digest</th>
+          <th>state</th>
+          <th>updated</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .TagSets}}
+          {{$digestKey := .TagDigest}}{{if eq $digestKey ""}}{{$digestKey = "stub"}}{{end}}
+          {{$rowID := printf "ts:%s|%s|%s" $.RegistryURL $.RepoPath $digestKey}}
+          {{$childGroup := printf "tg-%s" $rowID}}
+          {{$digestHref := pathEscape .TagDigest}}
+          <tr class="tree-row tree-lvl-1" id="row-{{$rowID}}">
+            <td>
+              {{if .TagDigest}}
+                <a href="{{base}}/repos/{{$.RegistryURL}}/{{$.RepoPath}}/tags/{{$digestHref}}">
+                  {{range .Tags}}<code class="tag">{{.}}</code> {{end}}
+                </a>
+              {{else}}
+                <span class="muted">unresolved</span>
+                {{range .Tags}}<code class="tag">{{.}}</code> {{end}}
+              {{end}}
+            </td>
+            <td class="muted">{{.ImageCount}}</td>
+            <td class="muted">{{if .TagDigest}}<code title="{{.TagDigest}}">{{shortDigest .TagDigest}}</code>{{else}}—{{end}}</td>
+            <td>{{template "_state_summary.html" .States}}</td>
+            <td class="muted" title="{{formatTime .UpdatedAt}}">{{formatRelative .UpdatedAt}}</td>
+            <td class="row-actions">
+              {{$imgs := index $.ImagesByTag .TagDigest}}
+              {{if $imgs}}
+                <button type="button"
+                        class="toggle"
+                        data-row-id="{{$rowID}}"
+                        data-expand-label="expand ({{len $imgs}})"
+                        aria-expanded="false"
+                        aria-controls="{{$childGroup}}">expand ({{len $imgs}})</button>
+              {{end}}
+            </td>
+          </tr>
+          {{$imgs := index $.ImagesByTag .TagDigest}}
+          {{range $imgs}}
+            <tr class="tree-row tree-lvl-2" id="image-{{.ID}}" data-group="{{$childGroup}}" hidden>
+              <td><a href="{{base}}/images/{{.ID}}">{{.TagName}}</a></td>
+              <td class="muted">{{if .OS}}{{.OS}}/{{.Arch}}{{else}}—{{end}}</td>
+              <td class="muted"><code title="{{.Digest}}">{{shortDigest .Digest}}</code></td>
+              <td><span class="{{stateClass .State}}">{{.State}}</span></td>
+              <td class="muted" title="{{formatTime .UpdatedAt}}">{{formatRelative .UpdatedAt}}</td>
+              <td class="row-actions">{{template "_actions.html" .}}</td>
+            </tr>
+          {{end}}
+        {{end}}
+      </tbody>
+    </table>
+  {{else}}
+    <p class="muted">No tag-sets yet for this repository.</p>
+  {{end}}
+</section>
+{{end}}

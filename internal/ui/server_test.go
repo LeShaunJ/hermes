@@ -26,6 +26,14 @@ type mockStorage struct {
 	listErr    error
 	listCalls  int
 
+	listReposResp []db.RepoSummary
+	listReposErr  error
+	listReposCall db.ListFilter
+
+	listTagSetsResp []db.TagSet
+	listTagSetsErr  error
+	listTagSetsArgs []listTagSetsArg
+
 	byID    map[int64]*db.Image
 	byIDErr error
 
@@ -53,6 +61,12 @@ type approveCall struct {
 	Cache string
 }
 
+type listTagSetsArg struct {
+	Registry string
+	Repo     string
+	Filter   db.ListFilter
+}
+
 type logEventCall struct {
 	ImageID *int64
 	Source  db.EventSource
@@ -65,6 +79,18 @@ func (m *mockStorage) List(_ db.ListFilter) ([]db.Image, error) {
 	defer m.mu.Unlock()
 	m.listCalls++
 	return m.listImages, m.listErr
+}
+func (m *mockStorage) ListRepos(f db.ListFilter) ([]db.RepoSummary, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.listReposCall = f
+	return m.listReposResp, m.listReposErr
+}
+func (m *mockStorage) ListTagSets(registry, repository string, f db.ListFilter) ([]db.TagSet, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.listTagSetsArgs = append(m.listTagSetsArgs, listTagSetsArg{Registry: registry, Repo: repository, Filter: f})
+	return m.listTagSetsResp, m.listTagSetsErr
 }
 func (m *mockStorage) GetByID(id int64) (*db.Image, error) {
 	m.mu.Lock()
@@ -247,22 +273,48 @@ func TestListImages_renders(t *testing.T) {
 	}
 }
 
-func TestListImages_htmxPartial(t *testing.T) {
-	mock := &mockStorage{
-		listImages: []db.Image{*newImg(7, db.StateApproved)},
-	}
+func TestImageTree_groupsByRepoAndTagDigest(t *testing.T) {
+	// Two tags pointing at the same tag_digest collapse to one tag-set
+	// containing two per-platform images.  A third stub falls into the
+	// empty-digest bucket of the same repo.
+	stub := newImg(13, db.StateQueued)
+	stub.Digest = ""
+	stub.TagDigest = ""
+	stub.Arch = ""
+	stub.OS = ""
+	stub.TagName = "edge"
+
+	a := newImg(7, db.StateApproved)
+	a.TagName = "latest"
+	a.TagDigest = "sha256:topAA"
+	a.Digest = "sha256:platAMD"
+	a.Arch = "amd64"
+
+	b := newImg(8, db.StateScanned)
+	b.TagName = "v1.2"
+	b.TagDigest = "sha256:topAA"
+	b.Digest = "sha256:platARM"
+	b.Arch = "arm64"
+
+	mock := &mockStorage{listImages: []db.Image{*stub, *a, *b}}
 	srv := newTestServer(t, mock)
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/images", nil)
-	r.Header.Set("Hx-Request", "true")
-	r.Header.Set("Hx-Target", "image-rows")
 	srv.Handler().ServeHTTP(w, r)
-	body := w.Body.String()
-	if strings.Contains(body, "<html") {
-		t.Errorf("htmx partial should not include layout html: %s", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
 	}
-	if !strings.Contains(body, "image-7") {
-		t.Errorf("partial missing row id: %s", body)
+	body := w.Body.String()
+	for _, want := range []string{
+		`row-repo:registry.example.com|myorg/myapp`,
+		`expand (2)`, // two tag-sets in the repo (one resolved, one stub)
+		`code class="tag">latest</code>`,
+		`code class="tag">v1.2</code>`,
+		`unresolved`, // stub bucket label
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n%s", want, body)
+		}
 	}
 }
 
@@ -842,6 +894,158 @@ func TestRowPartial_stubHasFetchAction(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, `/images/11/fetch`) {
 		t.Errorf("expected fetch button for stub row\n%s", body)
+	}
+}
+
+func TestListRepos_render(t *testing.T) {
+	mock := &mockStorage{
+		listReposResp: []db.RepoSummary{{
+			RegistryURL: "docker.io",
+			Repository:  "library/alpine",
+			TagSetCount: 2,
+			ImageCount:  9,
+			UpdatedAt:   time.Now(),
+			States:      map[string]int{"approved": 1, "queued": 8},
+		}},
+	}
+	srv := newTestServer(t, mock)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/repos", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`docker.io/library/alpine`,
+		`href="/repos/docker.io/library/alpine"`,
+		`approved: <strong>1</strong>`,
+		`queued: <strong>8</strong>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n%s", want, body)
+		}
+	}
+}
+
+func TestViewRepo_pathDecoding(t *testing.T) {
+	mock := &mockStorage{
+		listTagSetsResp: []db.TagSet{{
+			TagDigest:  "sha256:topAA",
+			Tags:       []string{"3.23.4", "latest"},
+			ImageCount: 8,
+			UpdatedAt:  time.Now(),
+			States:     map[string]int{"queued": 8},
+		}},
+		listImages: []db.Image{
+			{
+				ID: 1, RegistryURL: "docker.io", Repository: "library/alpine",
+				TagName: "latest", TagDigest: "sha256:topAA",
+				Digest: "sha256:platAMD", State: db.StateQueued,
+				UpdatedAt: time.Now(),
+			},
+		},
+	}
+	srv := newTestServer(t, mock)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/repos/docker.io/library/alpine", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if len(mock.listTagSetsArgs) != 1 {
+		t.Fatalf("ListTagSets calls = %d, want 1", len(mock.listTagSetsArgs))
+	}
+	got := mock.listTagSetsArgs[0]
+	if got.Registry != "docker.io" || got.Repo != "library/alpine" {
+		t.Errorf("ListTagSets args = (%q, %q), want (docker.io, library/alpine)", got.Registry, got.Repo)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "code class=\"tag\">latest</code>") {
+		t.Errorf("body missing latest tag chip\n%s", body)
+	}
+}
+
+func TestViewTagSet_digestRoundtrip(t *testing.T) {
+	mock := &mockStorage{
+		listImages: []db.Image{
+			{
+				ID: 99, RegistryURL: "docker.io", Repository: "library/alpine",
+				TagName: "latest", TagDigest: "sha256:topAA",
+				Digest: "sha256:platAMD", Arch: "amd64", OS: "linux",
+				State: db.StateScanned, UpdatedAt: time.Now(),
+			},
+		},
+	}
+	srv := newTestServer(t, mock)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/repos/docker.io/library/alpine/tags/sha256:topAA", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "image-99") {
+		t.Errorf("body missing image-99 row\n%s", body)
+	}
+	if !strings.Contains(body, "sha256:topAA") {
+		t.Errorf("body missing the full top-level digest\n%s", body)
+	}
+}
+
+func TestViewTagSet_notFound(t *testing.T) {
+	srv := newTestServer(t, &mockStorage{})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/repos/docker.io/library/alpine/tags/sha256:none", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestViewImage_rendersCVEAndSBOMTables(t *testing.T) {
+	report := json.RawMessage(`{
+		"Results": [{
+			"Target": "alpine 3.23.4 (alpine 3.23.4)",
+			"Type": "alpine",
+			"Vulnerabilities": [{
+				"VulnerabilityID": "CVE-2024-1234",
+				"PkgName": "openssl",
+				"InstalledVersion": "1.1.1",
+				"FixedVersion": "1.1.2",
+				"Severity": "HIGH",
+				"Title": "Heap buffer overflow"
+			}],
+			"Packages": [
+				{"Name": "musl", "Version": "1.2.5"},
+				{"Name": "openssl", "Version": "1.1.1"}
+			]
+		}]
+	}`)
+	img := newImg(42, db.StateScanned)
+	img.ScanReport = report
+	mock := &mockStorage{byID: map[int64]*db.Image{42: img}}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/images/42", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`Vulnerabilities (1)`,
+		`Packages (2)`,
+		`CVE-2024-1234`,
+		`Heap buffer overflow`,
+		`nvd.nist.gov/vuln/detail/CVE-2024-1234`,
+		`<code>musl</code>`,
+		`<code>openssl</code>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q", want)
+		}
 	}
 }
 

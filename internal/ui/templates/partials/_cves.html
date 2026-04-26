@@ -1,0 +1,28 @@
+{{define "_cves.html"}}
+{{if .}}
+<table class="cves">
+  <thead>
+    <tr>
+      <th>severity</th>
+      <th>id</th>
+      <th>package</th>
+      <th>installed</th>
+      <th>fixed</th>
+      <th>title</th>
+    </tr>
+  </thead>
+  <tbody>
+    {{range .}}
+      <tr class="cve-row sev-row-{{.Severity}}">
+        <td><span class="sev sev-{{.Severity}}">{{.Severity}}</span></td>
+        <td><a href="{{cveURL .ID}}" target="_blank" rel="noreferrer noopener"><code>{{.ID}}</code></a></td>
+        <td><code>{{.PkgName}}</code></td>
+        <td class="muted"><code>{{.InstalledVersion}}</code></td>
+        <td>{{if .FixedVersion}}<code>{{.FixedVersion}}</code>{{else}}<span class="muted">—</span>{{end}}</td>
+        <td class="cve-title">{{.Title}}</td>
+      </tr>
+    {{end}}
+  </tbody>
+</table>
+{{end}}
+{{end}}
