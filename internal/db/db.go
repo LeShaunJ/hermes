@@ -684,8 +684,17 @@ func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 		// Stub tag (no linked images) — fall through to populate.
 	}
 
-	// 3. Fetch the top-level manifest.
-	digest, mediaType, manifest, err := fetcher.FetchManifest(ref.Registry, ref.Repository, ref.Tag)
+	// 3. Fetch the top-level manifest.  ref.Registry may be a canonical
+	//    display alias (e.g. `docker.io`) that does not actually host the
+	//    /v2/ API — translate it through the mask chain to a concrete
+	//    upstream endpoint (`registry-1.docker.io`) for HTTPS calls.
+	//    Storage rows still key on the canonical id resolved above; only
+	//    the wire address changes.
+	upstream, err := d.UpstreamRegistryURL(ref.Registry)
+	if err != nil {
+		return nil, fmt.Errorf("resolve upstream for %s: %w", ref.Registry, err)
+	}
+	digest, mediaType, manifest, err := fetcher.FetchManifest(upstream, ref.Repository, ref.Tag)
 	if err != nil {
 		return nil, fmt.Errorf("fetch manifest for %s/%s:%s: %w", ref.Registry, ref.Repository, ref.Tag, err)
 	}
@@ -721,11 +730,11 @@ func (d *DB) Queue(ref ImageRef, fetcher Fetcher) ([]*Image, error) {
 	// 6. No alt-tag match — populate normally.
 	switch {
 	case isImageManifest(mediaType):
-		if err := d.queueSingleImage(tagID, repoID, ref.Registry, ref.Repository, topID, digest, mediaType, manifest, fetcher); err != nil {
+		if err := d.queueSingleImage(tagID, repoID, upstream, ref.Repository, topID, digest, mediaType, manifest, fetcher); err != nil {
 			return nil, err
 		}
 	case isImageIndex(mediaType):
-		if err := d.queueIndexImages(tagID, repoID, ref.Registry, ref.Repository, manifest, fetcher); err != nil {
+		if err := d.queueIndexImages(tagID, repoID, upstream, ref.Repository, manifest, fetcher); err != nil {
 			return nil, err
 		}
 	default:

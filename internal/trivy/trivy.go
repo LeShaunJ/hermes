@@ -56,6 +56,13 @@ func Scan(imageRef string, cfg config.TrivyConfig) (*ScanResult, error) {
 	cmd := execCommand("docker", args...)
 
 	stdout, _ := cmd.StdoutPipe()
+	// Capture stderr explicitly: cmd.Wait does NOT populate
+	// ExitError.Stderr unless the command was constructed with cmd.Output,
+	// so the previous formatter consistently reported an empty string and
+	// hid the real failure (e.g. "permission denied while trying to
+	// connect to the Docker daemon socket" or "Error: image not found").
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("run cmd: %w", err)
@@ -67,11 +74,15 @@ func Scan(imageRef string, cfg config.TrivyConfig) (*ScanResult, error) {
 	}
 
 	if err := cmd.Wait(); err != nil {
+		errBody := strings.TrimSpace(stderr.String())
+		if errBody == "" {
+			errBody = "(no stderr; check that the docker daemon is reachable from this container)"
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return nil, fmt.Errorf("trivy exited %d: %s", exitErr.ExitCode(), string(exitErr.Stderr))
+			return nil, fmt.Errorf("trivy exited %d: %s", exitErr.ExitCode(), errBody)
 		}
-		return nil, fmt.Errorf("run trivy: %w", err)
+		return nil, fmt.Errorf("run trivy: %w: %s", err, errBody)
 	}
 
 	// Strip any non-JSON lines that trivy may emit before the report (e.g.

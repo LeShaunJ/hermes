@@ -1232,20 +1232,23 @@ type mockFetcher struct {
 	manifestMediaType string
 	manifest          []byte
 	manifestErr       error
+	manifestRegistry  string // last registry seen by FetchManifest
 	configArch        string
 	configOS          string
 	configErr         error
 }
 
-func (m *mockFetcher) FetchManifest(_, _, _ string) (string, string, []byte, error) {
+func (m *mockFetcher) FetchManifest(registry, _, _ string) (string, string, []byte, error) {
+	m.manifestRegistry = registry
 	return m.manifestDigest, m.manifestMediaType, m.manifest, m.manifestErr
 }
 func (m *mockFetcher) FetchConfig(_, _, _ string) (string, string, error) {
 	return m.configArch, m.configOS, m.configErr
 }
 
-// expectCommonQueuePrefix expects the registry+repository upserts and the
-// getTagID lookup (returning no row).
+// expectCommonQueuePrefix expects the registry+repository upserts, the
+// getTagID lookup (returning no row), and the UpstreamRegistryURL probe
+// (returning no mask child so the input registry is used unchanged).
 func expectCommonQueuePrefix(mock sqlmock.Sqlmock) {
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
 		WithArgs("registry.example.com").
@@ -1255,6 +1258,9 @@ func expectCommonQueuePrefix(mock sqlmock.Sqlmock) {
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11)))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT child.url`)).
+		WithArgs("registry.example.com").
+		WillReturnRows(sqlmock.NewRows([]string{"url"}))
 }
 
 func TestQueue_singleImage(t *testing.T) {
@@ -1501,6 +1507,55 @@ func TestQueue_unknownMediaType(t *testing.T) {
 	_, err := d.Queue(ref, fetcher)
 	if err != nil {
 		t.Fatalf("Queue unknown media type: %v", err)
+	}
+}
+
+// TestQueue_translatesRegistryMaskBeforeFetch documents the docker.io →
+// registry-1.docker.io fix: when ref.Registry has mask children seeded
+// in registries, Queue must hand the concrete child URL to the fetcher
+// or the upstream fetch lands on the canonical alias's marketing site
+// instead of the /v2/ API.
+func TestQueue_translatesRegistryMaskBeforeFetch(t *testing.T) {
+	d, mock := newMockDB(t)
+
+	fetcher := &mockFetcher{
+		manifestDigest:    "sha256:abc",
+		manifestMediaType: "application/unknown",
+		manifest:          []byte(`{}`),
+	}
+
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO registries`)).
+		WithArgs("docker.io").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO repositories`)).
+		WithArgs(int64(1), "library/alpine").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11)))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM tags`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	// UpstreamRegistryURL finds the seeded mask child and returns it.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT child.url`)).
+		WithArgs("docker.io").
+		WillReturnRows(sqlmock.NewRows([]string{"url"}).AddRow("registry-1.docker.io"))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT ti.image`)).
+		WillReturnRows(sqlmock.NewRows([]string{"image"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO manifests`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(80)))
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO tags`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(3)))
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO images`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(50)))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO tag_images`)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`SELECT`).
+		WillReturnRows(testImageRow(50, "queued"))
+
+	ref := ImageRef{Registry: "docker.io", Repository: "library/alpine", Tag: "3.9.6"}
+	if _, err := d.Queue(ref, fetcher); err != nil {
+		t.Fatalf("Queue: %v", err)
+	}
+	if fetcher.manifestRegistry != "registry-1.docker.io" {
+		t.Errorf("fetcher saw registry %q, want registry-1.docker.io",
+			fetcher.manifestRegistry)
 	}
 }
 

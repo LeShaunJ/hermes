@@ -247,6 +247,25 @@ func TestScan_commandFails(t *testing.T) {
 	}
 }
 
+func TestScan_failureSurfacesStderr(t *testing.T) {
+	rec := &recorder{}
+	// /bin/sh -c "echo NOPE >&2; exit 13" — produces a real ExitError
+	// with non-empty stderr so the test verifies the error message
+	// includes whatever the failing docker/trivy invocation said.
+	withExec(t, rec.useReal("/bin/sh", "-c", "echo daemon-not-reachable 1>&2; exit 13"))
+
+	_, err := Scan("myimage:latest", config.TrivyConfig{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "exited 13") {
+		t.Errorf("error does not include exit code: %v", err)
+	}
+	if !strings.Contains(err.Error(), "daemon-not-reachable") {
+		t.Errorf("error does not include captured stderr: %v", err)
+	}
+}
+
 func TestScan_noJSON(t *testing.T) {
 	rec := &recorder{}
 	withExec(t, rec.useReal("echo", "no json output here"))

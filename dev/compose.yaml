@@ -34,6 +34,7 @@ services:
 
   # ── hermes (operator UI) ─────────────────────────────────────────────────────
   hermes-ui:
+    privileged: true
     build:
       context: ..
       dockerfile: Containerfile
