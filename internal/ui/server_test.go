@@ -273,6 +273,138 @@ func TestListImages_renders(t *testing.T) {
 	}
 }
 
+func TestImageTree_dedupsAliasedTagsToOneRowPerPlatform(t *testing.T) {
+	// `latest` and `3.23.4` both point at sha256:topAA which has 2 platform
+	// images.  `tag_image_rows` returns 2 tags × 2 images = 4 rows, but the
+	// rendered tree must show one row per platform (id=image-7 once,
+	// id=image-8 once) with both aliases preserved on the parent tag-set.
+	mk := func(id int64, tag, arch string) db.Image {
+		return db.Image{
+			ID:          id,
+			RegistryURL: "registry.example.com",
+			Repository:  "myorg/myapp",
+			TagName:     tag,
+			TagDigest:   "sha256:topAA",
+			Digest:      "sha256:plat" + arch,
+			Arch:        arch,
+			OS:          "linux",
+			State:       db.StateApproved,
+			UpdatedAt:   time.Now(),
+		}
+	}
+	mock := &mockStorage{listImages: []db.Image{
+		mk(7, "latest", "amd64"),
+		mk(8, "latest", "arm64"),
+		mk(7, "3.23.4", "amd64"),
+		mk(8, "3.23.4", "arm64"),
+	}}
+	srv := newTestServer(t, mock)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/images", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if got := strings.Count(body, `id="image-7"`); got != 1 {
+		t.Errorf("image-7 rows = %d, want 1\n%s", got, body)
+	}
+	if got := strings.Count(body, `id="image-8"`); got != 1 {
+		t.Errorf("image-8 rows = %d, want 1", got)
+	}
+	for _, tag := range []string{"latest", "3.23.4"} {
+		if !strings.Contains(body, `<code class="tag">`+tag+`</code>`) {
+			t.Errorf("missing alias %q", tag)
+		}
+	}
+	if !strings.Contains(body, `approved: <strong>2</strong>`) {
+		t.Errorf("expected dedup'd approved=2 on level-2 row, body lacked it\n%s", body)
+	}
+}
+
+func TestViewTagSet_dedupsAliasedRows(t *testing.T) {
+	mk := func(id int64, tag, arch string) db.Image {
+		return db.Image{
+			ID:          id,
+			RegistryURL: "docker.io",
+			Repository:  "library/alpine",
+			TagName:     tag,
+			TagDigest:   "sha256:topAA",
+			Digest:      "sha256:plat" + arch,
+			Arch:        arch,
+			OS:          "linux",
+			State:       db.StateScanned,
+			UpdatedAt:   time.Now(),
+		}
+	}
+	mock := &mockStorage{listImages: []db.Image{
+		mk(7, "latest", "amd64"),
+		mk(7, "3.23.4", "amd64"),
+		mk(8, "latest", "arm64"),
+		mk(8, "3.23.4", "arm64"),
+	}}
+	srv := newTestServer(t, mock)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/repos/docker.io/library/alpine/tags/sha256:topAA", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if got := strings.Count(body, `id="image-7"`); got != 1 {
+		t.Errorf("image-7 rows = %d, want 1", got)
+	}
+	if got := strings.Count(body, `id="image-8"`); got != 1 {
+		t.Errorf("image-8 rows = %d, want 1", got)
+	}
+}
+
+func TestViewRepo_dedupsAliasedRows(t *testing.T) {
+	mk := func(id int64, tag, arch string) db.Image {
+		return db.Image{
+			ID:          id,
+			RegistryURL: "docker.io",
+			Repository:  "library/alpine",
+			TagName:     tag,
+			TagDigest:   "sha256:topAA",
+			Digest:      "sha256:plat" + arch,
+			Arch:        arch,
+			OS:          "linux",
+			State:       db.StateApproved,
+			UpdatedAt:   time.Now(),
+		}
+	}
+	mock := &mockStorage{
+		listTagSetsResp: []db.TagSet{{
+			TagDigest:  "sha256:topAA",
+			Tags:       []string{"3.23.4", "latest"},
+			ImageCount: 2,
+			UpdatedAt:  time.Now(),
+			States:     map[string]int{"approved": 2},
+		}},
+		listImages: []db.Image{
+			mk(7, "latest", "amd64"),
+			mk(7, "3.23.4", "amd64"),
+			mk(8, "latest", "arm64"),
+			mk(8, "3.23.4", "arm64"),
+		},
+	}
+	srv := newTestServer(t, mock)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/repos/docker.io/library/alpine", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if got := strings.Count(body, `id="image-7"`); got != 1 {
+		t.Errorf("image-7 rows = %d, want 1", got)
+	}
+	if got := strings.Count(body, `id="image-8"`); got != 1 {
+		t.Errorf("image-8 rows = %d, want 1", got)
+	}
+}
+
 func TestImageTree_groupsByRepoAndTagDigest(t *testing.T) {
 	// Two tags pointing at the same tag_digest collapse to one tag-set
 	// containing two per-platform images.  A third stub falls into the

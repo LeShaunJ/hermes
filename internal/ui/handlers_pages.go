@@ -146,6 +146,9 @@ func (s *Server) viewRepo(w http.ResponseWriter, r *http.Request, registry, repo
 		return
 	}
 
+	// Same alias-fanout as in groupTree — collapse duplicates so the
+	// per-platform list under a tag-set has one row per real image.
+	imgs = dedupImages(imgs)
 	summary := summarizeImages(imgs)
 	images := groupByTagDigest(imgs)
 
@@ -175,11 +178,19 @@ func (s *Server) viewTagSet(w http.ResponseWriter, r *http.Request, registry, re
 
 	tagSet := db.TagSet{TagDigest: digest, States: map[string]int{}, UpdatedAt: imgs[0].UpdatedAt}
 	tagsSeen := map[string]struct{}{}
+	imgSeen := map[string]struct{}{}
+	deduped := make([]db.Image, 0, len(imgs))
 	for _, img := range imgs {
 		if _, ok := tagsSeen[img.TagName]; !ok {
 			tagSet.Tags = append(tagSet.Tags, img.TagName)
 			tagsSeen[img.TagName] = struct{}{}
 		}
+		key := imageDedupKey(img)
+		if _, dup := imgSeen[key]; dup {
+			continue
+		}
+		imgSeen[key] = struct{}{}
+		deduped = append(deduped, img)
 		if img.ID != 0 {
 			tagSet.ImageCount++
 		}
@@ -195,8 +206,8 @@ func (s *Server) viewTagSet(w http.ResponseWriter, r *http.Request, registry, re
 		RegistryURL:  registry,
 		RepoPath:     repoPath,
 		TagSet:       &tagSet,
-		Images:       imgs,
-		StateSummary: summarizeImages(imgs),
+		Images:       deduped,
+		StateSummary: summarizeImages(deduped),
 	})
 }
 
@@ -317,6 +328,12 @@ type TagSetNode struct {
 // tag-set are sorted lexicographically.  Stub images (empty TagDigest)
 // share the "" bucket so the unresolved-tags pile is visible at a
 // glance.
+//
+// `tag_image_rows` produces one row per (tag, platform) — when several
+// tags point at the same top-level digest (e.g. `latest` + `3.23.4`)
+// each platform image appears once per aliasing tag.  We dedup by
+// image id within a tag-set so the rendered tree shows one row per
+// platform, with the aliases collected on the parent tag-set row.
 func groupTree(imgs []db.Image) []RepoNode {
 	type repoKey struct{ Reg, Path string }
 	type tsKey struct {
@@ -326,6 +343,7 @@ func groupTree(imgs []db.Image) []RepoNode {
 	repoIdx := map[repoKey]int{}
 	tsIdx := map[tsKey]int{}
 	tagSeen := map[tsKey]map[string]struct{}{}
+	imgSeen := map[tsKey]map[string]struct{}{}
 
 	var repos []RepoNode
 
@@ -346,7 +364,6 @@ func groupTree(imgs []db.Image) []RepoNode {
 		if img.UpdatedAt.After(repo.UpdatedAt) {
 			repo.UpdatedAt = img.UpdatedAt
 		}
-		repo.States[string(img.State)]++
 
 		tk := tsKey{img.RegistryURL, img.Repository, img.TagDigest}
 		ti, ok := tsIdx[tk]
@@ -359,17 +376,30 @@ func groupTree(imgs []db.Image) []RepoNode {
 				States:    map[string]int{},
 			})
 			tagSeen[tk] = map[string]struct{}{}
+			imgSeen[tk] = map[string]struct{}{}
 		}
 		ts := &repo.TagSets[ti]
 		if img.UpdatedAt.After(ts.UpdatedAt) {
 			ts.UpdatedAt = img.UpdatedAt
 		}
-		ts.States[string(img.State)]++
-		ts.Images = append(ts.Images, img)
 		if _, seen := tagSeen[tk][img.TagName]; !seen {
 			ts.Tags = append(ts.Tags, img.TagName)
 			tagSeen[tk][img.TagName] = struct{}{}
 		}
+
+		// Skip duplicate platform-image rows produced by alias tags
+		// pointing at the same digest.  Stubs (ID == 0) have no image
+		// row to dedup against, so key on tag name instead so each
+		// distinct stub tag still appears.
+		key := imageDedupKey(img)
+		if _, dup := imgSeen[tk][key]; dup {
+			continue
+		}
+		imgSeen[tk][key] = struct{}{}
+
+		repo.States[string(img.State)]++
+		ts.States[string(img.State)]++
+		ts.Images = append(ts.Images, img)
 	}
 
 	// Order tag-sets within each repo by most-recent first; sort tag
@@ -396,6 +426,35 @@ func groupTree(imgs []db.Image) []RepoNode {
 		return repos[i].UpdatedAt.After(repos[j].UpdatedAt)
 	})
 	return repos
+}
+
+// imageDedupKey returns a stable identifier for one platform-image row
+// suitable for collapsing duplicates from `tag_image_rows` when several
+// tags alias the same digest.  Real image rows (ID != 0) key on the
+// integer id; stub rows (ID == 0) key on the tag name so distinct
+// unresolved tags survive deduplication.
+func imageDedupKey(img db.Image) string {
+	if img.ID != 0 {
+		return strconv.FormatInt(img.ID, 10)
+	}
+	return "stub:" + img.TagName
+}
+
+// dedupImages collapses duplicate platform-image rows produced by the
+// (tag × image) JOIN when multiple aliasing tags point at the same
+// digest.  See imageDedupKey for the bucketing rule.
+func dedupImages(imgs []db.Image) []db.Image {
+	seen := make(map[string]struct{}, len(imgs))
+	out := make([]db.Image, 0, len(imgs))
+	for _, img := range imgs {
+		key := imageDedupKey(img)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, img)
+	}
+	return out
 }
 
 // groupByTagDigest buckets imgs by their top-level (`tag_digest`).
