@@ -70,6 +70,67 @@ func (s *Server) actionRescind(w http.ResponseWriter, r *http.Request) {
 	s.respondAction(w, r, id)
 }
 
+// actionFetch handles POST /images/{id}/fetch.  Stub rows have no
+// manifest yet — the gateway saw the tag but the operator never ran
+// `hermes scan` to populate it.  This action calls db.Queue (the same
+// path the CLI uses) which fetches the manifest and writes one image
+// row per platform.  The stub row is replaced in-place by the new
+// per-platform rows via an outerHTML swap.
+func (s *Server) actionFetch(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.actionPrep(w, r)
+	if !ok {
+		return
+	}
+	stub, err := s.db.GetByID(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if stub == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !isStub(*stub) {
+		http.Error(w, "image is already fetched; use scan to refresh", http.StatusConflict)
+		return
+	}
+	ref := db.ImageRef{
+		Registry:   stub.RegistryURL,
+		Repository: stub.Repository,
+		Tag:        stub.TagName,
+	}
+	imgs, err := s.db.Queue(ref, s.fetcher)
+	if err != nil {
+		_ = s.db.LogEvent(&id, db.SourceAPI, "fetch_error", map[string]interface{}{
+			"source": "ui",
+			"error":  err.Error(),
+		})
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	_ = s.db.LogEvent(&id, db.SourceAPI, "fetch", map[string]interface{}{
+		"source":   "ui",
+		"registry": stub.RegistryURL,
+		"repo":     stub.Repository,
+		"tag":      stub.TagName,
+		"count":    len(imgs),
+	})
+
+	if r.Header.Get("Hx-Request") != "true" {
+		http.Redirect(w, r, fmt.Sprintf("%s/images?ref=%s/%s:%s",
+			s.cfg.UI.BasePath, stub.RegistryURL, stub.Repository, stub.TagName),
+			http.StatusSeeOther)
+		return
+	}
+	rendered := make([]db.Image, 0, len(imgs))
+	for _, p := range imgs {
+		if p != nil {
+			rendered = append(rendered, *p)
+		}
+	}
+	s.tmpl.render(w, "_rowset.html", rendered)
+}
+
 // actionScan handles POST /images/{id}/scan.  The trivy invocation is
 // long-running, so it is dispatched on a background goroutine; this
 // handler returns immediately with the row partial in its "scanning…"

@@ -482,6 +482,14 @@ func (d *DB) resolveRepository(ref ImageRef) (registryID, repoID int64, err erro
 // those are content-determined and therefore shared across every location
 // that observes this digest.
 func (d *DB) upsertManifest(digest, mediaType string, body []byte, arch, os string) (int64, error) {
+	// `body` is bound for a jsonb column, so anything other than well-formed
+	// UTF-8 JSON makes Postgres return a cryptic 22P02. Validate up front so
+	// the operator sees what the registry actually returned (the leading
+	// bytes most often reveal an HTML error page or an upstream redirect).
+	if !json.Valid(body) {
+		return 0, fmt.Errorf("manifest body is not valid JSON (digest=%q, media_type=%q, %d bytes): %s",
+			digest, mediaType, len(body), bodyPreview(body))
+	}
 	var id int64
 	err := d.db.QueryRow(`
 		INSERT INTO manifests (digest, media_type, body, arch, os)
@@ -494,6 +502,17 @@ func (d *DB) upsertManifest(digest, mediaType string, body []byte, arch, os stri
 		digest, mediaType, body, arch, os,
 	).Scan(&id)
 	return id, err
+}
+
+// bodyPreview returns a single-line, length-bounded rendering of a manifest
+// body for diagnostic error messages.  Bytes are quoted so newlines, NULs
+// and other unprintables are visible.
+func bodyPreview(body []byte) string {
+	const max = 200
+	if len(body) > max {
+		body = body[:max]
+	}
+	return strconv.Quote(string(body))
 }
 
 // upsertBlob inserts a blob digest if absent and returns its id.  Size and

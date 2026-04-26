@@ -30,6 +30,7 @@ import (
 
 	"github.com/leshaunj/hermes/internal/config"
 	"github.com/leshaunj/hermes/internal/db"
+	"github.com/leshaunj/hermes/internal/oci"
 	"github.com/leshaunj/hermes/internal/trivy"
 )
 
@@ -38,6 +39,7 @@ import (
 type storage interface {
 	List(f db.ListFilter) ([]db.Image, error)
 	GetByID(id int64) (*db.Image, error)
+	Queue(ref db.ImageRef, fetcher db.Fetcher) ([]*db.Image, error)
 	Approve(imageID int64, cacheRegistry string) error
 	Reject(imageID int64) error
 	Rescind(imageID int64) error
@@ -52,12 +54,13 @@ type scanFunc func(imageRef string, cfg config.TrivyConfig) (*trivy.ScanResult, 
 
 // Server is the hermes operator web console.
 type Server struct {
-	db   storage
-	cfg  *config.Config
-	mux  *http.ServeMux
-	hub  *eventHub
-	tmpl *templates
-	scan scanFunc
+	db      storage
+	cfg     *config.Config
+	mux     *http.ServeMux
+	hub     *eventHub
+	tmpl    *templates
+	scan    scanFunc
+	fetcher db.Fetcher
 }
 
 // New creates a Server and registers all routes.  Templates and static
@@ -72,12 +75,13 @@ func New(database storage, cfg *config.Config) *Server {
 	}
 
 	s := &Server{
-		db:   database,
-		cfg:  cfg,
-		mux:  http.NewServeMux(),
-		hub:  newEventHub(),
-		tmpl: tmpl,
-		scan: trivy.Scan,
+		db:      database,
+		cfg:     cfg,
+		mux:     http.NewServeMux(),
+		hub:     newEventHub(),
+		tmpl:    tmpl,
+		scan:    trivy.Scan,
+		fetcher: oci.NewDefaultClient(),
 	}
 
 	staticFS, err := fs.Sub(staticAssets, "static")
@@ -92,6 +96,7 @@ func New(database storage, cfg *config.Config) *Server {
 	s.mux.HandleFunc("POST /images/{id}/reject", s.actionReject)
 	s.mux.HandleFunc("POST /images/{id}/rescind", s.actionRescind)
 	s.mux.HandleFunc("POST /images/{id}/scan", s.actionScan)
+	s.mux.HandleFunc("POST /images/{id}/fetch", s.actionFetch)
 	s.mux.HandleFunc("GET /events", s.serveEvents)
 	s.mux.HandleFunc("GET /healthz", s.serveHealthz)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
@@ -119,6 +124,11 @@ func (s *Server) Subscribe(events <-chan *db.Event) {
 // SetScanFunc overrides the trivy.Scan implementation used by the scan
 // action handler.  Intended for tests that must not invoke real trivy.
 func (s *Server) SetScanFunc(fn scanFunc) { s.scan = fn }
+
+// SetFetcher overrides the OCI client used to fetch manifests when
+// promoting a stub image.  Intended for tests that must not hit the
+// network.
+func (s *Server) SetFetcher(f db.Fetcher) { s.fetcher = f }
 
 func (s *Server) serveHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))

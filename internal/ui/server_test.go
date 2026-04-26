@@ -29,6 +29,10 @@ type mockStorage struct {
 	byID    map[int64]*db.Image
 	byIDErr error
 
+	queueResp  []*db.Image
+	queueErr   error
+	queueCalls []db.ImageRef
+
 	approveErr   error
 	approveCalls []approveCall
 	rejectErr    error
@@ -69,6 +73,15 @@ func (m *mockStorage) GetByID(id int64) (*db.Image, error) {
 		return nil, m.byIDErr
 	}
 	return m.byID[id], nil
+}
+func (m *mockStorage) Queue(ref db.ImageRef, _ db.Fetcher) ([]*db.Image, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.queueCalls = append(m.queueCalls, ref)
+	if m.queueErr != nil {
+		return nil, m.queueErr
+	}
+	return m.queueResp, nil
 }
 func (m *mockStorage) Approve(id int64, cache string) error {
 	m.mu.Lock()
@@ -711,6 +724,124 @@ func TestActionApprove_redirectUsesBasePath(t *testing.T) {
 	srv.Handler().ServeHTTP(w, r)
 	if got := w.Header().Get("Location"); got != "/ui/images/2" {
 		t.Errorf("location = %q, want /ui/images/2", got)
+	}
+}
+
+func TestActionFetch(t *testing.T) {
+	stub := newImg(50, db.StateQueued)
+	stub.Digest = ""
+	stub.Arch = ""
+	stub.OS = ""
+
+	platformAMD := newImg(51, db.StateQueued)
+	platformARM := newImg(52, db.StateQueued)
+	platformARM.Arch = "arm64"
+
+	mock := &mockStorage{
+		byID:      map[int64]*db.Image{50: stub},
+		queueResp: []*db.Image{platformAMD, platformARM},
+	}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/50/fetch", nil)
+	r.Header.Set("Hx-Request", "true")
+	srv.Handler().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
+	}
+	if len(mock.queueCalls) != 1 {
+		t.Fatalf("expected one Queue call, got %d", len(mock.queueCalls))
+	}
+	gotRef := mock.queueCalls[0]
+	wantRef := db.ImageRef{
+		Registry:   stub.RegistryURL,
+		Repository: stub.Repository,
+		Tag:        stub.TagName,
+	}
+	if gotRef != wantRef {
+		t.Errorf("Queue ref = %+v, want %+v", gotRef, wantRef)
+	}
+	if !containsEvent(mock.logEvents, "fetch") {
+		t.Errorf("missing fetch event: %#v", mock.logEvents)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`id="image-51"`, `id="image-52"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n%s", want, body)
+		}
+	}
+}
+
+func TestActionFetch_notStub(t *testing.T) {
+	full := newImg(60, db.StateScanned)
+	mock := &mockStorage{byID: map[int64]*db.Image{60: full}}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/60/fetch", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", w.Code)
+	}
+}
+
+func TestActionFetch_queueError(t *testing.T) {
+	stub := newImg(70, db.StateQueued)
+	stub.Digest = ""
+	mock := &mockStorage{
+		byID:     map[int64]*db.Image{70: stub},
+		queueErr: errors.New("upstream 404"),
+	}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/70/fetch", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", w.Code)
+	}
+	if !containsEvent(mock.logEvents, "fetch_error") {
+		t.Errorf("expected fetch_error event")
+	}
+}
+
+func TestActionFetch_notFound(t *testing.T) {
+	srv := newTestServer(t, &mockStorage{byID: map[int64]*db.Image{}})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/99/fetch", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestListImages_stateSelectedReflectsQuery(t *testing.T) {
+	mock := &mockStorage{}
+	srv := newTestServer(t, mock)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/images?state=approved", nil)
+	srv.Handler().ServeHTTP(w, r)
+	body := w.Body.String()
+	if !strings.Contains(body, `value="approved"  selected`) {
+		t.Errorf("expected approved option to be marked selected\n%s", body)
+	}
+}
+
+func TestRowPartial_stubHasFetchAction(t *testing.T) {
+	stub := newImg(11, db.StateQueued)
+	stub.Digest = ""
+	mock := &mockStorage{
+		listImages: []db.Image{*stub},
+	}
+	srv := newTestServer(t, mock)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/images", nil)
+	srv.Handler().ServeHTTP(w, r)
+	body := w.Body.String()
+	if !strings.Contains(body, `/images/11/fetch`) {
+		t.Errorf("expected fetch button for stub row\n%s", body)
 	}
 }
 

@@ -90,6 +90,18 @@ table.images.compact th, table.images.compact td { padding: 6px 8px; }
   border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px;
   font: inherit;
 }
+/* Override the OS-native select chrome so it matches the text inputs.
+   The chevron is an inline SVG data URL pinned to the right padding. */
+.filters select {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  padding-right: 26px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'><path fill='%238a93a0' d='M0 0h12L6 8z'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 10px 6px;
+}
 button, .filters button {
   background: var(--accent); color: #fff; border: 0;
   border-radius: 4px; padding: 6px 12px; font: inherit; cursor: pointer;
@@ -104,8 +116,17 @@ button:hover { filter: brightness(1.1); }
   gap: 8px 16px; padding: 16px; background: var(--panel);
   border: 1px solid var(--line); border-radius: 6px; margin: 16px 0;
 }
-.image-detail .meta div { display: flex; flex-direction: column; }
+.image-detail .meta div { display: flex; flex-direction: column; min-width: 0; }
 .image-detail .meta .muted { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+/* Long values (digests, cache URLs) truncate with an ellipsis instead of
+   blowing the cell out and forcing horizontal scroll. The full value
+   stays available via the inline `code` element's title attribute. */
+.image-detail .meta code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
 .image-detail .actions { margin: 16px 0; }
 .image-detail .actions-inline { justify-content: flex-start; }
 

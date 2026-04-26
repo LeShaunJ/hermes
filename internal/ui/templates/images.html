@@ -1,4 +1,5 @@
 {{define "content"}}
+{{$selected := ""}}{{if .StateTokens}}{{$selected = index .StateTokens 0}}{{end}}
 <section class="images">
   <h1>Images</h1>
 
@@ -7,21 +8,21 @@
         hx-headers='{"Hx-Target": "image-rows"}' hx-push-url="true">
     <label>state
       <select name="state">
-        <option value="">all</option>
-        <option value="pending">pending</option>
-        <option value="verified">verified</option>
-        <option value="queued">queued</option>
-        <option value="scanned">scanned</option>
-        <option value="approved">approved</option>
-        <option value="rejected">rejected</option>
-        <option value="rescinded">rescinded</option>
-        <option value="voided">voided</option>
-        <option value="errored">errored</option>
+        <option value=""          {{if eq $selected ""}}selected{{end}}>all</option>
+        <option value="pending"   {{if eq $selected "pending"}}selected{{end}}>pending</option>
+        <option value="verified"  {{if eq $selected "verified"}}selected{{end}}>verified</option>
+        <option value="queued"    {{if eq $selected "queued"}}selected{{end}}>queued</option>
+        <option value="scanned"   {{if eq $selected "scanned"}}selected{{end}}>scanned</option>
+        <option value="approved"  {{if eq $selected "approved"}}selected{{end}}>approved</option>
+        <option value="rejected"  {{if eq $selected "rejected"}}selected{{end}}>rejected</option>
+        <option value="rescinded" {{if eq $selected "rescinded"}}selected{{end}}>rescinded</option>
+        <option value="voided"    {{if eq $selected "voided"}}selected{{end}}>voided</option>
+        <option value="errored"   {{if eq $selected "errored"}}selected{{end}}>errored</option>
       </select>
     </label>
     <label>os <input type="text" name="os" value="{{.Filter.OS}}" placeholder="linux"></label>
     <label>arch <input type="text" name="arch" value="{{.Filter.Arch}}" placeholder="amd64"></label>
-    <label>ref <input type="text" name="ref" placeholder="myorg/myapp:v1"></label>
+    <label>ref <input type="text" name="ref" value="{{.RefFilter}}" placeholder="myorg/myapp:v1"></label>
     <button type="submit">filter</button>
   </form>
 

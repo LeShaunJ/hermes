@@ -4,7 +4,11 @@
 {{$stub := isStub .}}
 {{$base := base}}
 <div class="actions-inline">
-  {{if not $stub}}
+  {{if $stub}}
+    <button hx-post="{{$base}}/images/{{$id}}/fetch" hx-target="#image-{{$id}}" hx-swap="outerHTML">fetch</button>
+    <button hx-post="{{$base}}/images/{{$id}}/reject" hx-target="#image-{{$id}}" hx-swap="outerHTML"
+            hx-confirm="Reject {{.Repository}}:{{.TagName}}?">reject</button>
+  {{else}}
     {{if eq $state "queued"}}
       <button hx-post="{{$base}}/images/{{$id}}/scan" hx-target="#image-{{$id}}" hx-swap="outerHTML">scan</button>
     {{else if eq $state "scanned"}}

@@ -9,7 +9,7 @@
   <div class="meta">
     <div><span class="muted">state</span> <span class="{{stateClass .State}}">{{.State}}</span></div>
     <div><span class="muted">platform</span> {{if .OS}}{{.OS}}/{{.Arch}}{{else}}—{{end}}</div>
-    <div><span class="muted">digest</span> <code>{{.Digest}}</code></div>
+    <div><span class="muted">digest</span> <code title="{{.Digest}}">{{.Digest}}</code></div>
     <div><span class="muted">cache</span> {{if .CacheRegistry}}{{.CacheRegistry}}{{else}}—{{end}}</div>
     <div><span class="muted">created</span> {{formatTime .CreatedAt}}</div>
     <div><span class="muted">updated</span> {{formatTime .UpdatedAt}}</div>

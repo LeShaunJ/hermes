@@ -72,6 +72,12 @@ func (s *Server) listImages(w http.ResponseWriter, r *http.Request) {
 		filter.Refs = refs
 	}
 
+	// Preserve every state token the operator typed so the form can
+	// re-render the same selection on refresh / direct load.  Each token
+	// may be a state name, a group name (`pending`/`verified`), or a
+	// comma-separated combination — flatten to a string slice for both
+	// DB filtering and the rendered <select>'s `selected` lookup.
+	var stateTokens []string
 	for _, raw := range q["state"] {
 		for _, item := range strings.Split(raw, ",") {
 			item = strings.TrimSpace(item)
@@ -84,6 +90,7 @@ func (s *Server) listImages(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			filter.States = append(filter.States, states...)
+			stateTokens = append(stateTokens, item)
 		}
 	}
 
@@ -94,10 +101,12 @@ func (s *Server) listImages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := pageData{
-		Title:  "Images",
-		Images: imgs,
-		Filter: filter,
-		Query:  q.Encode(),
+		Title:       "Images",
+		Images:      imgs,
+		Filter:      filter,
+		StateTokens: stateTokens,
+		RefFilter:   strings.Join(filter.Refs, " "),
+		Query:       q.Encode(),
 	}
 
 	if r.Header.Get("Hx-Request") == "true" && r.Header.Get("Hx-Target") == "image-rows" {
@@ -132,15 +141,17 @@ func (s *Server) viewImage(w http.ResponseWriter, r *http.Request) {
 // pageData is the unified template input.  Templates touch only the fields
 // they need; unset fields render as empty.
 type pageData struct {
-	Title    string
-	Tiles    []stateTile
-	Recent   []db.Image
-	Images   []db.Image
-	Filter   db.ListFilter
-	Query    string
-	Image    *db.Image
-	Total    int
-	FlashMsg string
+	Title       string
+	Tiles       []stateTile
+	Recent      []db.Image
+	Images      []db.Image
+	Filter      db.ListFilter
+	StateTokens []string // raw state/group tokens from the query, for re-rendering the form
+	RefFilter   string   // joined `ref` query values, for re-populating the input
+	Query       string
+	Image       *db.Image
+	Total       int
+	FlashMsg    string
 }
 
 type stateTile struct {

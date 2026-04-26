@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -194,6 +195,23 @@ func TestUpsertManifest(t *testing.T) {
 	}
 	if id != 33 {
 		t.Errorf("id = %d, want 33", id)
+	}
+}
+
+func TestUpsertManifest_invalidJSONReturnsClearError(t *testing.T) {
+	d, _ := newMockDB(t)
+	// No mock.ExpectQuery — validation must short-circuit before the
+	// driver is touched, otherwise a real upstream that returned HTML
+	// would still produce a cryptic Postgres 22P02.
+	body := []byte("<!DOCTYPE html><html><body>not a manifest</body></html>")
+	_, err := d.upsertManifest("sha256:abc", mediaTypeOCIManifest, body, "", "")
+	if err == nil {
+		t.Fatal("upsertManifest accepted non-JSON body")
+	}
+	for _, want := range []string{"not valid JSON", `"<!DOCTYPE`, "media_type"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing substring %q", err.Error(), want)
+		}
 	}
 }
 
