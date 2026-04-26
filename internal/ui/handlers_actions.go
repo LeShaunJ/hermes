@@ -154,7 +154,7 @@ func (s *Server) actionPrep(w http.ResponseWriter, r *http.Request) (int64, bool
 // redirected to the image detail page.
 func (s *Server) respondAction(w http.ResponseWriter, r *http.Request, id int64) {
 	if r.Header.Get("Hx-Request") != "true" {
-		http.Redirect(w, r, fmt.Sprintf("/images/%d", id), http.StatusSeeOther)
+		http.Redirect(w, r, fmt.Sprintf("%s/images/%d", s.cfg.UI.BasePath, id), http.StatusSeeOther)
 		return
 	}
 	img, err := s.db.GetByID(id)

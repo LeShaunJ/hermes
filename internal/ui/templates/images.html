@@ -2,8 +2,8 @@
 <section class="images">
   <h1>Images</h1>
 
-  <form class="filters" method="get" action="/images"
-        hx-get="/images" hx-target="#image-rows" hx-trigger="change, submit"
+  <form class="filters" method="get" action="{{base}}/images"
+        hx-get="{{base}}/images" hx-target="#image-rows" hx-trigger="change, submit"
         hx-headers='{"Hx-Target": "image-rows"}' hx-push-url="true">
     <label>state
       <select name="state">

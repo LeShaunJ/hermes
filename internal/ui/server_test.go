@@ -132,9 +132,15 @@ func (m *mockStorage) LogEvent(imgID *int64, source db.EventSource, t string, de
 
 func newTestServer(t *testing.T, mock *mockStorage) *Server {
 	t.Helper()
+	return newTestServerWithBase(t, mock, "")
+}
+
+func newTestServerWithBase(t *testing.T, mock *mockStorage, base string) *Server {
+	t.Helper()
 	cfg := &config.Config{}
 	cfg.UI.Addr = ":0"
 	cfg.UI.URL = "http://localhost"
+	cfg.UI.BasePath = base
 	return New(mock, cfg)
 }
 
@@ -674,6 +680,37 @@ func TestRunScan_tagOnlyRef(t *testing.T) {
 	want := "registry.example.com/myorg/myapp:v1"
 	if capturedRef != want {
 		t.Errorf("ref = %q, want %q", capturedRef, want)
+	}
+}
+
+func TestDashboard_basePathPrefixesAssets(t *testing.T) {
+	mock := &mockStorage{listImages: []db.Image{*newImg(1, db.StateApproved)}}
+	srv := newTestServerWithBase(t, mock, "/ui")
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.Handler().ServeHTTP(w, r)
+	body := w.Body.String()
+	for _, want := range []string{
+		`href="/ui/static/hermes.css"`,
+		`src="/ui/static/htmx.min.js"`,
+		`sse-connect="/ui/events"`,
+		`href="/ui/images/1"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q", want)
+		}
+	}
+}
+
+func TestActionApprove_redirectUsesBasePath(t *testing.T) {
+	img := newImg(2, db.StateScanned)
+	mock := &mockStorage{byID: map[int64]*db.Image{2: img}}
+	srv := newTestServerWithBase(t, mock, "/ui")
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/2/approve", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if got := w.Header().Get("Location"); got != "/ui/images/2" {
+		t.Errorf("location = %q, want /ui/images/2", got)
 	}
 }
 

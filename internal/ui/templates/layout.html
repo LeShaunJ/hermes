@@ -4,17 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.Title}} · hermes</title>
-  <link rel="stylesheet" href="/static/hermes.css">
-  <script src="/static/htmx.min.js" defer></script>
+  <link rel="icon" href="{{base}}/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="{{base}}/static/hermes.css">
+  <script src="{{base}}/static/htmx.min.js" defer></script>
 </head>
-<body hx-ext="sse" sse-connect="/events">
+<body hx-ext="sse" sse-connect="{{base}}/events">
   <header class="topbar">
-    <div class="brand"><a href="/">hermes</a></div>
+    <div class="brand"><a href="{{base}}/">hermes</a></div>
     <nav>
-      <a href="/">Dashboard</a>
-      <a href="/images">Images</a>
-      <a href="/images?state=pending">Pending</a>
-      <a href="/images?state=verified">Verified</a>
+      <a href="{{base}}/">Dashboard</a>
+      <a href="{{base}}/images">Images</a>
+      <a href="{{base}}/images?state=pending">Pending</a>
+      <a href="{{base}}/images?state=verified">Verified</a>
     </nav>
     <div class="live" title="live event feed">
       <span class="dot"></span>

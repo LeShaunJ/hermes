@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 
@@ -41,8 +42,9 @@ type ServerConfig struct {
 
 // UIConfig configures the operator web console served by `hermes ui`.
 type UIConfig struct {
-	Addr string `mapstructure:"addr"`
-	URL  string `mapstructure:"url"` // public base URL (default: http://hostname:port)
+	Addr     string `mapstructure:"addr"`
+	URL      string `mapstructure:"url"`       // public base URL (default: http://hostname:port)
+	BasePath string `mapstructure:"base_path"` // mount prefix used in rendered URLs (e.g. "/ui"); inferred from URL when empty
 }
 
 // DBConfig configures the PostgreSQL connection.
@@ -119,6 +121,16 @@ func Load(path string) (*Config, error) {
 	if cfg.UI.URL == "" {
 		cfg.UI.URL = "http://" + hostname + ":" + addrPort(cfg.UI.Addr)
 	}
+
+	// Infer ui.base_path from ui.url's path when not set explicitly.
+	// This means a deployment at https://hermes.example.com/ui automatically
+	// serves prefixed asset and link URLs without an extra config knob.
+	if cfg.UI.BasePath == "" {
+		if u, err := url.Parse(cfg.UI.URL); err == nil {
+			cfg.UI.BasePath = u.Path
+		}
+	}
+	cfg.UI.BasePath = strings.TrimRight(cfg.UI.BasePath, "/")
 
 	return &cfg, nil
 }

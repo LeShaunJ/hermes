@@ -44,6 +44,11 @@
           "description": "Public base URL of the operator UI. Defaults to http://<hostname>:<port> when not set. The UI itself does not enforce auth; deploy behind a reverse proxy that does.",
           "type": "string",
           "examples": ["http://hermes.internal:8090", "https://hermes.example.com/ui"]
+        },
+        "base_path": {
+          "description": "Mount prefix used in rendered URLs (assets, links, htmx hx-get/hx-post, SSE connect). Inferred from ui.url's path when unset. Set explicitly when serving the UI at a non-root path through a reverse proxy that strips the prefix before forwarding.",
+          "type": "string",
+          "examples": ["/ui", "/admin/hermes"]
         }
       }
     },

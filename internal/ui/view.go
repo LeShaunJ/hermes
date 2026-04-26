@@ -35,15 +35,16 @@ type templates struct {
 // a new page requires appending its filename here.
 var pageNames = []string{"index.html", "images.html", "image.html"}
 
-func loadTemplates() (*templates, error) {
+func loadTemplates(basePath string) (*templates, error) {
 	partialFiles, err := fs.Glob(templateFS, "templates/partials/*.html")
 	if err != nil {
 		return nil, err
 	}
+	funcs := buildFuncMap(basePath)
 
 	pages := make(map[string]*template.Template, len(pageNames))
 	for _, name := range pageNames {
-		t := template.New(name).Funcs(funcMap)
+		t := template.New(name).Funcs(funcs)
 		files := append([]string{"templates/layout.html", "templates/" + name}, partialFiles...)
 		if _, err := t.ParseFS(templateFS, files...); err != nil {
 			return nil, err
@@ -51,7 +52,7 @@ func loadTemplates() (*templates, error) {
 		pages[name] = t
 	}
 
-	p := template.New("partials").Funcs(funcMap)
+	p := template.New("partials").Funcs(funcs)
 	if _, err := p.ParseFS(templateFS, partialFiles...); err != nil {
 		return nil, err
 	}
@@ -82,17 +83,23 @@ func (t *templates) render(w http.ResponseWriter, name string, data interface{})
 	_, _ = w.Write(buf.Bytes())
 }
 
-// funcMap bundles every helper used by the templates.
-var funcMap = template.FuncMap{
-	"stateClass":     stateClass,
-	"shortDigest":    shortDigest,
-	"formatTime":     formatTime,
-	"formatRelative": formatRelative,
-	"vulnSummary":    vulnSummary,
-	"prettyJSON":     prettyJSON,
-	"isStub":         isStub,
-	"join":           strings.Join,
-	"add":            func(a, b int) int { return a + b },
+// buildFuncMap returns the template helper map with `base` closed over the
+// configured mount prefix.  Templates emit URLs as `{{base}}/...` so the
+// console works whether it is served at the listener's root or behind a
+// reverse-proxy path like `/ui`.
+func buildFuncMap(basePath string) template.FuncMap {
+	return template.FuncMap{
+		"base":           func() string { return basePath },
+		"stateClass":     stateClass,
+		"shortDigest":    shortDigest,
+		"formatTime":     formatTime,
+		"formatRelative": formatRelative,
+		"vulnSummary":    vulnSummary,
+		"prettyJSON":     prettyJSON,
+		"isStub":         isStub,
+		"join":           strings.Join,
+		"add":            func(a, b int) int { return a + b },
+	}
 }
 
 // stateClass maps a db.State to a CSS class for badge styling.

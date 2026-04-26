@@ -6,6 +6,9 @@ server:
 ui:
   addr: ":8090"
   url: http://localhost:8888/ui
+  # base_path is inferred from ui.url's path ("/ui").  Set explicitly to
+  # override, or leave unset when the UI is served at the listener's root.
+  # base_path: "/ui"
 
 db:
   host: postgres

@@ -5,7 +5,7 @@
 
   <div class="tiles">
     {{range .Tiles}}
-      <a class="tile" href="/images?state={{.State}}">
+      <a class="tile" href="{{base}}/images?state={{.State}}">
         <div class="tile-count">{{.Count}}</div>
         <div class="{{stateClass .State}}">{{.State}}</div>
       </a>
@@ -28,7 +28,7 @@
           <tr>
             <td><span class="{{stateClass .State}}">{{.State}}</span></td>
             <td>
-              <a href="/images/{{.ID}}">{{.RegistryURL}}/{{.Repository}}:{{.TagName}}</a>
+              <a href="{{base}}/images/{{.ID}}">{{.RegistryURL}}/{{.Repository}}:{{.TagName}}</a>
               {{if isStub .}}<span class="muted">(stub)</span>{{end}}
             </td>
             <td class="muted">{{if .OS}}{{.OS}}/{{.Arch}}{{else}}—{{end}}</td>

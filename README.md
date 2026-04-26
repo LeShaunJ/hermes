@@ -214,6 +214,7 @@ server:
 ui:
   addr: ":8090"          # listen address for `hermes ui`
   url:  ""               # public base URL (default: http://<hostname>:<port>)
+  base_path: ""          # mount prefix (e.g. "/ui"); inferred from ui.url's path when empty
 
 db:
   host:     localhost
@@ -503,6 +504,12 @@ indicator update in place when any source — UI clicks, CLI commands, or
 the gateway itself — writes to the events table.  Slow consumers drop
 events rather than back-pressuring the listener; the feed is a tail, not
 a queue.
+
+All rendered URLs (assets, navigation, htmx targets, the SSE connect URL,
+and post-action redirects) are prefixed with [`ui.base_path`](#configuration).
+A reverse proxy that strips `/ui` before forwarding (see
+[`dev/default.conf`](dev/default.conf)) only needs `ui.url` set to the
+public path — `base_path` is inferred from it.
 
 > [!NOTE]
 > The shipped `static/htmx.min.js` is a small in-tree shim that handles

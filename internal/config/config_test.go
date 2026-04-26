@@ -215,6 +215,54 @@ func TestLoad_uiDefaults(t *testing.T) {
 	}
 }
 
+func TestLoad_uiBasePath_inferredFromURL(t *testing.T) {
+	yaml := `
+ui:
+  url: "https://hermes.example.com/ui"
+`
+	f, err := os.CreateTemp(t.TempDir(), "hermes*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(yaml); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	cfg, err := Load(f.Name())
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.UI.BasePath != "/ui" {
+		t.Errorf("UI.BasePath = %q, want /ui", cfg.UI.BasePath)
+	}
+}
+
+func TestLoad_uiBasePath_explicitWins(t *testing.T) {
+	yaml := `
+ui:
+  url: "https://hermes.example.com/ui"
+  base_path: "/admin/"
+`
+	f, err := os.CreateTemp(t.TempDir(), "hermes*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(yaml); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	cfg, err := Load(f.Name())
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	// Trailing slash trimmed; explicit value wins over URL-derived path.
+	if cfg.UI.BasePath != "/admin" {
+		t.Errorf("UI.BasePath = %q, want /admin", cfg.UI.BasePath)
+	}
+}
+
 func TestLoad_uiFromYAML(t *testing.T) {
 	yaml := `
 ui:

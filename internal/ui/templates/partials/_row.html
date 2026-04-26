@@ -2,7 +2,7 @@
 <tr id="image-{{.ID}}">
   <td><span class="{{stateClass .State}}">{{.State}}</span></td>
   <td>
-    <a href="/images/{{.ID}}">{{.RegistryURL}}/{{.Repository}}:{{.TagName}}</a>
+    <a href="{{base}}/images/{{.ID}}">{{.RegistryURL}}/{{.Repository}}:{{.TagName}}</a>
     {{if isStub .}}<span class="muted">(stub)</span>{{end}}
   </td>
   <td class="muted">{{if .OS}}{{.OS}}/{{.Arch}}{{else}}—{{end}}</td>
