@@ -1,56 +1,5 @@
 {{define "content"}}
-{{with .Image}}
-<section class="image-detail">
-  <h1>
-    <a href="{{base}}/images">images</a> /
-    {{.RegistryURL}}/{{.Repository}}:{{.TagName}}
-  </h1>
-
-  <div class="meta">
-    <div><span class="muted">state</span> <span class="{{stateClass .State}}">{{.State}}</span></div>
-    <div><span class="muted">platform</span> {{if .OS}}{{.OS}}/{{.Arch}}{{else}}—{{end}}</div>
-    <div><span class="muted">digest</span> <code title="{{.Digest}}">{{.Digest}}</code></div>
-    <div><span class="muted">cache</span> {{if .CacheRegistry}}{{.CacheRegistry}}{{else}}—{{end}}</div>
-    <div><span class="muted">created</span> {{formatTime .CreatedAt}}</div>
-    <div><span class="muted">updated</span> {{formatTime .UpdatedAt}}</div>
-  </div>
-
-  <div class="actions" id="actions-{{.ID}}">
-    {{template "_actions.html" (dict "Image" . "Scanning" false)}}
-  </div>
-
-  <h2>Vulnerability summary</h2>
-  {{$vs := vulnSummary .ScanReport}}
-  {{if $vs}}
-    <ul class="severities">
-      {{range $vs}}<li class="sev sev-{{.Severity}}">{{.Severity}}: <strong>{{.Count}}</strong></li>{{end}}
-    </ul>
-  {{else}}
-    <p class="muted">No scan report on file. Run a scan to populate.</p>
-  {{end}}
-
-  {{$cves := vulnList .ScanReport}}
-  {{if $cves}}
-    <h2>Vulnerabilities ({{len $cves}})</h2>
-    {{template "_cves.html" $cves}}
-  {{end}}
-
-  {{$pkgs := packageList .ScanReport}}
-  {{if $pkgs}}
-    <h2>Packages ({{len $pkgs}})</h2>
-    {{template "_packages.html" $pkgs}}
-  {{end}}
-
-  <h2>Manifest</h2>
-  <pre class="json">{{prettyJSON .Manifest}}</pre>
-
-  {{if .ScanReport}}
-    <h2>Scan report (raw)</h2>
-    <details>
-      <summary>show JSON</summary>
-      <pre class="json">{{prettyJSON .ScanReport}}</pre>
-    </details>
-  {{end}}
+<section class="image-detail" id="image-detail" data-image-id="{{.Image.ID}}">
+  {{template "_image_detail.html" .Image}}
 </section>
-{{end}}
 {{end}}

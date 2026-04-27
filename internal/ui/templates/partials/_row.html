@@ -1,5 +1,5 @@
 {{define "_row.html"}}
-{{$img := .Image}}{{$group := .Group}}{{$indent := .Indent}}{{$scanning := .Scanning}}{{$hidden := .Hidden}}
+{{$img := .Image}}{{$group := .Group}}{{$indent := .Indent}}{{$scanning := .Scanning}}{{$fetching := .Fetching}}{{$hidden := .Hidden}}
 {{$indentClass := ""}}
 {{if eq $indent 1}}{{$indentClass = "indent-1"}}{{end}}
 {{if eq $indent 2}}{{$indentClass = "indent-2"}}{{end}}
@@ -14,9 +14,9 @@
     </a>
     {{if isStub $img}}<span class="muted">(stub)</span>{{end}}
   </td>
-  <td class="muted"><code title="{{$img.Digest}}">{{shortDigest $img.Digest}}</code></td>
+  <td class="muted">{{template "_digest.html" $img.Digest}}</td>
   <td><span class="{{stateClass $img.State}}">{{$img.State}}</span></td>
   <td class="muted" title="{{formatTime $img.UpdatedAt}}">{{formatRelative $img.UpdatedAt}}</td>
-  <td class="row-actions">{{template "_actions.html" (dict "Image" $img "Scanning" $scanning)}}</td>
+  <td class="row-actions">{{template "_actions.html" (dict "Image" $img "Scanning" $scanning "Fetching" $fetching "DetailTarget" false)}}</td>
 </tr>
 {{end}}

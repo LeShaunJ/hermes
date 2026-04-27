@@ -184,6 +184,18 @@ code.tag {
   border-radius: 3px; font-size: 11px;
 }
 
+/* Digest container — short hash + copy button on the same line. */
+.digest { display: inline-flex; align-items: center; gap: 4px; }
+button.copy {
+  background: transparent; border: 1px solid transparent;
+  color: var(--muted); cursor: pointer;
+  padding: 0 4px; font-size: 12px; line-height: 1;
+  border-radius: 3px;
+}
+button.copy:hover { color: var(--fg); border-color: var(--line); background: var(--panel); }
+button.copy.copied { color: var(--accent); border-color: var(--accent); }
+.image-detail .meta .digest code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* State summary chip cluster. */
 .state-summary { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 16px 0; }
 

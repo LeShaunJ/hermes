@@ -4,10 +4,13 @@
 {{$rowID := printf "ts:%s|%s|%s" $reg $path $digestKey}}
 {{$childGroup := printf "tg-%s" $rowID}}
 {{$digestHref := pathEscape $ts.TagDigest}}
-<tr class="tree-row tree-lvl-2" id="row-{{$rowID}}" data-group="{{$parentGroup}}" hidden>
+{{$base := base}}
+{{$refresh := ""}}
+{{if $ts.TagDigest}}{{$refresh = printf "%s/repos/%s/%s/tags/%s/row" $base $reg $path $digestHref}}{{end}}
+<tr class="tree-row tree-lvl-2" id="row-{{$rowID}}" data-group="{{$parentGroup}}"{{if $refresh}} data-refresh="{{$refresh}}"{{end}} hidden>
   <td class="tree-col-1 indent-1">
     {{if $ts.TagDigest}}
-      <a href="{{base}}/repos/{{$reg}}/{{$path}}/tags/{{$digestHref}}">
+      <a href="{{$base}}/repos/{{$reg}}/{{$path}}/tags/{{$digestHref}}">
         {{range $ts.Tags}}<code class="tag">{{.}}</code> {{end}}
       </a>
     {{else}}
@@ -15,7 +18,7 @@
       {{range $ts.Tags}}<code class="tag">{{.}}</code> {{end}}
     {{end}}
   </td>
-  <td class="muted">{{if $ts.TagDigest}}<code title="{{$ts.TagDigest}}">{{shortDigest $ts.TagDigest}}</code>{{else}}—{{end}}</td>
+  <td class="muted">{{template "_digest.html" $ts.TagDigest}}</td>
   <td>{{template "_state_summary.html" $ts.States}}</td>
   <td class="muted" title="{{formatTime $ts.UpdatedAt}}">{{formatRelative $ts.UpdatedAt}}</td>
   <td class="row-actions">
@@ -29,5 +32,5 @@
     {{end}}
   </td>
 </tr>
-{{range $ts.Images}}{{template "_row.html" (dict "Image" . "Group" $childGroup "Indent" 2 "Hidden" true "Scanning" false)}}{{end}}
+{{range $ts.Images}}{{template "_row.html" (dict "Image" . "Group" $childGroup "Indent" 2 "Hidden" true "Scanning" false "Fetching" false)}}{{end}}
 {{end}}

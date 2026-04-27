@@ -72,10 +72,12 @@ func (s *Server) actionRescind(w http.ResponseWriter, r *http.Request) {
 
 // actionFetch handles POST /images/{id}/fetch.  Stub rows have no
 // manifest yet — the gateway saw the tag but the operator never ran
-// `hermes scan` to populate it.  This action calls db.Queue (the same
-// path the CLI uses) which fetches the manifest and writes one image
-// row per platform.  The stub row is replaced in-place by the new
-// per-platform rows via an outerHTML swap.
+// `hermes scan` to populate it.  This action runs db.Queue (the same
+// path the CLI uses) on a background goroutine so a slow registry
+// does not stall the HTTP response.  The handler returns immediately
+// with the row partial in its "fetching…" state; the eventual `fetch`
+// / `fetch_error` event lets the SSE shim refresh the level-1 row,
+// which by then contains the resolved per-platform rows.
 func (s *Server) actionFetch(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.actionPrep(w, r)
 	if !ok {
@@ -94,6 +96,55 @@ func (s *Server) actionFetch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "image is already fetched; use scan to refresh", http.StatusConflict)
 		return
 	}
+
+	// Non-htmx (no JS) path keeps the original synchronous shape so a
+	// curl/wget caller still gets the resolved row set.  The interactive
+	// htmx flow goes through the async path with the spinner.
+	if r.Header.Get("Hx-Request") != "true" {
+		s.runFetchSync(w, r, stub, id)
+		return
+	}
+
+	s.fetching.Store(id, struct{}{})
+	go s.runFetch(stub, id)
+
+	w.WriteHeader(http.StatusAccepted)
+	s.respondAction(w, r, id)
+}
+
+// runFetch is the goroutine body for actionFetch.  Errors and successes
+// both clear the in-flight tracker and emit an event the SSE shim uses
+// to refresh the affected ancestors.
+func (s *Server) runFetch(stub *db.Image, id int64) {
+	defer s.fetching.Delete(id)
+
+	ref := db.ImageRef{
+		Registry:   stub.RegistryURL,
+		Repository: stub.Repository,
+		Tag:        stub.TagName,
+	}
+	imgs, err := s.db.Queue(ref, s.fetcher)
+	if err != nil {
+		_ = s.db.LogEvent(&id, db.SourceAPI, "fetch_error", map[string]interface{}{
+			"source": "ui",
+			"error":  err.Error(),
+		})
+		slog.Warn("ui fetch error", "image_id", id, "err", err)
+		return
+	}
+	_ = s.db.LogEvent(&id, db.SourceAPI, "fetch", map[string]interface{}{
+		"source":   "ui",
+		"registry": stub.RegistryURL,
+		"repo":     stub.Repository,
+		"tag":      stub.TagName,
+		"count":    len(imgs),
+	})
+}
+
+// runFetchSync preserves the pre-async fallback for non-htmx callers
+// (curl, redirected browsers without JS).  It blocks the request until
+// Queue returns and renders the resolved row set or a 502.
+func (s *Server) runFetchSync(w http.ResponseWriter, r *http.Request, stub *db.Image, id int64) {
 	ref := db.ImageRef{
 		Registry:   stub.RegistryURL,
 		Repository: stub.Repository,
@@ -115,20 +166,9 @@ func (s *Server) actionFetch(w http.ResponseWriter, r *http.Request) {
 		"tag":      stub.TagName,
 		"count":    len(imgs),
 	})
-
-	if r.Header.Get("Hx-Request") != "true" {
-		http.Redirect(w, r, fmt.Sprintf("%s/images?ref=%s/%s:%s",
-			s.cfg.UI.BasePath, stub.RegistryURL, stub.Repository, stub.TagName),
-			http.StatusSeeOther)
-		return
-	}
-	rendered := make([]db.Image, 0, len(imgs))
-	for _, p := range imgs {
-		if p != nil {
-			rendered = append(rendered, *p)
-		}
-	}
-	s.tmpl.render(w, "_rowset.html", rendered)
+	http.Redirect(w, r, fmt.Sprintf("%s/images?ref=%s/%s:%s",
+		s.cfg.UI.BasePath, stub.RegistryURL, stub.Repository, stub.TagName),
+		http.StatusSeeOther)
 }
 
 // actionScan handles POST /images/{id}/scan.  The trivy invocation is
@@ -218,12 +258,11 @@ func (s *Server) actionPrep(w http.ResponseWriter, r *http.Request) (int64, bool
 	return id, true
 }
 
-// respondAction writes the row partial for htmx so the table swaps the
-// affected row into its new state in place.  Non-htmx requests are
-// redirected to the image detail page.  The shim sets `Hx-Indent` and
-// `Hx-Group` headers from the source row's CSS class / data-group so
-// the swap preserves the row's nesting (otherwise the row visually
-// jumps back to indent 0).
+// respondAction writes the right partial for the source page: a row
+// partial when the action came from a tree row (Hx-Target=image-{id}),
+// or the image-detail partial when the action came from the detail
+// page (Hx-Target=image-detail).  Non-htmx requests redirect to the
+// image detail page.
 func (s *Server) respondAction(w http.ResponseWriter, r *http.Request, id int64) {
 	if r.Header.Get("Hx-Request") != "true" {
 		http.Redirect(w, r, fmt.Sprintf("%s/images/%d", s.cfg.UI.BasePath, id), http.StatusSeeOther)
@@ -236,6 +275,10 @@ func (s *Server) respondAction(w http.ResponseWriter, r *http.Request, id int64)
 	}
 	if img == nil {
 		http.NotFound(w, r)
+		return
+	}
+	if r.Header.Get("Hx-Target") == "image-detail" {
+		s.tmpl.render(w, "_image_detail.html", *img)
 		return
 	}
 	s.renderRow(w, r, img)

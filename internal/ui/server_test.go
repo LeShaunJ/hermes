@@ -36,6 +36,7 @@ type mockStorage struct {
 	queueResp  []*db.Image
 	queueErr   error
 	queueCalls []db.ImageRef
+	queueGate  chan struct{} // when non-nil, Queue blocks on this channel
 
 	approveErr   error
 	approveCalls []approveCall
@@ -92,12 +93,15 @@ func (m *mockStorage) GetByID(id int64) (*db.Image, error) {
 }
 func (m *mockStorage) Queue(ref db.ImageRef, _ db.Fetcher) ([]*db.Image, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	gate := m.queueGate
 	m.queueCalls = append(m.queueCalls, ref)
-	if m.queueErr != nil {
-		return nil, m.queueErr
+	err := m.queueErr
+	resp := m.queueResp
+	m.mu.Unlock()
+	if gate != nil {
+		<-gate
 	}
-	return m.queueResp, nil
+	return resp, err
 }
 func (m *mockStorage) Approve(id int64, cache string) error {
 	m.mu.Lock()
@@ -921,8 +925,29 @@ func TestActionFetch(t *testing.T) {
 	r.Header.Set("Hx-Request", "true")
 	srv.Handler().ServeHTTP(w, r)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `class="busy fetching"`) || !strings.Contains(body, "disabled") {
+		t.Errorf("expected fetching/disabled button, body=%s", body)
+	}
+
+	// Wait for the goroutine to run Queue and emit the `fetch` event
+	// (mockStorage.Queue is synchronous so this resolves quickly).
+	deadline := time.After(time.Second)
+	for {
+		mock.mu.Lock()
+		ok := containsEvent(mock.logEvents, "fetch")
+		mock.mu.Unlock()
+		if ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("fetch event never recorded; logEvents=%#v", mock.logEvents)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 	if len(mock.queueCalls) != 1 {
 		t.Fatalf("expected one Queue call, got %d", len(mock.queueCalls))
@@ -936,15 +961,41 @@ func TestActionFetch(t *testing.T) {
 	if gotRef != wantRef {
 		t.Errorf("Queue ref = %+v, want %+v", gotRef, wantRef)
 	}
-	if !containsEvent(mock.logEvents, "fetch") {
-		t.Errorf("missing fetch event: %#v", mock.logEvents)
+}
+
+func TestActionFetch_marksRowAsFetching(t *testing.T) {
+	stub := newImg(53, db.StateQueued)
+	stub.Digest = ""
+	stub.Arch = ""
+	stub.OS = ""
+	mock := &mockStorage{
+		byID: map[int64]*db.Image{53: stub},
+	}
+	srv := newTestServer(t, mock)
+
+	// Block the goroutine inside Queue until the test releases the
+	// gate, so the synchronous HTTP response has to come back with
+	// the "fetching…" button regardless of how fast Queue would be.
+	gate := make(chan struct{})
+	mock.queueGate = gate
+	mock.queueResp = []*db.Image{newImg(54, db.StateQueued)}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/53/fetch", nil)
+	r.Header.Set("Hx-Request", "true")
+	srv.Handler().ServeHTTP(w, r)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", w.Code)
 	}
 	body := w.Body.String()
-	for _, want := range []string{`id="image-51"`, `id="image-52"`} {
-		if !strings.Contains(body, want) {
-			t.Errorf("body missing %q\n%s", want, body)
-		}
+	if !strings.Contains(body, `class="busy fetching"`) {
+		t.Errorf("expected fetching pseudo-state, body=%s", body)
 	}
+	if !strings.Contains(body, `aria-busy="true"`) {
+		t.Errorf("expected aria-busy on fetching button, body=%s", body)
+	}
+	close(gate)
 }
 
 func TestActionFetch_notStub(t *testing.T) {
@@ -1189,7 +1240,7 @@ func TestActionScan_marksRowAsScanning(t *testing.T) {
 		t.Fatalf("status = %d, want 202", w.Code)
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, `class="scanning"`) || !strings.Contains(body, `disabled`) {
+	if !strings.Contains(body, `class="busy scanning"`) || !strings.Contains(body, `disabled`) {
 		t.Errorf("expected scanning/disabled button, body=%s", body)
 	}
 	if !strings.Contains(body, `aria-busy="true"`) {
@@ -1226,6 +1277,137 @@ func TestViewImageRow_notFound(t *testing.T) {
 	srv.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestViewImageDetail(t *testing.T) {
+	img := newImg(77, db.StateScanned)
+	img.Manifest = json.RawMessage(`{"schemaVersion":2}`)
+	mock := &mockStorage{byID: map[int64]*db.Image{77: img}}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/images/77/detail", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "<html") {
+		t.Errorf("detail partial must not include <html>, body=%s", body)
+	}
+	for _, want := range []string{
+		`Vulnerability summary`,
+		`schemaVersion`,
+		`data-clipboard="`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n%s", want, body)
+		}
+	}
+}
+
+func TestActionFromDetailPage_returnsDetailPartial(t *testing.T) {
+	img := newImg(78, db.StateScanned)
+	mock := &mockStorage{byID: map[int64]*db.Image{78: img}}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/78/approve", nil)
+	r.Header.Set("Hx-Request", "true")
+	r.Header.Set("Hx-Target", "image-detail")
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	// Detail partial: meta block with state badge, vulnerability summary
+	// header, and the action buttons re-rendered for the new state.
+	for _, want := range []string{
+		`Vulnerability summary`,
+		`state-approved`,
+		`hx-target="#image-detail"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `<tr id="image-78"`) {
+		t.Errorf("detail-target swap should not include a <tr>, body=%s", body)
+	}
+}
+
+func TestViewRepoRow_partial(t *testing.T) {
+	mock := &mockStorage{listImages: []db.Image{
+		{ID: 1, RegistryURL: "docker.io", Repository: "library/alpine",
+			TagName: "latest", TagDigest: "sha256:topAA",
+			Digest: "sha256:platAMD", Arch: "amd64", OS: "linux",
+			State: db.StateApproved, UpdatedAt: time.Now()},
+	}}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/repos/docker.io/library/alpine/row", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`row-repo:docker.io|library/alpine`,
+		`approved: <strong>1</strong>`,
+		`data-refresh="/repos/docker.io/library/alpine/row"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "<html") {
+		t.Errorf("partial response must not include layout html")
+	}
+}
+
+func TestViewTagSetRow_partial(t *testing.T) {
+	mock := &mockStorage{listImages: []db.Image{
+		{ID: 1, RegistryURL: "docker.io", Repository: "library/alpine",
+			TagName: "latest", TagDigest: "sha256:topAA",
+			Digest: "sha256:platAMD", Arch: "amd64", OS: "linux",
+			State: db.StateApproved, UpdatedAt: time.Now()},
+	}}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/repos/docker.io/library/alpine/tags/sha256:topAA/row", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`row-ts:docker.io|library/alpine|sha256:topAA`,
+		`approved: <strong>1</strong>`,
+		`data-refresh="/repos/docker.io/library/alpine/tags/sha256:topAA/row"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n%s", want, body)
+		}
+	}
+}
+
+func TestImageRow_includesCopyDigestButton(t *testing.T) {
+	img := newImg(81, db.StateApproved)
+	mock := &mockStorage{byID: map[int64]*db.Image{81: img}}
+	srv := newTestServer(t, mock)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/images/81/row", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	want := `data-clipboard="` + img.Digest + `"`
+	if !strings.Contains(body, want) {
+		t.Errorf("expected copy button %q, body=%s", want, body)
 	}
 }
 

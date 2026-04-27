@@ -1,0 +1,1 @@
+{{define "_digest.html"}}{{if .}}<span class="digest"><code title="{{.}}">{{shortDigest .}}</code><button type="button" class="copy" data-clipboard="{{.}}" aria-label="copy digest" title="copy digest">📋</button></span>{{else}}<span class="muted">—</span>{{end}}{{end}}

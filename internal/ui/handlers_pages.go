@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
@@ -111,8 +112,8 @@ func (s *Server) viewImageRow(w http.ResponseWriter, r *http.Request) {
 // renderRow writes the level-3 row partial for img, picking up indent
 // and group context from request headers so action swaps and SSE
 // refreshes both keep the row visually consistent with where it lived
-// before.  The Scanning flag flips on for any image whose scan
-// goroutine is still in flight.
+// before.  The Scanning / Fetching flags flip on for any image whose
+// background goroutine is still running.
 func (s *Server) renderRow(w http.ResponseWriter, r *http.Request, img *db.Image) {
 	indent := 0
 	if v := r.Header.Get("Hx-Indent"); v != "" {
@@ -120,29 +121,60 @@ func (s *Server) renderRow(w http.ResponseWriter, r *http.Request, img *db.Image
 			indent = n
 		}
 	}
-	scanning := false
-	if _, ok := s.scanning.Load(img.ID); ok {
-		scanning = true
-	}
+	_, scanning := s.scanning.Load(img.ID)
+	_, fetching := s.fetching.Load(img.ID)
 	s.tmpl.render(w, "_row.html", map[string]interface{}{
 		"Image":    *img,
 		"Group":    r.Header.Get("Hx-Group"),
 		"Indent":   indent,
 		"Scanning": scanning,
+		"Fetching": fetching,
 		"Hidden":   false,
 	})
 }
 
-// viewRepoOrTagSet handles both `/repos/{registry}/{path...}` and the
-// `/repos/{registry}/{path...}/tags/{digest}` drill-down.  Go's stdlib
-// mux requires the `{path...}` wildcard to be the last segment, so we
-// peel off any trailing `/tags/{digest}` here ourselves.
+// viewImageDetail returns the inner partial of the image detail page.
+// The shim's SSE handler hits this endpoint when an event for the
+// image currently shown on /images/{id} arrives, and detail-page
+// action buttons target #image-detail so the swap stays in place.
+func (s *Server) viewImageDetail(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad image id", http.StatusBadRequest)
+		return
+	}
+	img, err := s.db.GetByID(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if img == nil {
+		http.NotFound(w, r)
+		return
+	}
+	s.tmpl.render(w, "_image_detail.html", *img)
+}
+
+// viewRepoOrTagSet dispatches every `/repos/{registry}/{path...}` URL.
+// Go's stdlib mux requires `{path...}` to be the last segment, so the
+// handler parses the trailing form itself:
+//
+//	/repos/{reg}/{path}                          → repo detail page
+//	/repos/{reg}/{path}/row                      → level-1 row partial
+//	/repos/{reg}/{path}/tags/{digest}            → tag-set detail page
+//	/repos/{reg}/{path}/tags/{digest}/row        → level-2 row partial
 func (s *Server) viewRepoOrTagSet(w http.ResponseWriter, r *http.Request) {
 	registry := r.PathValue("registry")
 	rest := r.PathValue("path")
 
-	// Detect a trailing /tags/<digest> segment.  rest contains literal
-	// slashes (e.g. `library/alpine` or `library/alpine/tags/sha256:abc`).
+	// Strip a trailing /row marker first so we can route partial
+	// requests independently of detail-page requests.
+	wantRow := false
+	if strings.HasSuffix(rest, "/row") {
+		wantRow = true
+		rest = strings.TrimSuffix(rest, "/row")
+	}
+
 	repoPath := rest
 	digest := ""
 	if i := strings.Index(rest, "/tags/"); i >= 0 {
@@ -159,11 +191,76 @@ func (s *Server) viewRepoOrTagSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if digest != "" {
+	switch {
+	case wantRow && digest != "":
+		s.viewTagSetRow(w, r, registry, repoPath, digest)
+	case wantRow:
+		s.viewRepoRow(w, r, registry, repoPath)
+	case digest != "":
 		s.viewTagSet(w, r, registry, repoPath, digest)
+	default:
+		s.viewRepo(w, r, registry, repoPath)
+	}
+}
+
+// viewRepoRow re-renders the level-1 (repo) tree row in isolation.
+// Used by the shim when an SSE event fires for a child image whose
+// repo row state-summary chips need to refresh.
+func (s *Server) viewRepoRow(w http.ResponseWriter, r *http.Request, registry, repoPath string) {
+	imgs, err := s.db.List(db.ListFilter{Refs: []string{registry + "/" + repoPath}})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.viewRepo(w, r, registry, repoPath)
+	tree := groupTree(imgs)
+	for _, repo := range tree {
+		if repo.RegistryURL == registry && repo.Repository == repoPath {
+			s.tmpl.render(w, "_repo_row.html", repo)
+			return
+		}
+	}
+	http.NotFound(w, r)
+}
+
+// viewTagSetRow re-renders the level-2 (tag-set) tree row in isolation.
+func (s *Server) viewTagSetRow(w http.ResponseWriter, r *http.Request, registry, repoPath, digest string) {
+	imgs, err := s.db.List(db.ListFilter{
+		Refs:      []string{registry + "/" + repoPath},
+		TagDigest: digest,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(imgs) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	imgs = dedupImages(imgs)
+
+	ts := TagSetNode{TagDigest: digest, States: map[string]int{}, UpdatedAt: imgs[0].UpdatedAt}
+	tagSeen := map[string]struct{}{}
+	for _, img := range imgs {
+		if _, ok := tagSeen[img.TagName]; !ok {
+			ts.Tags = append(ts.Tags, img.TagName)
+			tagSeen[img.TagName] = struct{}{}
+		}
+		ts.States[string(img.State)]++
+		ts.Images = append(ts.Images, img)
+		if img.UpdatedAt.After(ts.UpdatedAt) {
+			ts.UpdatedAt = img.UpdatedAt
+		}
+	}
+	sort.Strings(ts.Tags)
+
+	parentRowID := fmt.Sprintf("repo:%s|%s", registry, repoPath)
+	parentGroup := "tg-" + parentRowID
+	s.tmpl.render(w, "_tagset_row.html", map[string]interface{}{
+		"Repo":   registry,
+		"Path":   repoPath,
+		"TagSet": ts,
+		"Group":  parentGroup,
+	})
 }
 
 func (s *Server) viewRepo(w http.ResponseWriter, r *http.Request, registry, repoPath string) {

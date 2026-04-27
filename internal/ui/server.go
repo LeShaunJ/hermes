@@ -64,12 +64,13 @@ type Server struct {
 	scan    scanFunc
 	fetcher db.Fetcher
 
-	// scanning is the set of image ids whose scan goroutine is still
-	// running.  Action handlers consult it when rendering the row
-	// partial so an in-flight scan surfaces as a disabled button with
-	// a spinner instead of a fresh "scan" button that would let the
-	// operator double-fire trivy.
+	// scanning / fetching are the sets of image ids whose scan or
+	// fetch goroutine is still running.  Action handlers consult them
+	// when rendering the row partial so an in-flight operation
+	// surfaces as a disabled button with a spinner instead of a fresh
+	// action button that would let the operator double-fire it.
 	scanning sync.Map // map[int64]struct{}
+	fetching sync.Map // map[int64]struct{}
 }
 
 // New creates a Server and registers all routes.  Templates and static
@@ -102,6 +103,7 @@ func New(database storage, cfg *config.Config) *Server {
 	s.mux.HandleFunc("GET /images", s.imageTree)
 	s.mux.HandleFunc("GET /images/{id}", s.viewImage)
 	s.mux.HandleFunc("GET /images/{id}/row", s.viewImageRow)
+	s.mux.HandleFunc("GET /images/{id}/detail", s.viewImageDetail)
 	s.mux.HandleFunc("GET /repos/{registry}/{path...}", s.viewRepoOrTagSet)
 	s.mux.HandleFunc("POST /images/{id}/approve", s.actionApprove)
 	s.mux.HandleFunc("POST /images/{id}/reject", s.actionReject)

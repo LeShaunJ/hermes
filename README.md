@@ -492,8 +492,11 @@ audit events, so CLI and UI activity remain interleaved in one event log.
 | `GET`  | `/images`                                         | Three-level tree: repos → tag-sets → per-platform images. State persists via `localStorage`. |
 | `GET`  | `/images/{id}`                                    | Image detail — manifest, vulnerability table, SBOM, raw report. |
 | `GET`  | `/images/{id}/row`                                | Re-render one level-3 row partial (used by the SSE feed for in-place updates). |
+| `GET`  | `/images/{id}/detail`                             | Re-render the image detail page partial (used by the SSE feed). |
 | `GET`  | `/repos/{registry}/{path...}`                     | Repo detail — tag-sets + per-platform drill-down.                |
+| `GET`  | `/repos/{registry}/{path...}/row`                 | Re-render one level-1 row partial (used by SSE-driven ancestor refresh). |
 | `GET`  | `/repos/{registry}/{path...}/tags/{digest}`       | Tag-set detail — per-platform images for one top-level digest.   |
+| `GET`  | `/repos/{registry}/{path...}/tags/{digest}/row`   | Re-render one level-2 row partial.                               |
 | `POST` | `/images/{id}/approve`                            | Set state to `approved` (form: `cache_url`).                     |
 | `POST` | `/images/{id}/reject`                             | Set state to `rejected`.                                         |
 | `POST` | `/images/{id}/rescind`                            | Set state to `rescinded`.                                        |
