@@ -38,7 +38,6 @@ var pageNames = []string{
 	"index.html",
 	"images.html",
 	"image.html",
-	"repos.html",
 	"repo.html",
 	"tagset.html",
 }

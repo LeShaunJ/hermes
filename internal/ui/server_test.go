@@ -26,10 +26,6 @@ type mockStorage struct {
 	listErr    error
 	listCalls  int
 
-	listReposResp []db.RepoSummary
-	listReposErr  error
-	listReposCall db.ListFilter
-
 	listTagSetsResp []db.TagSet
 	listTagSetsErr  error
 	listTagSetsArgs []listTagSetsArg
@@ -79,12 +75,6 @@ func (m *mockStorage) List(_ db.ListFilter) ([]db.Image, error) {
 	defer m.mu.Unlock()
 	m.listCalls++
 	return m.listImages, m.listErr
-}
-func (m *mockStorage) ListRepos(f db.ListFilter) ([]db.RepoSummary, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.listReposCall = f
-	return m.listReposResp, m.listReposErr
 }
 func (m *mockStorage) ListTagSets(registry, repository string, f db.ListFilter) ([]db.TagSet, error) {
 	m.mu.Lock()
@@ -778,23 +768,22 @@ func TestActionScan(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("scan goroutine did not run")
 	}
-	// Give the goroutine a moment to call SaveScan and LogEvent.
+	// Wait for the goroutine to finish all the way through LogEvent.
+	// Polling on saveScanArg races the LogEvent that follows; wait on
+	// the event slice directly so the assertion is deterministic.
 	deadline := time.After(time.Second)
 	for {
 		mock.mu.Lock()
-		ok := len(mock.saveScanArg) > 0
+		ok := containsEvent(mock.logEvents, "scan")
 		mock.mu.Unlock()
 		if ok {
 			break
 		}
 		select {
 		case <-deadline:
-			t.Fatal("SaveScan never called")
+			t.Fatalf("scan event never recorded; logEvents=%#v", mock.logEvents)
 		case <-time.After(10 * time.Millisecond):
 		}
-	}
-	if !containsEvent(mock.logEvents, "scan") {
-		t.Errorf("expected scan event, got %#v", mock.logEvents)
 	}
 }
 
@@ -1029,41 +1018,6 @@ func TestRowPartial_stubHasFetchAction(t *testing.T) {
 	}
 }
 
-func TestListRepos_render(t *testing.T) {
-	// /repos now renders the same three-level tree as /images, sourced
-	// from db.List + groupTree.  Confirm the toggle button and
-	// state-summary chips render alongside the repo link.
-	mock := &mockStorage{
-		listImages: []db.Image{
-			{
-				ID: 1, RegistryURL: "docker.io", Repository: "library/alpine",
-				TagName: "latest", TagDigest: "sha256:topAA",
-				Digest: "sha256:platAMD", Arch: "amd64", OS: "linux",
-				State: db.StateApproved, UpdatedAt: time.Now(),
-			},
-		},
-	}
-	srv := newTestServer(t, mock)
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/repos", nil)
-	srv.Handler().ServeHTTP(w, r)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
-	}
-	body := w.Body.String()
-	for _, want := range []string{
-		`docker.io/library/alpine`,
-		`href="/repos/docker.io/library/alpine"`,
-		`approved: <strong>1</strong>`,
-		`data-row-id="repo:docker.io|library/alpine"`,
-		`expand (1)`, // one tag-set under the repo
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("body missing %q\n%s", want, body)
-		}
-	}
-}
-
 func TestViewRepo_pathDecoding(t *testing.T) {
 	mock := &mockStorage{
 		listTagSetsResp: []db.TagSet{{
@@ -1182,6 +1136,106 @@ func TestViewImage_rendersCVEAndSBOMTables(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q", want)
 		}
+	}
+}
+
+func TestActionSwap_preservesIndentFromHeader(t *testing.T) {
+	img := newImg(11, db.StateScanned)
+	mock := &mockStorage{byID: map[int64]*db.Image{11: img}}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/11/approve", nil)
+	r.Header.Set("Hx-Request", "true")
+	r.Header.Set("Hx-Indent", "2")
+	r.Header.Set("Hx-Group", "tg-ts:registry.example.com|myorg/myapp|sha256:topdigest")
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `class="tree-row tree-lvl-3"`) {
+		t.Errorf("expected tree-lvl-3 class, body=%s", body)
+	}
+	if !strings.Contains(body, `data-group="tg-ts:`) {
+		t.Errorf("expected data-group attr, body=%s", body)
+	}
+	if strings.Contains(body, " hidden") {
+		t.Errorf("swap response must not be hidden, body=%s", body)
+	}
+}
+
+func TestActionScan_marksRowAsScanning(t *testing.T) {
+	img := newImg(12, db.StateQueued)
+	mock := &mockStorage{byID: map[int64]*db.Image{12: img}}
+	srv := newTestServer(t, mock)
+
+	// Block the scan goroutine by giving the scan func a long-running
+	// closure.  The HTTP response must come back immediately with the
+	// row partial in its scanning pseudo-state, regardless of whether
+	// the scan has finished.
+	gate := make(chan struct{})
+	srv.SetScanFunc(func(string, config.TrivyConfig) (*trivy.ScanResult, error) {
+		<-gate
+		return &trivy.ScanResult{Raw: []byte(`{}`)}, nil
+	})
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/12/scan", nil)
+	r.Header.Set("Hx-Request", "true")
+	srv.Handler().ServeHTTP(w, r)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `class="scanning"`) || !strings.Contains(body, `disabled`) {
+		t.Errorf("expected scanning/disabled button, body=%s", body)
+	}
+	if !strings.Contains(body, `aria-busy="true"`) {
+		t.Errorf("expected aria-busy on scanning button, body=%s", body)
+	}
+	close(gate)
+}
+
+func TestViewImageRow_renders(t *testing.T) {
+	img := newImg(13, db.StateApproved)
+	mock := &mockStorage{byID: map[int64]*db.Image{13: img}}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/images/13/row", nil)
+	r.Header.Set("Hx-Indent", "1")
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `id="image-13"`) {
+		t.Errorf("missing row id\n%s", body)
+	}
+	if !strings.Contains(body, "tree-lvl-2") {
+		t.Errorf("expected indent 1 → tree-lvl-2 class\n%s", body)
+	}
+}
+
+func TestViewImageRow_notFound(t *testing.T) {
+	srv := newTestServer(t, &mockStorage{byID: map[int64]*db.Image{}})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/images/999/row", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestReposRouteRemoved(t *testing.T) {
+	srv := newTestServer(t, &mockStorage{})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/repos", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("/repos should be 404, got %d", w.Code)
 	}
 }
 

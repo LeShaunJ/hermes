@@ -16,7 +16,7 @@
   </div>
 
   <div class="actions" id="actions-{{.ID}}">
-    {{template "_actions.html" .}}
+    {{template "_actions.html" (dict "Image" . "Scanning" false)}}
   </div>
 
   <h2>Vulnerability summary</h2>

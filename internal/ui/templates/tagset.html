@@ -1,7 +1,7 @@
 {{define "content"}}
 <section class="tagset-detail">
   <h1>
-    <a href="{{base}}/repos">repos</a> /
+    <a href="{{base}}/images">images</a> /
     <a href="{{base}}/repos/{{.RegistryURL}}/{{.RepoPath}}">{{.RegistryURL}}/{{.RepoPath}}</a> /
     {{shortDigest .TagSet.TagDigest}}
   </h1>
@@ -29,7 +29,7 @@
       </tr>
     </thead>
     <tbody>
-      {{range .Images}}{{template "_row.html" (dict "Image" . "Group" "" "Indent" 0)}}{{end}}
+      {{range .Images}}{{template "_row.html" (dict "Image" . "Group" "" "Indent" 0 "Hidden" false "Scanning" false)}}{{end}}
     </tbody>
   </table>
 </section>

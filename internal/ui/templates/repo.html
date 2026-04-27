@@ -1,7 +1,7 @@
 {{define "content"}}
 <section class="repo-detail">
   <h1>
-    <a href="{{base}}/repos">repos</a> / {{.RegistryURL}}/{{.RepoPath}}
+    <a href="{{base}}/images">images</a> / {{.RegistryURL}}/{{.RepoPath}}
   </h1>
 
   <div class="state-summary">
@@ -53,7 +53,7 @@
               {{end}}
             </td>
           </tr>
-          {{range $imgs}}{{template "_row.html" (dict "Image" . "Group" $childGroup "Indent" 1)}}{{end}}
+          {{range $imgs}}{{template "_row.html" (dict "Image" . "Group" $childGroup "Indent" 1 "Hidden" true "Scanning" false)}}{{end}}
         {{end}}
       </tbody>
     </table>

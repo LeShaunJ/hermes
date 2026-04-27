@@ -111,8 +111,28 @@ button, .filters button {
 }
 button:hover { filter: brightness(1.1); }
 
-.actions-inline { display: flex; gap: 6px; justify-content: flex-end; }
+.actions-inline { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
 .actions-inline button { padding: 4px 10px; font-size: 12px; }
+
+/* In-flight scan: button is disabled, sports a small spinner, and the
+   row reads as busy via `aria-busy`.  The SSE handler refetches the
+   row when the scan completes so the spinner is replaced with the
+   terminal-state action set automatically. */
+button.scanning {
+  background: var(--line);
+  color: var(--muted);
+  cursor: progress;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+button.scanning .spinner {
+  width: 10px; height: 10px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: hermes-spin 0.7s linear infinite;
+  display: inline-block;
+}
+@keyframes hermes-spin { to { transform: rotate(360deg); } }
 
 .image-detail .meta {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));

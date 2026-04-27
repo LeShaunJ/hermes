@@ -1,39 +1,42 @@
 {{define "_actions.html"}}
-{{$id := .ID}}
-{{$state := .State}}
-{{$stub := isStub .}}
+{{$img := .Image}}{{$scanning := .Scanning}}
+{{$id := $img.ID}}
+{{$state := $img.State}}
+{{$stub := isStub $img}}
 {{$base := base}}
 <div class="actions-inline">
-  {{if $stub}}
+  {{if $scanning}}
+    <button class="scanning" disabled aria-busy="true"><span class="spinner"></span>scanning…</button>
+  {{else if $stub}}
     <button hx-post="{{$base}}/images/{{$id}}/fetch" hx-target="#image-{{$id}}" hx-swap="outerHTML">fetch</button>
     <button hx-post="{{$base}}/images/{{$id}}/reject" hx-target="#image-{{$id}}" hx-swap="outerHTML"
-            hx-confirm="Reject {{.Repository}}:{{.TagName}}?">reject</button>
+            hx-confirm="Reject {{$img.Repository}}:{{$img.TagName}}?">reject</button>
   {{else}}
     {{if eq $state "queued"}}
       <button hx-post="{{$base}}/images/{{$id}}/scan" hx-target="#image-{{$id}}" hx-swap="outerHTML">scan</button>
     {{else if eq $state "scanned"}}
       <button hx-post="{{$base}}/images/{{$id}}/approve" hx-target="#image-{{$id}}" hx-swap="outerHTML">approve</button>
       <button hx-post="{{$base}}/images/{{$id}}/reject"  hx-target="#image-{{$id}}" hx-swap="outerHTML"
-              hx-confirm="Reject {{.Repository}}:{{.TagName}}?">reject</button>
+              hx-confirm="Reject {{$img.Repository}}:{{$img.TagName}}?">reject</button>
       <button hx-post="{{$base}}/images/{{$id}}/scan"    hx-target="#image-{{$id}}" hx-swap="outerHTML">re-scan</button>
     {{else if eq $state "approved"}}
       <button hx-post="{{$base}}/images/{{$id}}/rescind" hx-target="#image-{{$id}}" hx-swap="outerHTML">rescind</button>
       <button hx-post="{{$base}}/images/{{$id}}/reject"  hx-target="#image-{{$id}}" hx-swap="outerHTML"
-              hx-confirm="Reject {{.Repository}}:{{.TagName}}?">reject</button>
+              hx-confirm="Reject {{$img.Repository}}:{{$img.TagName}}?">reject</button>
     {{else if eq $state "rescinded"}}
       <button hx-post="{{$base}}/images/{{$id}}/approve" hx-target="#image-{{$id}}" hx-swap="outerHTML">re-approve</button>
       <button hx-post="{{$base}}/images/{{$id}}/reject"  hx-target="#image-{{$id}}" hx-swap="outerHTML"
-              hx-confirm="Reject {{.Repository}}:{{.TagName}}?">reject</button>
+              hx-confirm="Reject {{$img.Repository}}:{{$img.TagName}}?">reject</button>
     {{else if eq $state "voided"}}
       <button hx-post="{{$base}}/images/{{$id}}/scan"    hx-target="#image-{{$id}}" hx-swap="outerHTML">re-scan</button>
       <button hx-post="{{$base}}/images/{{$id}}/reject"  hx-target="#image-{{$id}}" hx-swap="outerHTML"
-              hx-confirm="Reject {{.Repository}}:{{.TagName}}?">reject</button>
+              hx-confirm="Reject {{$img.Repository}}:{{$img.TagName}}?">reject</button>
     {{else if eq $state "rejected"}}
       <button hx-post="{{$base}}/images/{{$id}}/scan"    hx-target="#image-{{$id}}" hx-swap="outerHTML">re-scan</button>
     {{else if eq $state "errored"}}
       <button hx-post="{{$base}}/images/{{$id}}/scan"    hx-target="#image-{{$id}}" hx-swap="outerHTML">retry-scan</button>
       <button hx-post="{{$base}}/images/{{$id}}/reject"  hx-target="#image-{{$id}}" hx-swap="outerHTML"
-              hx-confirm="Reject {{.Repository}}:{{.TagName}}?">reject</button>
+              hx-confirm="Reject {{$img.Repository}}:{{$img.TagName}}?">reject</button>
     {{end}}
   {{end}}
 </div>

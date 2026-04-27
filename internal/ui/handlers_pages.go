@@ -83,19 +83,53 @@ func (s *Server) imageTree(w http.ResponseWriter, r *http.Request) {
 	s.tmpl.render(w, "images.html", data)
 }
 
-// listRepos renders /repos — same three-level tree as /images, just
-// with no filter form and a simpler intro.  The tree view replaces an
-// older flat repo summary; expand toggles surface tag-sets and
-// per-platform images inline.
-func (s *Server) listRepos(w http.ResponseWriter, r *http.Request) {
-	imgs, err := s.db.List(db.ListFilter{})
+// viewImageRow re-renders a single level-3 row.  The htmx shim hits
+// this from its SSE handler so the row updates in place when a scan
+// (or any other state-changing action) finishes asynchronously — no
+// full-page reload required.  The nesting context is supplied via
+// `Hx-Indent` and `Hx-Group` headers (set by the shim from the source
+// row's CSS class and `data-group` attribute) so the swap preserves
+// indent and parent-collapse linkage.
+func (s *Server) viewImageRow(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad image id", http.StatusBadRequest)
+		return
+	}
+	img, err := s.db.GetByID(id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.tmpl.render(w, "repos.html", pageData{
-		Title: "Repositories",
-		Tree:  groupTree(imgs),
+	if img == nil {
+		http.NotFound(w, r)
+		return
+	}
+	s.renderRow(w, r, img)
+}
+
+// renderRow writes the level-3 row partial for img, picking up indent
+// and group context from request headers so action swaps and SSE
+// refreshes both keep the row visually consistent with where it lived
+// before.  The Scanning flag flips on for any image whose scan
+// goroutine is still in flight.
+func (s *Server) renderRow(w http.ResponseWriter, r *http.Request, img *db.Image) {
+	indent := 0
+	if v := r.Header.Get("Hx-Indent"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 2 {
+			indent = n
+		}
+	}
+	scanning := false
+	if _, ok := s.scanning.Load(img.ID); ok {
+		scanning = true
+	}
+	s.tmpl.render(w, "_row.html", map[string]interface{}{
+		"Image":    *img,
+		"Group":    r.Header.Get("Hx-Group"),
+		"Indent":   indent,
+		"Scanning": scanning,
+		"Hidden":   false,
 	})
 }
 

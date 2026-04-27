@@ -134,8 +134,10 @@ func (s *Server) actionFetch(w http.ResponseWriter, r *http.Request) {
 // actionScan handles POST /images/{id}/scan.  The trivy invocation is
 // long-running, so it is dispatched on a background goroutine; this
 // handler returns immediately with the row partial in its "scanning…"
-// state.  The /events SSE feed will deliver the eventual scan / scan_error
-// event to the browser, which swaps the row into its terminal state.
+// state (button disabled, spinner visible).  The /events SSE feed
+// delivers the eventual scan / scan_error event, the shim's SSE
+// listener fetches `/images/{id}/row` and swaps the row into its
+// terminal state.
 func (s *Server) actionScan(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.actionPrep(w, r)
 	if !ok {
@@ -155,6 +157,10 @@ func (s *Server) actionScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Stamp the in-flight tracker before spawning the goroutine so the
+	// row partial we render below picks up the scanning pseudo-state.
+	// The deferred Delete in runScan clears it once the scan finishes.
+	s.scanning.Store(id, struct{}{})
 	go s.runScan(img)
 
 	w.WriteHeader(http.StatusAccepted)
@@ -165,6 +171,8 @@ func (s *Server) actionScan(w http.ResponseWriter, r *http.Request) {
 // the events table so the SSE feed surfaces them; they are not returned
 // because the original HTTP request has already been answered.
 func (s *Server) runScan(img *db.Image) {
+	defer s.scanning.Delete(img.ID)
+
 	scanRef := fmt.Sprintf("%s/%s:%s", img.RegistryURL, img.Repository, img.TagName)
 	if img.Digest != "" {
 		scanRef = fmt.Sprintf("%s/%s@%s", img.RegistryURL, img.Repository, img.Digest)
@@ -212,7 +220,10 @@ func (s *Server) actionPrep(w http.ResponseWriter, r *http.Request) (int64, bool
 
 // respondAction writes the row partial for htmx so the table swaps the
 // affected row into its new state in place.  Non-htmx requests are
-// redirected to the image detail page.
+// redirected to the image detail page.  The shim sets `Hx-Indent` and
+// `Hx-Group` headers from the source row's CSS class / data-group so
+// the swap preserves the row's nesting (otherwise the row visually
+// jumps back to indent 0).
 func (s *Server) respondAction(w http.ResponseWriter, r *http.Request, id int64) {
 	if r.Header.Get("Hx-Request") != "true" {
 		http.Redirect(w, r, fmt.Sprintf("%s/images/%d", s.cfg.UI.BasePath, id), http.StatusSeeOther)
@@ -227,13 +238,5 @@ func (s *Server) respondAction(w http.ResponseWriter, r *http.Request, id int64)
 		http.NotFound(w, r)
 		return
 	}
-	// Always wrap the image in a dict so `_row.html` sees the same shape
-	// whether it is rendered inside the tree or as an htmx swap response.
-	// Indent is intentionally 0 here — the row will lose its tree-lvl-N
-	// CSS class until the next full page render; tracked as a follow-up.
-	s.tmpl.render(w, "_row.html", map[string]interface{}{
-		"Image":  *img,
-		"Group":  "",
-		"Indent": 0,
-	})
+	s.renderRow(w, r, img)
 }
