@@ -1,5 +1,5 @@
 {{define "_row.html"}}
-{{$img := .Image}}{{$group := .Group}}{{$indent := .Indent}}{{$scanning := .Scanning}}{{$fetching := .Fetching}}{{$hidden := .Hidden}}
+{{$img := .Image}}{{$group := .Group}}{{$indent := .Indent}}{{$hidden := .Hidden}}
 {{$indentClass := ""}}
 {{if eq $indent 1}}{{$indentClass = "indent-1"}}{{end}}
 {{if eq $indent 2}}{{$indentClass = "indent-2"}}{{end}}
@@ -9,14 +9,18 @@
 {{if eq $indent 2}}{{$cls = "tree-row tree-lvl-3"}}{{end}}
 <tr id="image-{{$img.ID}}"{{if $cls}} class="{{$cls}}"{{end}}{{if $group}} data-group="{{$group}}"{{end}}{{if $hidden}} hidden{{end}}>
   <td class="tree-col-1 {{$indentClass}}">
-    <a href="{{base}}/images/{{$img.ID}}">
-      {{if $img.OS}}{{$img.OS}}/{{$img.Arch}}{{else}}{{$img.TagName}}{{end}}
-    </a>
-    {{if isStub $img}}<span class="muted">(stub)</span>{{end}}
+    {{if isStub $img}}
+      <span>{{$img.TagName}}</span>
+      <span class="muted">(stub)</span>
+    {{else}}
+      <a href="{{base}}/images/{{$img.ID}}">
+        {{if $img.OS}}{{$img.OS}}/{{$img.Arch}}{{else}}{{$img.TagName}}{{end}}
+      </a>
+    {{end}}
   </td>
   <td class="muted">{{template "_digest.html" $img.Digest}}</td>
   <td><span class="{{stateClass $img.State}}">{{$img.State}}</span></td>
   <td class="muted" title="{{formatTime $img.UpdatedAt}}">{{formatRelative $img.UpdatedAt}}</td>
-  <td class="row-actions">{{template "_actions.html" (dict "Image" $img "Scanning" $scanning "Fetching" $fetching "DetailTarget" false)}}</td>
+  <td class="row-actions">{{template "_actions.html" (dict "Image" $img "DetailTarget" false)}}</td>
 </tr>
 {{end}}

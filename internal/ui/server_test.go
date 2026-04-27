@@ -914,9 +914,15 @@ func TestActionFetch(t *testing.T) {
 	platformARM := newImg(52, db.StateQueued)
 	platformARM.Arch = "arm64"
 
+	// Gate the goroutine so the synchronous response can be rendered
+	// (and asserted) before s.fetching is cleared by the goroutine's
+	// defer.  Without this the test would race the goroutine — fast
+	// mock Queue clears the busy state before respondAction renders.
+	gate := make(chan struct{})
 	mock := &mockStorage{
 		byID:      map[int64]*db.Image{50: stub},
 		queueResp: []*db.Image{platformAMD, platformARM},
+		queueGate: gate,
 	}
 	srv := newTestServer(t, mock)
 
@@ -933,8 +939,8 @@ func TestActionFetch(t *testing.T) {
 		t.Errorf("expected fetching/disabled button, body=%s", body)
 	}
 
-	// Wait for the goroutine to run Queue and emit the `fetch` event
-	// (mockStorage.Queue is synchronous so this resolves quickly).
+	// Release the goroutine, then wait for the eventual fetch event.
+	close(gate)
 	deadline := time.After(time.Second)
 	for {
 		mock.mu.Lock()
@@ -1409,6 +1415,146 @@ func TestImageRow_includesCopyDigestButton(t *testing.T) {
 	if !strings.Contains(body, want) {
 		t.Errorf("expected copy button %q, body=%s", want, body)
 	}
+}
+
+func TestViewImage_stubIdRedirectsToList(t *testing.T) {
+	srv := newTestServer(t, &mockStorage{byID: map[int64]*db.Image{}})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/images/0", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", w.Code)
+	}
+	if got := w.Header().Get("Location"); !strings.Contains(got, "/images?state=queued") {
+		t.Errorf("location = %q, want /images?state=queued", got)
+	}
+}
+
+func TestRow_stubDoesNotLinkToImageZero(t *testing.T) {
+	stub := newImg(0, db.StateQueued)
+	stub.Digest = ""
+	stub.TagDigest = ""
+	stub.Arch = ""
+	stub.OS = ""
+	mock := &mockStorage{listImages: []db.Image{*stub}}
+	srv := newTestServer(t, mock)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/images", nil)
+	srv.Handler().ServeHTTP(w, r)
+	body := w.Body.String()
+	if strings.Contains(body, `href="/images/0"`) {
+		t.Errorf("stub row must not link to /images/0\n%s", body)
+	}
+	if !strings.Contains(body, "(stub)") {
+		t.Errorf("stub row must indicate stub\n%s", body)
+	}
+}
+
+func TestActionFetch_stubIDLogsNullEventID(t *testing.T) {
+	stub := newImg(0, db.StateQueued)
+	stub.Digest = ""
+	stub.TagDigest = ""
+	stub.Arch = ""
+	stub.OS = ""
+	mock := &mockStorage{
+		byID:      map[int64]*db.Image{0: stub},
+		queueResp: []*db.Image{newImg(101, db.StateQueued)},
+	}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/0/fetch", nil)
+	r.Header.Set("Hx-Request", "true")
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", w.Code)
+	}
+
+	// Wait for the goroutine to log the fetch event.
+	deadline := time.After(time.Second)
+	for {
+		mock.mu.Lock()
+		ok := containsEvent(mock.logEvents, "fetch")
+		mock.mu.Unlock()
+		if ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("fetch event never recorded")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	// The synthetic id=0 must NOT be propagated as image_id, otherwise
+	// Postgres' FK constraint rejects the insert (events.image_id has
+	// to point at a real images.id row).
+	for _, ev := range mock.logEvents {
+		if ev.Type == "fetch" && ev.ImageID != nil {
+			t.Errorf("fetch event ImageID = %v, want nil for stub", *ev.ImageID)
+		}
+	}
+}
+
+func TestActionsHTML_levelRefreshDoesNotDropScanningSibling(t *testing.T) {
+	// Reproduce the race: image #1 has a scan in flight, image #2 fires
+	// a state event that triggers a level-2 ancestor refresh.  The
+	// refreshed level-2 row must still render image #1 as "scanning…"
+	// because s.scanning is consulted via the template func.
+	a := newImg(1, db.StateQueued)
+	a.TagDigest = "sha256:topAA"
+	b := newImg(2, db.StateApproved)
+	b.TagDigest = "sha256:topAA"
+	mock := &mockStorage{listImages: []db.Image{*a, *b}}
+	srv := newTestServer(t, mock)
+
+	// Mark #1 as scanning before we render the level-2 row.
+	srv.scanning.Store(int64(1), struct{}{})
+	defer srv.scanning.Delete(int64(1))
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet,
+		"/repos/registry.example.com/myorg/myapp/tags/sha256:topAA/row", nil)
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `class="busy scanning"`) {
+		t.Errorf("expected sibling scanning state preserved, body=%s", body)
+	}
+}
+
+func TestActionScan_fromDetailPage_returnsDetailPartialWithBusyState(t *testing.T) {
+	img := newImg(33, db.StateQueued)
+	mock := &mockStorage{byID: map[int64]*db.Image{33: img}}
+	srv := newTestServer(t, mock)
+
+	gate := make(chan struct{})
+	srv.SetScanFunc(func(string, config.TrivyConfig) (*trivy.ScanResult, error) {
+		<-gate
+		return &trivy.ScanResult{Raw: []byte(`{}`)}, nil
+	})
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/33/scan", nil)
+	r.Header.Set("Hx-Request", "true")
+	r.Header.Set("Hx-Target", "image-detail")
+	srv.Handler().ServeHTTP(w, r)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", w.Code)
+	}
+	body := w.Body.String()
+	// Detail partial fingerprint:
+	if !strings.Contains(body, "Vulnerability summary") {
+		t.Errorf("expected detail partial body\n%s", body)
+	}
+	// Busy state must be reflected in the actions section even though
+	// the response goes through the detail-target path.
+	if !strings.Contains(body, `class="busy scanning"`) {
+		t.Errorf("expected scanning button on detail swap\n%s", body)
+	}
+	close(gate)
 }
 
 func TestReposRouteRemoved(t *testing.T) {

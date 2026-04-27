@@ -112,8 +112,9 @@ func (s *Server) viewImageRow(w http.ResponseWriter, r *http.Request) {
 // renderRow writes the level-3 row partial for img, picking up indent
 // and group context from request headers so action swaps and SSE
 // refreshes both keep the row visually consistent with where it lived
-// before.  The Scanning / Fetching flags flip on for any image whose
-// background goroutine is still running.
+// before.  Busy state (scanning / fetching) is read straight from the
+// server's in-flight maps via the `isScanning` / `isFetching`
+// template funcs — no need to thread booleans through every dict.
 func (s *Server) renderRow(w http.ResponseWriter, r *http.Request, img *db.Image) {
 	indent := 0
 	if v := r.Header.Get("Hx-Indent"); v != "" {
@@ -121,15 +122,11 @@ func (s *Server) renderRow(w http.ResponseWriter, r *http.Request, img *db.Image
 			indent = n
 		}
 	}
-	_, scanning := s.scanning.Load(img.ID)
-	_, fetching := s.fetching.Load(img.ID)
 	s.tmpl.render(w, "_row.html", map[string]interface{}{
-		"Image":    *img,
-		"Group":    r.Header.Get("Hx-Group"),
-		"Indent":   indent,
-		"Scanning": scanning,
-		"Fetching": fetching,
-		"Hidden":   false,
+		"Image":  *img,
+		"Group":  r.Header.Get("Hx-Group"),
+		"Indent": indent,
+		"Hidden": false,
 	})
 }
 
@@ -377,6 +374,14 @@ func (s *Server) viewImage(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		http.Error(w, "bad image id", http.StatusBadRequest)
+		return
+	}
+	// Synthetic id=0 covers every stub in `tag_image_rows`, so a
+	// detail page at /images/0 cannot identify a specific row.
+	// Bounce the operator back to the list, which links each stub
+	// only by its (registry, repository, tag) tuple.
+	if id == 0 {
+		http.Redirect(w, r, s.cfg.UI.BasePath+"/images?state=queued", http.StatusSeeOther)
 		return
 	}
 	img, err := s.db.GetByID(id)

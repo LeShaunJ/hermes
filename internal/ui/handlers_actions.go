@@ -114,7 +114,10 @@ func (s *Server) actionFetch(w http.ResponseWriter, r *http.Request) {
 
 // runFetch is the goroutine body for actionFetch.  Errors and successes
 // both clear the in-flight tracker and emit an event the SSE shim uses
-// to refresh the affected ancestors.
+// to refresh the affected ancestors.  Stub rows synthesize id=0 in
+// `tag_image_rows` and have no real image row to FK against, so the
+// event is logged with image_id=NULL when id is zero — Postgres
+// rejects an `events.image_id` that does not exist in `images`.
 func (s *Server) runFetch(stub *db.Image, id int64) {
 	defer s.fetching.Delete(id)
 
@@ -124,21 +127,36 @@ func (s *Server) runFetch(stub *db.Image, id int64) {
 		Tag:        stub.TagName,
 	}
 	imgs, err := s.db.Queue(ref, s.fetcher)
+	eventID := eventIDFor(id)
 	if err != nil {
-		_ = s.db.LogEvent(&id, db.SourceAPI, "fetch_error", map[string]interface{}{
-			"source": "ui",
-			"error":  err.Error(),
+		_ = s.db.LogEvent(eventID, db.SourceAPI, "fetch_error", map[string]interface{}{
+			"source":   "ui",
+			"error":    err.Error(),
+			"registry": stub.RegistryURL,
+			"repo":     stub.Repository,
+			"tag":      stub.TagName,
 		})
 		slog.Warn("ui fetch error", "image_id", id, "err", err)
 		return
 	}
-	_ = s.db.LogEvent(&id, db.SourceAPI, "fetch", map[string]interface{}{
+	_ = s.db.LogEvent(eventID, db.SourceAPI, "fetch", map[string]interface{}{
 		"source":   "ui",
 		"registry": stub.RegistryURL,
 		"repo":     stub.Repository,
 		"tag":      stub.TagName,
 		"count":    len(imgs),
 	})
+}
+
+// eventIDFor returns id wrapped in *int64, or nil when id is the
+// synthetic zero used for stub rows.  events.image_id is FK-checked
+// against images.id, so passing zero would 23503 — and there is no
+// "the stub" row to point at anyway.
+func eventIDFor(id int64) *int64 {
+	if id == 0 {
+		return nil
+	}
+	return &id
 }
 
 // runFetchSync preserves the pre-async fallback for non-htmx callers
@@ -151,15 +169,19 @@ func (s *Server) runFetchSync(w http.ResponseWriter, r *http.Request, stub *db.I
 		Tag:        stub.TagName,
 	}
 	imgs, err := s.db.Queue(ref, s.fetcher)
+	eventID := eventIDFor(id)
 	if err != nil {
-		_ = s.db.LogEvent(&id, db.SourceAPI, "fetch_error", map[string]interface{}{
-			"source": "ui",
-			"error":  err.Error(),
+		_ = s.db.LogEvent(eventID, db.SourceAPI, "fetch_error", map[string]interface{}{
+			"source":   "ui",
+			"error":    err.Error(),
+			"registry": stub.RegistryURL,
+			"repo":     stub.Repository,
+			"tag":      stub.TagName,
 		})
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	_ = s.db.LogEvent(&id, db.SourceAPI, "fetch", map[string]interface{}{
+	_ = s.db.LogEvent(eventID, db.SourceAPI, "fetch", map[string]interface{}{
 		"source":   "ui",
 		"registry": stub.RegistryURL,
 		"repo":     stub.Repository,

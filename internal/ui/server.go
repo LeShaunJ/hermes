@@ -77,22 +77,21 @@ type Server struct {
 // assets are loaded eagerly from the embedded FS so the constructor fails
 // fast if they are malformed.
 func New(database storage, cfg *config.Config) *Server {
-	tmpl, err := loadTemplates(cfg.UI.BasePath)
-	if err != nil {
-		// loadTemplates only parses files baked into the binary, so a
-		// failure here is a programming error, not a runtime condition.
-		panic("ui: parse templates: " + err.Error())
-	}
-
 	s := &Server{
 		db:      database,
 		cfg:     cfg,
 		mux:     http.NewServeMux(),
 		hub:     newEventHub(),
-		tmpl:    tmpl,
 		scan:    trivy.Scan,
 		fetcher: oci.NewDefaultClient(),
 	}
+	tmpl, err := loadTemplates(cfg.UI.BasePath, &s.scanning, &s.fetching)
+	if err != nil {
+		// loadTemplates only parses files baked into the binary, so a
+		// failure here is a programming error, not a runtime condition.
+		panic("ui: parse templates: " + err.Error())
+	}
+	s.tmpl = tmpl
 
 	staticFS, err := fs.Sub(staticAssets, "static")
 	if err != nil {

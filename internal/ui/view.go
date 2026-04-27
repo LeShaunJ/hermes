@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/leshaunj/hermes/internal/db"
@@ -42,12 +43,12 @@ var pageNames = []string{
 	"tagset.html",
 }
 
-func loadTemplates(basePath string) (*templates, error) {
+func loadTemplates(basePath string, scanning, fetching *sync.Map) (*templates, error) {
 	partialFiles, err := fs.Glob(templateFS, "templates/partials/*.html")
 	if err != nil {
 		return nil, err
 	}
-	funcs := buildFuncMap(basePath)
+	funcs := buildFuncMap(basePath, scanning, fetching)
 
 	pages := make(map[string]*template.Template, len(pageNames))
 	for _, name := range pageNames {
@@ -91,10 +92,14 @@ func (t *templates) render(w http.ResponseWriter, name string, data interface{})
 }
 
 // buildFuncMap returns the template helper map with `base` closed over the
-// configured mount prefix.  Templates emit URLs as `{{base}}/...` so the
-// console works whether it is served at the listener's root or behind a
-// reverse-proxy path like `/ui`.
-func buildFuncMap(basePath string) template.FuncMap {
+// configured mount prefix and `isScanning`/`isFetching` closed over the
+// running server's in-flight tracker maps.  Closing over the maps lets
+// any partial — even one rendered from an ancestor refresh that
+// otherwise has no per-image context — derive the correct busy state
+// for each image straight from the source of truth, eliminating the
+// race where a level-2 row refresh would clear a sibling image's
+// scanning state out from under an in-flight goroutine.
+func buildFuncMap(basePath string, scanning, fetching *sync.Map) template.FuncMap {
 	return template.FuncMap{
 		"base":           func() string { return basePath },
 		"stateClass":     stateClass,
@@ -107,10 +112,24 @@ func buildFuncMap(basePath string) template.FuncMap {
 		"cveURL":         cveURL,
 		"prettyJSON":     prettyJSON,
 		"isStub":         isStub,
-		"pathEscape":     url.PathEscape,
-		"join":           strings.Join,
-		"add":            func(a, b int) int { return a + b },
-		"dict":           dict,
+		"isScanning": func(id int64) bool {
+			if scanning == nil || id == 0 {
+				return false
+			}
+			_, ok := scanning.Load(id)
+			return ok
+		},
+		"isFetching": func(id int64) bool {
+			if fetching == nil || id == 0 {
+				return false
+			}
+			_, ok := fetching.Load(id)
+			return ok
+		},
+		"pathEscape": url.PathEscape,
+		"join":       strings.Join,
+		"add":        func(a, b int) int { return a + b },
+		"dict":       dict,
 	}
 }
 

@@ -53,7 +53,7 @@
               {{end}}
             </td>
           </tr>
-          {{range $imgs}}{{template "_row.html" (dict "Image" . "Group" $childGroup "Indent" 1 "Hidden" true "Scanning" false "Fetching" false)}}{{end}}
+          {{range $imgs}}{{template "_row.html" (dict "Image" . "Group" $childGroup "Indent" 1 "Hidden" true)}}{{end}}
         {{end}}
       </tbody>
     </table>

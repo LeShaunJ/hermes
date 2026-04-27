@@ -1,8 +1,10 @@
 {{define "_actions.html"}}
-{{$img := .Image}}{{$scanning := .Scanning}}{{$fetching := .Fetching}}{{$detail := .DetailTarget}}
+{{$img := .Image}}{{$detail := .DetailTarget}}
 {{$id := $img.ID}}
 {{$state := $img.State}}
 {{$stub := isStub $img}}
+{{$scanning := isScanning $id}}
+{{$fetching := isFetching $id}}
 {{$base := base}}
 {{$tgt := printf "#image-%d" $id}}{{$swap := "outerHTML"}}
 {{if $detail}}{{$tgt = "#image-detail"}}{{$swap = "innerHTML"}}{{end}}
@@ -12,9 +14,13 @@
   {{else if $fetching}}
     <button class="busy fetching" disabled aria-busy="true"><span class="spinner"></span>fetching…</button>
   {{else if $stub}}
-    <button hx-post="{{$base}}/images/{{$id}}/fetch" hx-target="{{$tgt}}" hx-swap="{{$swap}}">fetch</button>
-    <button hx-post="{{$base}}/images/{{$id}}/reject" hx-target="{{$tgt}}" hx-swap="{{$swap}}"
-            hx-confirm="Reject {{$img.Repository}}:{{$img.TagName}}?">reject</button>
+    {{if and $detail (eq $id 0)}}
+      <span class="muted">open from the list to fetch this stub</span>
+    {{else}}
+      <button hx-post="{{$base}}/images/{{$id}}/fetch" hx-target="{{$tgt}}" hx-swap="{{$swap}}">fetch</button>
+      <button hx-post="{{$base}}/images/{{$id}}/reject" hx-target="{{$tgt}}" hx-swap="{{$swap}}"
+              hx-confirm="Reject {{$img.Repository}}:{{$img.TagName}}?">reject</button>
+    {{end}}
   {{else}}
     {{if eq $state "queued"}}
       <button hx-post="{{$base}}/images/{{$id}}/scan" hx-target="{{$tgt}}" hx-swap="{{$swap}}">scan</button>

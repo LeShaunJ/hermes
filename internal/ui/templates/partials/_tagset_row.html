@@ -32,5 +32,5 @@
     {{end}}
   </td>
 </tr>
-{{range $ts.Images}}{{template "_row.html" (dict "Image" . "Group" $childGroup "Indent" 2 "Hidden" true "Scanning" false "Fetching" false)}}{{end}}
+{{range $ts.Images}}{{template "_row.html" (dict "Image" . "Group" $childGroup "Indent" 2 "Hidden" true)}}{{end}}
 {{end}}
