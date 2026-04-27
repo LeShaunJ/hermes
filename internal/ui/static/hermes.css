@@ -71,6 +71,8 @@ h2 { margin: 32px 0 12px 0; font-size: 16px; font-weight: 600; color: var(--mute
   display: inline-block; padding: 2px 8px; border-radius: 12px;
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
   background: var(--line); color: var(--fg);
+  white-space: nowrap;
+  align-self: flex-start;
 }
 .state-approved { background: var(--accent); color: #fff; }
 .state-rejected { background: var(--bad); color: #fff; }
@@ -105,6 +107,7 @@ table.images.compact th, table.images.compact td { padding: 6px 8px; }
 button, .filters button {
   background: var(--accent); color: #fff; border: 0;
   border-radius: 4px; padding: 6px 12px; font: inherit; cursor: pointer;
+  white-space: nowrap;
 }
 button:hover { filter: brightness(1.1); }
 
