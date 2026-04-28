@@ -1,6 +1,14 @@
 {{define "_cves.html"}}
 {{if .}}
 <table class="cves">
+  <colgroup>
+    <col class="col-sev">
+    <col class="col-id">
+    <col class="col-pkg">
+    <col class="col-installed">
+    <col class="col-fixed">
+    <col class="col-title">
+  </colgroup>
   <thead>
     <tr>
       <th>severity</th>
@@ -15,11 +23,11 @@
     {{range .}}
       <tr class="cve-row sev-row-{{.Severity}}">
         <td><span class="sev sev-{{.Severity}}">{{.Severity}}</span></td>
-        <td><a href="{{cveURL .ID}}" target="_blank" rel="noreferrer noopener"><code>{{.ID}}</code></a></td>
-        <td><code>{{.PkgName}}</code></td>
-        <td class="muted"><code>{{.InstalledVersion}}</code></td>
-        <td>{{if .FixedVersion}}<code>{{.FixedVersion}}</code>{{else}}<span class="muted">—</span>{{end}}</td>
-        <td class="cve-title">{{.Title}}</td>
+        <td title="{{.ID}}"><a href="{{cveURL .ID}}" target="_blank" rel="noreferrer noopener"><code>{{.ID}}</code></a></td>
+        <td title="{{.PkgName}}"><code>{{.PkgName}}</code></td>
+        <td class="muted" title="{{.InstalledVersion}}"><code>{{.InstalledVersion}}</code></td>
+        <td title="{{.FixedVersion}}">{{if .FixedVersion}}<code>{{.FixedVersion}}</code>{{else}}<span class="muted">—</span>{{end}}</td>
+        <td class="cve-title" title="{{.Title}}">{{.Title}}</td>
       </tr>
     {{end}}
   </tbody>

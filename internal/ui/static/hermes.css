@@ -189,12 +189,24 @@ code.tag {
 button.copy {
   background: transparent; border: 1px solid transparent;
   color: var(--muted); cursor: pointer;
-  padding: 0 4px; font-size: 12px; line-height: 1;
+  padding: 2px 4px; line-height: 0;
   border-radius: 3px;
+  display: inline-flex; align-items: center; justify-content: center;
 }
 button.copy:hover { color: var(--fg); border-color: var(--line); background: var(--panel); }
 button.copy.copied { color: var(--accent); border-color: var(--accent); }
+button.copy .icon-check { display: none; }
+button.copy.copied .icon-copy { display: none; }
+button.copy.copied .icon-check { display: inline-block; }
 .image-detail .meta .digest code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* JSON code block with a small copy button anchored top-right. */
+.json-block { position: relative; }
+.json-block button.copy {
+  position: absolute; top: 6px; right: 6px;
+  background: var(--panel);
+  border-color: var(--line);
+}
 
 /* State summary chip cluster. */
 .state-summary { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 16px 0; }
@@ -202,17 +214,16 @@ button.copy.copied { color: var(--accent); border-color: var(--accent); }
 /* ── CVE / packages tables ─────────────────────────────────────────────── */
 table.cves, table.packages {
   width: 100%; border-collapse: collapse; margin: 8px 0 24px 0;
-  /* Fixed layout + widths on each column so a long Target value
-     wraps inside its cell instead of pushing the rest of the table
-     out of the viewport. */
+  /* Fixed layout so per-column widths apply and long values can be
+     truncated with an ellipsis; the full text stays available via the
+     `title` attribute on the cell. */
   table-layout: fixed;
 }
 table.cves th, table.cves td,
 table.packages th, table.packages td {
   text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
   font-size: 13px;
-  word-break: break-word;
-  overflow-wrap: anywhere;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 table.cves th, table.packages th {
   font-size: 11px; text-transform: uppercase; color: var(--muted);
@@ -221,10 +232,15 @@ table.cves th, table.packages th {
 .cve-row.sev-row-CRITICAL { background: rgba(249, 65, 68, 0.06); }
 .cve-row.sev-row-HIGH     { background: rgba(214, 90, 49, 0.05); }
 
-/* Column widths: package name + version are dense; target carries the
-   long path so it wraps; keep type/source narrow. */
 table.packages col.col-pkg     { width: 22%; }
-table.packages col.col-version { width: 16%; }
-table.packages col.col-type    { width: 12%; }
+table.packages col.col-version { width: 14%; }
+table.packages col.col-type    { width: 10%; }
 table.packages col.col-source  { width: 18%; }
-table.packages col.col-target  { width: 32%; }
+table.packages col.col-target  { width: 36%; }
+
+table.cves col.col-sev      { width: 90px; }
+table.cves col.col-id       { width: 160px; }
+table.cves col.col-pkg      { width: 18%; }
+table.cves col.col-installed { width: 12%; }
+table.cves col.col-fixed    { width: 12%; }
+table.cves col.col-title    { width: auto; }

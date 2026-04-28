@@ -42,13 +42,21 @@
   {{end}}
 
   <h2>Manifest</h2>
-  <pre class="json">{{prettyJSON .Manifest}}</pre>
+  {{$manifest := prettyJSON .Manifest}}
+  <div class="json-block">
+    {{template "_copy_btn.html" $manifest}}
+    <pre class="json">{{$manifest}}</pre>
+  </div>
 
   {{if .ScanReport}}
     <h2>Scan report (raw)</h2>
+    {{$report := prettyJSON .ScanReport}}
     <details>
       <summary>show JSON</summary>
-      <pre class="json">{{prettyJSON .ScanReport}}</pre>
+      <div class="json-block">
+        {{template "_copy_btn.html" $report}}
+        <pre class="json">{{$report}}</pre>
+      </div>
     </details>
   {{end}}
 {{end}}

@@ -20,11 +20,11 @@
   <tbody>
     {{range .}}
       <tr>
-        <td><code>{{.Name}}</code></td>
-        <td class="muted"><code>{{.Version}}</code></td>
-        <td class="muted">{{.Type}}</td>
-        <td class="muted">{{if .Source}}<code>{{.Source}}</code>{{else}}—{{end}}</td>
-        <td class="muted">{{.Target}}</td>
+        <td title="{{.Name}}"><code>{{.Name}}</code></td>
+        <td class="muted" title="{{.Version}}"><code>{{.Version}}</code></td>
+        <td class="muted" title="{{.Type}}">{{.Type}}</td>
+        <td class="muted" title="{{.Source}}">{{if .Source}}<code>{{.Source}}</code>{{else}}—{{end}}</td>
+        <td class="muted" title="{{.Target}}">{{.Target}}</td>
       </tr>
     {{end}}
   </tbody>
