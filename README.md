@@ -519,10 +519,12 @@ A reverse proxy that strips `/ui` before forwarding (see
 public path — `base_path` is inferred from it.
 
 > [!NOTE]
-> The shipped `static/htmx.min.js` is a small in-tree shim that handles
-> the `hx-get`/`hx-post`/`sse-*` attributes the templates use.  Drop in
-> the official htmx.min.js (https://htmx.org) for full feature
-> compatibility — the templates target the standard attribute set.
+> The console ships the official [htmx](https://htmx.org) 2.0.9 in
+> `static/htmx.min.js` and a tiny project-specific companion in
+> `static/hermes.js` (custom request headers, the SSE-driven row
+> refresh logic, tree expand/collapse with `localStorage`
+> persistence, and copy-to-clipboard).  Replace `htmx.min.js` to
+> upgrade htmx.
 
 ---
 

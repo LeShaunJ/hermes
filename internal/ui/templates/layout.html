@@ -7,8 +7,9 @@
   <link rel="icon" href="{{base}}/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="{{base}}/static/hermes.css">
   <script src="{{base}}/static/htmx.min.js" defer></script>
+  <script src="{{base}}/static/hermes.js" defer></script>
 </head>
-<body hx-ext="sse" sse-connect="{{base}}/events">
+<body data-base="{{base}}">
   <header class="topbar">
     <div class="brand"><a href="{{base}}/">hermes</a></div>
     <nav>
@@ -19,7 +20,7 @@
     </nav>
     <div class="live" title="live event feed">
       <span class="dot"></span>
-      <span sse-swap="event" hx-swap="innerHTML">idle</span>
+      <span id="event-tail">idle</span>
     </div>
   </header>
   <main>
