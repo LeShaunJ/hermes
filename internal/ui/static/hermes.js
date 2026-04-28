@@ -37,6 +37,12 @@
   // refetches the whole repo tbody from the SSE handler, which is what
   // the user sees as flicker when clicking rapidly.  Mark the image id
   // here, gate the SSE handler against the mark, expire after a TTL.
+  //
+  // Only verbs whose action response IS the final state are deduped.
+  // scan and fetch return an *intermediate* "scanning…/fetching…" row
+  // and rely on the SSE-delivered scan / scan_error / fetch /
+  // fetch_error event to refresh into the terminal state — deduping
+  // them would leave the row stuck on the spinner.
   var localActionTTL = 1500; // ms — outlasts NOTIFY round-trip on a
                              // loopback compose stack without swallowing
                              // a legitimate follow-up event.
@@ -51,7 +57,7 @@
     if (Date.now() > until) { delete localActions[id]; return false; }
     return true;
   }
-  var actionPathRE = /\/images\/(\d+)\/(scan|approve|reject|rescind|fetch)$/;
+  var actionPathRE = /\/images\/(\d+)\/(approve|reject|rescind)$/;
 
   // ── htmx:configRequest ────────────────────────────────────────────────
   // htmx already sends HX-Request, HX-Current-URL, HX-Target, HX-Trigger
