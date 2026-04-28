@@ -79,6 +79,13 @@ h2 { margin: 32px 0 12px 0; font-size: 16px; font-weight: 600; color: var(--mute
 .state-pending  { background: var(--warn); color: #1a1a1a; }
 .state-errored  { background: var(--bad); color: #fff; }
 
+table.images {
+  display: grid;
+  width: 100%;
+  border-collapse: collapse;
+  grid-template-columns: max-content max-content max-content max-content 1fr;
+}
+table.images tbody, table.images thead, table.images tr { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; }
 table.images { width: 100%; border-collapse: collapse; }
 table.images th, table.images td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
 table.images th { font-weight: 500; color: var(--muted); font-size: 12px; text-transform: uppercase; }
@@ -163,8 +170,6 @@ button.scanning .spinner {
 
 /* ── tree view ─────────────────────────────────────────────────────────── */
 table.images.tree td { vertical-align: middle; }
-table.images.tree td.indent-1 { width: 28px; }
-table.images.tree td.indent-2 { width: 56px; }
 .tree-lvl-2 > td:first-child { padding-left: 28px; }
 .tree-lvl-3 > td:first-child { padding-left: 56px; }
 .tree-row[hidden] { display: none; }
@@ -212,13 +217,18 @@ button.copy.copied .icon-check { display: inline-block; }
 .state-summary { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 16px 0; }
 
 /* ── CVE / packages tables ─────────────────────────────────────────────── */
+table.images tbody, table.images thead, table.images tr { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; }
 table.cves, table.packages {
-  width: 100%; border-collapse: collapse; margin: 8px 0 24px 0;
+  display: grid; width: 100%; border-collapse: collapse; margin: 8px 0 24px 0;
   /* Fixed layout so per-column widths apply and long values can be
      truncated with an ellipsis; the full text stays available via the
      `title` attribute on the cell. */
   table-layout: fixed;
 }
+table.cves { grid-template-columns: max-content max-content fit-content(18%) fit-content(12%) fit-content(12%) 1fr; }
+table.packages { grid-template-columns: fit-content(22%) fit-content(14%) fit-content(10%) fit-content(18%) 1fr; }
+table.cves tbody, table.cves thead, table.cves tr,
+table.packages tbody, table.packages thead, table.packages tr { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; }
 table.cves th, table.cves td,
 table.packages th, table.packages td {
   text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
@@ -232,15 +242,16 @@ table.cves th, table.packages th {
 .cve-row.sev-row-CRITICAL { background: rgba(249, 65, 68, 0.06); }
 .cve-row.sev-row-HIGH     { background: rgba(214, 90, 49, 0.05); }
 
-table.packages col.col-pkg     { width: 22%; }
-table.packages col.col-version { width: 14%; }
-table.packages col.col-type    { width: 10%; }
-table.packages col.col-source  { width: 18%; }
-table.packages col.col-target  { width: 36%; }
+:is(details, details[open]) > summary:first-of-type:has(> :is(h1, h2, h3, h4, h5)) {
+    list-style-type: none;
+}
+details > summary:first-of-type > :is(h1, h2, h3, h4, h5) {
+    display: list-item;
+    counter-increment: list-item 0;
+    list-style-position: inside;
+    list-style-type: disclosure-closed;
 
-table.cves col.col-sev      { width: 90px; }
-table.cves col.col-id       { width: 160px; }
-table.cves col.col-pkg      { width: 18%; }
-table.cves col.col-installed { width: 12%; }
-table.cves col.col-fixed    { width: 12%; }
-table.cves col.col-title    { width: auto; }
+}
+details[open] > summary:first-of-type > :is(h1, h2, h3, h4, h5) {
+    list-style-type: disclosure-open;
+}

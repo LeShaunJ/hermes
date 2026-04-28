@@ -31,28 +31,33 @@
 
   {{$cves := vulnList .ScanReport}}
   {{if $cves}}
-    <h2>Vulnerabilities ({{len $cves}})</h2>
-    {{template "_cves.html" $cves}}
+    <details open>
+      <summary><h2>Vulnerabilities ({{len $cves}})</h2></summary>
+      {{template "_cves.html" $cves}}
+    </details>
   {{end}}
 
   {{$pkgs := packageList .ScanReport}}
   {{if $pkgs}}
-    <h2>Packages ({{len $pkgs}})</h2>
-    {{template "_packages.html" $pkgs}}
+    <details>
+      <summary><h2>Packages ({{len $pkgs}})</h2></summary>
+      {{template "_packages.html" $pkgs}}
+    </details>
   {{end}}
 
-  <h2>Manifest</h2>
   {{$manifest := prettyJSON .Manifest}}
-  <div class="json-block">
-    {{template "_copy_btn.html" $manifest}}
-    <pre class="json">{{$manifest}}</pre>
-  </div>
+    <details>
+      <summary><h2>Manifest</h2></summary>
+      <div class="json-block">
+        {{template "_copy_btn.html" $manifest}}
+        <pre class="json">{{$manifest}}</pre>
+      </div>
+    </details>
 
   {{if .ScanReport}}
-    <h2>Scan report (raw)</h2>
     {{$report := prettyJSON .ScanReport}}
     <details>
-      <summary>show JSON</summary>
+      <summary><h2>Scan report (raw)</h2></summary>
       <div class="json-block">
         {{template "_copy_btn.html" $report}}
         <pre class="json">{{$report}}</pre>
