@@ -101,6 +101,11 @@
   // and only the changed cells repaint.  410 Gone removes the target
   // outright — server-side filter-aware dispatch uses this to drop a
   // row when the new state no longer passes the page's filter.
+  //
+  // contextElement is passed explicitly: htmx 2.x's swap-style
+  // dispatcher walks up from the contextElement to find hx-ext, and
+  // without one the morph extension is never invoked — htmx falls
+  // back to defaultSwapStyle ("morph") and silently no-ops.
   function refreshElement(target, url, swapStyle) {
     if (!target || !url) return;
     fetch(url, {
@@ -114,7 +119,7 @@
       .then(function (html) {
         if (!html || !html.trim()) return;
         if (window.htmx && htmx.swap) {
-          htmx.swap(target, html, { swapStyle: swapStyle || "morph" });
+          htmx.swap(target, html, { swapStyle: swapStyle || "morph" }, { contextElement: target });
         }
       })
       .catch(function () { /* leave the DOM alone on transient failure */ });
