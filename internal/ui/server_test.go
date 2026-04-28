@@ -883,7 +883,9 @@ func TestDashboard_basePathPrefixesAssets(t *testing.T) {
 	for _, want := range []string{
 		`href="/ui/static/hermes.css"`,
 		`src="/ui/static/htmx.min.js"`,
+		`src="/ui/static/idiomorph-ext.min.js"`,
 		`data-base="/ui"`,
+		`hx-ext="morph"`,
 		`href="/ui/images/1"`,
 	} {
 		if !strings.Contains(body, want) {

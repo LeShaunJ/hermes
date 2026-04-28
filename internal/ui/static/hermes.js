@@ -1,9 +1,13 @@
 // hermes operator console — custom client logic that sits alongside
-// htmx 2.x.  htmx handles every hx-*, hx-swap-oob, hx-target, etc.;
-// this file does the project-specific bits htmx does not know about:
+// htmx 2.x + idiomorph.  htmx handles every hx-*, hx-swap-oob,
+// hx-target, etc.; this file does the project-specific bits htmx does
+// not know about:
 //
 //   - adds Hx-Indent / Hx-Group headers derived from the source row's
 //     CSS class so server-side row swaps preserve tree nesting,
+//   - tracks image ids the current tab just acted on so the SSE
+//     handler can skip the redundant refresh the inline OOB already
+//     covered (the click-spam flicker fix),
 //   - subscribes to /events (SSE) and dispatches each event type to
 //     the right refresh primitive (row, repo tbody, image-detail
 //     section), including filter-aware row removal,
@@ -17,22 +21,58 @@
 
   function base() { return document.body.dataset.base || ""; }
 
+  // Default every swap to idiomorph ("morph" extension on <body>) so
+  // SSE-triggered tbody / row refreshes diff the existing DOM rather
+  // than destroying and recreating it — preserving expand state and
+  // avoiding the "rebuild flash" between two back-to-back updates.
+  if (window.htmx && htmx.config) {
+    htmx.config.defaultSwapStyle = "morph";
+  }
+
+  // ── Local-action dedup ────────────────────────────────────────────────
+  // A click on /images/{id}/<verb> returns inline OOB swaps that update
+  // the row + ancestor cells.  Postgres NOTIFY also broadcasts that
+  // event to every tab over SSE — *including* the originator.  Without
+  // dedup the originator does the OOB swap and then immediately
+  // refetches the whole repo tbody from the SSE handler, which is what
+  // the user sees as flicker when clicking rapidly.  Mark the image id
+  // here, gate the SSE handler against the mark, expire after a TTL.
+  var localActionTTL = 1500; // ms — outlasts NOTIFY round-trip on a
+                             // loopback compose stack without swallowing
+                             // a legitimate follow-up event.
+  var localActions = Object.create(null);
+  function markLocalAction(id) {
+    if (!id) return;
+    localActions[id] = Date.now() + localActionTTL;
+  }
+  function isLocalEcho(id) {
+    var until = localActions[id];
+    if (!until) return false;
+    if (Date.now() > until) { delete localActions[id]; return false; }
+    return true;
+  }
+  var actionPathRE = /\/images\/(\d+)\/(scan|approve|reject|rescind|fetch)$/;
+
   // ── htmx:configRequest ────────────────────────────────────────────────
   // htmx already sends HX-Request, HX-Current-URL, HX-Target, HX-Trigger
   // on every request.  We add two custom headers so the server-side
   // partial knows where this row lives in the tree (level-1/2/3 +
   // its parent group) and can render the swap response with the same
-  // nesting it had before.
+  // nesting it had before, and we tag the image id so the SSE listener
+  // can dedup the echo.
   document.body.addEventListener("htmx:configRequest", function (e) {
     var src = e.detail.elt;
     var row = src && src.closest && src.closest("tr");
-    if (!row) return;
-    var indent = "0";
-    if (row.classList.contains("tree-lvl-3")) indent = "2";
-    else if (row.classList.contains("tree-lvl-2")) indent = "1";
-    e.detail.headers["Hx-Indent"] = indent;
-    var grp = row.getAttribute("data-group");
-    if (grp) e.detail.headers["Hx-Group"] = grp;
+    if (row) {
+      var indent = "0";
+      if (row.classList.contains("tree-lvl-3")) indent = "2";
+      else if (row.classList.contains("tree-lvl-2")) indent = "1";
+      e.detail.headers["Hx-Indent"] = indent;
+      var grp = row.getAttribute("data-group");
+      if (grp) e.detail.headers["Hx-Group"] = grp;
+    }
+    var m = actionPathRE.exec(e.detail.path || "");
+    if (m) markLocalAction(parseInt(m[1], 10));
   });
 
   // ── SSE-driven row refreshes ──────────────────────────────────────────
@@ -50,9 +90,11 @@
 
   // refreshElement fetches html and hands it to htmx so OOB and target
   // swaps go through htmx's parser-aware fragment processing instead
-  // of any home-grown logic.  410 Gone removes the target outright —
-  // server-side filter-aware dispatch uses this to drop a row when
-  // the new state no longer passes the page's filter.
+  // of any home-grown logic.  Swap style defaults to "morph" so DOM
+  // identity is preserved across refreshes — child rows stay in place
+  // and only the changed cells repaint.  410 Gone removes the target
+  // outright — server-side filter-aware dispatch uses this to drop a
+  // row when the new state no longer passes the page's filter.
   function refreshElement(target, url, swapStyle) {
     if (!target || !url) return;
     fetch(url, {
@@ -66,7 +108,7 @@
       .then(function (html) {
         if (!html || !html.trim()) return;
         if (window.htmx && htmx.swap) {
-          htmx.swap(target, html, { swapStyle: swapStyle || "outerHTML" });
+          htmx.swap(target, html, { swapStyle: swapStyle || "morph" });
         }
       })
       .catch(function () { /* leave the DOM alone on transient failure */ });
@@ -75,19 +117,19 @@
   function refreshRow(id) {
     var row = document.getElementById("image-" + id);
     if (!row) return;
-    refreshElement(row, base() + "/images/" + id + "/row", "outerHTML");
+    refreshElement(row, base() + "/images/" + id + "/row");
   }
 
   function refreshRepoTbody(rowID) {
     var tbody = document.getElementById("tbody-" + rowID);
     if (!tbody) return;
-    refreshElement(tbody, tbody.getAttribute("data-refresh"), "outerHTML");
+    refreshElement(tbody, tbody.getAttribute("data-refresh"));
   }
 
   function refreshDetail(id) {
     var section = document.getElementById("image-detail");
     if (!section || section.dataset.imageId !== String(id)) return;
-    refreshElement(section, base() + "/images/" + id + "/detail", "innerHTML");
+    refreshElement(section, base() + "/images/" + id + "/detail", "morph:innerHTML");
   }
 
   // refreshAncestorRepo walks up the row's data-group chain to the
@@ -135,7 +177,7 @@
       var data = null;
       try { data = JSON.parse(ev.data); } catch (e) { /* ignore */ }
       if (!data) return;
-      if (data.image_id && rowRefreshEvents[data.event_type]) {
+      if (data.image_id && rowRefreshEvents[data.event_type] && !isLocalEcho(data.image_id)) {
         var row = document.getElementById("image-" + data.image_id);
         if (row) refreshAncestorRepo(row);
         refreshRow(data.image_id);
