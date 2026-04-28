@@ -36,10 +36,8 @@
         <th></th>
       </tr>
     </thead>
-    <tbody id="image-tree">
-      {{range .Tree}}{{template "_repo_row.html" .}}{{end}}
-      {{if not .Tree}}<tr><td colspan="5" class="muted">no images match</td></tr>{{end}}
-    </tbody>
+    {{range .Tree}}{{template "_repo_tbody.html" .}}{{end}}
+    {{if not .Tree}}<tbody><tr><td colspan="5" class="muted">no images match</td></tr></tbody>{{end}}
   </table>
 </section>
 {{end}}

@@ -1,0 +1,28 @@
+{{define "_repo_tbody.html"}}
+{{$rowID := printf "repo:%s|%s" .RegistryURL .Repository}}
+{{$tbodyID := printf "tbody-%s" $rowID}}
+{{$childGroup := printf "tg-%s" $rowID}}
+{{$base := base}}
+{{$refresh := printf "%s/repos/%s/%s/tbody" $base .RegistryURL .Repository}}
+<tbody class="repo-tbody" id="{{$tbodyID}}" data-refresh="{{$refresh}}">
+  <tr class="tree-row tree-lvl-1" id="row-{{$rowID}}">
+    <td class="tree-col-1">
+      <a href="{{$base}}/repos/{{.RegistryURL}}/{{.Repository}}">{{.RegistryURL}}/{{.Repository}}</a>
+    </td>
+    <td></td>
+    <td id="state-{{$rowID}}">{{template "_state_summary.html" .States}}</td>
+    <td class="muted" title="{{formatTime .UpdatedAt}}">{{formatRelative .UpdatedAt}}</td>
+    <td class="row-actions">
+      {{if .TagSets}}
+        <button type="button"
+                class="toggle"
+                data-row-id="{{$rowID}}"
+                data-expand-label="expand ({{len .TagSets}})"
+                aria-expanded="false"
+                aria-controls="{{$childGroup}}">expand ({{len .TagSets}})</button>
+      {{end}}
+    </td>
+  </tr>
+  {{range .TagSets}}{{template "_tagset_row.html" (dict "Repo" $.RegistryURL "Path" $.Repository "TagSet" . "Group" $childGroup)}}{{end}}
+</tbody>
+{{end}}

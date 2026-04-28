@@ -1,0 +1,15 @@
+{{define "_action_response.html"}}
+{{$img := .Image}}
+{{$tsKey := .TSKey}}
+{{$repoKey := .RepoKey}}
+{{if .RemoveRow}}
+{{/* Filter no longer matches — drop the row from the current view. */}}
+<template><tr id="image-{{$img.ID}}" hx-swap-oob="delete:#image-{{$img.ID}}"></tr></template>
+{{else}}
+{{template "_row.html" (dict "Image" $img "Group" .Group "Indent" .Indent "Hidden" false)}}
+{{end}}
+<template>
+  <td id="state-{{$tsKey}}" hx-swap-oob="true">{{template "_state_summary.html" .TSStates}}</td>
+  <td id="state-{{$repoKey}}" hx-swap-oob="true">{{template "_state_summary.html" .RepoStates}}</td>
+</template>
+{{end}}

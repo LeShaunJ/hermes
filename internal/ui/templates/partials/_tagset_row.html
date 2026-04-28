@@ -7,7 +7,7 @@
 {{$base := base}}
 {{$refresh := ""}}
 {{if $ts.TagDigest}}{{$refresh = printf "%s/repos/%s/%s/tags/%s/row" $base $reg $path $digestHref}}{{end}}
-<tr class="tree-row tree-lvl-2" id="row-{{$rowID}}" data-group="{{$parentGroup}}"{{if $refresh}} data-refresh="{{$refresh}}"{{end}} hidden>
+<tr class="tree-row tree-lvl-2" id="row-{{$rowID}}" data-group="{{$parentGroup}}" data-tg-id="{{$childGroup}}"{{if $refresh}} data-refresh="{{$refresh}}"{{end}} hidden>
   <td class="tree-col-1 indent-1">
     {{if $ts.TagDigest}}
       <a href="{{$base}}/repos/{{$reg}}/{{$path}}/tags/{{$digestHref}}">
@@ -19,7 +19,7 @@
     {{end}}
   </td>
   <td class="muted">{{template "_digest.html" $ts.TagDigest}}</td>
-  <td>{{template "_state_summary.html" $ts.States}}</td>
+  <td id="state-{{$rowID}}">{{template "_state_summary.html" $ts.States}}</td>
   <td class="muted" title="{{formatTime $ts.UpdatedAt}}">{{formatRelative $ts.UpdatedAt}}</td>
   <td class="row-actions">
     {{if $ts.Images}}

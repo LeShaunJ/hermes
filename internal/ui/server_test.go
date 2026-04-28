@@ -1343,7 +1343,7 @@ func TestActionFromDetailPage_returnsDetailPartial(t *testing.T) {
 	}
 }
 
-func TestViewRepoRow_partial(t *testing.T) {
+func TestViewRepoTbody_partial(t *testing.T) {
 	mock := &mockStorage{listImages: []db.Image{
 		{ID: 1, RegistryURL: "docker.io", Repository: "library/alpine",
 			TagName: "latest", TagDigest: "sha256:topAA",
@@ -1353,16 +1353,18 @@ func TestViewRepoRow_partial(t *testing.T) {
 	srv := newTestServer(t, mock)
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/repos/docker.io/library/alpine/row", nil)
+	r := httptest.NewRequest(http.MethodGet, "/repos/docker.io/library/alpine/tbody", nil)
 	srv.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
 	for _, want := range []string{
+		`<tbody class="repo-tbody"`,
+		`id="tbody-repo:docker.io|library/alpine"`,
 		`row-repo:docker.io|library/alpine`,
 		`approved: <strong>1</strong>`,
-		`data-refresh="/repos/docker.io/library/alpine/row"`,
+		`data-refresh="/repos/docker.io/library/alpine/tbody"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q\n%s", want, body)
@@ -1555,6 +1557,80 @@ func TestActionScan_fromDetailPage_returnsDetailPartialWithBusyState(t *testing.
 		t.Errorf("expected scanning button on detail swap\n%s", body)
 	}
 	close(gate)
+}
+
+func TestActionResponse_includesOOBStateCells(t *testing.T) {
+	img := newImg(91, db.StateScanned)
+	img.TagDigest = "sha256:topAA"
+	mock := &mockStorage{
+		byID:       map[int64]*db.Image{91: img},
+		listImages: []db.Image{*img},
+	}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/91/approve", nil)
+	r.Header.Set("Hx-Request", "true")
+	r.Header.Set("Hx-Current-URL", "http://localhost/images")
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`id="image-91"`, // primary swap
+		`id="state-ts:registry.example.com|myorg/myapp|sha256:topAA"`,
+		`id="state-repo:registry.example.com|myorg/myapp"`,
+		`hx-swap-oob="true"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n%s", want, body)
+		}
+	}
+}
+
+func TestActionResponse_filterMismatchEmitsDeleteOOB(t *testing.T) {
+	// Image is currently `queued`; after approve it becomes
+	// `approved`, which should disappear from a /images?state=queued
+	// view via an OOB delete directive.
+	img := newImg(92, db.StateQueued)
+	mock := &mockStorage{
+		byID:       map[int64]*db.Image{92: img},
+		listImages: []db.Image{*img},
+	}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/images/92/approve", nil)
+	r.Header.Set("Hx-Request", "true")
+	r.Header.Set("Hx-Current-URL", "http://localhost/images?state=queued")
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `hx-swap-oob="delete:#image-92"`) {
+		t.Errorf("expected delete OOB directive\n%s", body)
+	}
+	// The full row partial must NOT be in the body, since the row
+	// shouldn't appear under the queued filter anymore.
+	if strings.Contains(body, `<tr id="image-92" class="`) {
+		t.Errorf("row should not be rendered when filter rejects it\n%s", body)
+	}
+}
+
+func TestViewImageRow_filterMismatchReturns410(t *testing.T) {
+	img := newImg(93, db.StateApproved)
+	mock := &mockStorage{byID: map[int64]*db.Image{93: img}}
+	srv := newTestServer(t, mock)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/images/93/row", nil)
+	r.Header.Set("Hx-Current-URL", "http://localhost/images?state=queued")
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusGone {
+		t.Errorf("status = %d, want 410 (current filter excludes the row)", w.Code)
+	}
 }
 
 func TestReposRouteRemoved(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -280,11 +281,17 @@ func (s *Server) actionPrep(w http.ResponseWriter, r *http.Request) (int64, bool
 	return id, true
 }
 
-// respondAction writes the right partial for the source page: a row
-// partial when the action came from a tree row (Hx-Target=image-{id}),
-// or the image-detail partial when the action came from the detail
-// page (Hx-Target=image-detail).  Non-htmx requests redirect to the
-// image detail page.
+// respondAction writes the right response shape for the source page:
+//
+//   - Detail page (Hx-Target=image-detail) → re-render the detail
+//     partial inline so the section swaps in place.
+//   - Tree row (anything else) → emit a multi-swap response: the
+//     updated row in its target slot, plus OOB swaps for the parent
+//     tag-set and repo state-summary cells.  When the current view's
+//     state filter no longer admits the new state, the row is replaced
+//     with an `hx-swap-oob="delete"` directive so it disappears.
+//
+// Non-htmx requests redirect to the image detail page.
 func (s *Server) respondAction(w http.ResponseWriter, r *http.Request, id int64) {
 	if r.Header.Get("Hx-Request") != "true" {
 		http.Redirect(w, r, fmt.Sprintf("%s/images/%d", s.cfg.UI.BasePath, id), http.StatusSeeOther)
@@ -303,5 +310,111 @@ func (s *Server) respondAction(w http.ResponseWriter, r *http.Request, id int64)
 		s.tmpl.render(w, "_image_detail.html", *img)
 		return
 	}
-	s.renderRow(w, r, img)
+	s.renderActionResponse(w, r, img)
+}
+
+// renderActionResponse writes the multi-swap row response for an
+// action triggered from a tree page.  See respondAction.
+func (s *Server) renderActionResponse(w http.ResponseWriter, r *http.Request, img *db.Image) {
+	indent := 0
+	if v := r.Header.Get("Hx-Indent"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 2 {
+			indent = n
+		}
+	}
+	tsKey := tagSetKey(img.RegistryURL, img.Repository, img.TagDigest)
+	repoKey := fmt.Sprintf("repo:%s|%s", img.RegistryURL, img.Repository)
+
+	repoStates, tsStates, err := s.computeAncestorStates(img)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.tmpl.render(w, "_action_response.html", map[string]interface{}{
+		"Image":      *img,
+		"Group":      r.Header.Get("Hx-Group"),
+		"Indent":     indent,
+		"RemoveRow":  !s.imageMatchesCurrentFilter(r, img),
+		"TSKey":      tsKey,
+		"RepoKey":    repoKey,
+		"TSStates":   tsStates,
+		"RepoStates": repoStates,
+	})
+}
+
+// computeAncestorStates totals state counts across the image's
+// repository (level 1) and the tag-set within that repository it
+// shares a top-level digest with (level 2).  Used to populate OOB
+// state-summary chips on action responses without recomputing the
+// whole tree.
+func (s *Server) computeAncestorStates(img *db.Image) (repoStates, tsStates map[string]int, err error) {
+	imgs, err := s.db.List(db.ListFilter{Refs: []string{img.RegistryURL + "/" + img.Repository}})
+	if err != nil {
+		return nil, nil, err
+	}
+	imgs = dedupImages(imgs)
+	repoStates = map[string]int{}
+	tsStates = map[string]int{}
+	for _, m := range imgs {
+		repoStates[string(m.State)]++
+		if m.TagDigest == img.TagDigest {
+			tsStates[string(m.State)]++
+		}
+	}
+	return repoStates, tsStates, nil
+}
+
+// imageMatchesCurrentFilter inspects the operator's current page URL
+// (sent as Hx-Current-URL by the shim, with Referer as a fallback) and
+// reports whether img would still appear under the page's `state`
+// filter.  Returns true when the filter is empty or absent so action
+// responses default to a normal swap.
+func (s *Server) imageMatchesCurrentFilter(r *http.Request, img *db.Image) bool {
+	cur := r.Header.Get("Hx-Current-URL")
+	if cur == "" {
+		cur = r.Header.Get("Referer")
+	}
+	if cur == "" {
+		return true
+	}
+	u, err := url.Parse(cur)
+	if err != nil {
+		return true
+	}
+	states := u.Query()["state"]
+	if len(states) == 0 {
+		return true
+	}
+	var allowed []db.State
+	for _, raw := range states {
+		for _, item := range strings.Split(raw, ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			if list, lerr := db.ParseStateOrGroup(item); lerr == nil {
+				allowed = append(allowed, list...)
+			}
+		}
+	}
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, st := range allowed {
+		if st == img.State {
+			return true
+		}
+	}
+	return false
+}
+
+// tagSetKey returns the rowID-style identifier for a tag-set, matching
+// the keys emitted by the tree templates (`ts:reg|path|digest` or
+// `ts:reg|path|stub` for the unresolved bucket).
+func tagSetKey(registry, repository, digest string) string {
+	d := digest
+	if d == "" {
+		d = "stub"
+	}
+	return fmt.Sprintf("ts:%s|%s|%s", registry, repository, d)
 }

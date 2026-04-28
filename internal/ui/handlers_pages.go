@@ -91,6 +91,11 @@ func (s *Server) imageTree(w http.ResponseWriter, r *http.Request) {
 // `Hx-Indent` and `Hx-Group` headers (set by the shim from the source
 // row's CSS class and `data-group` attribute) so the swap preserves
 // indent and parent-collapse linkage.
+//
+// If the calling page applies a state filter (carried via the
+// Hx-Current-URL header) and the image's current state no longer
+// passes it, the endpoint returns 410 Gone — the shim treats that as
+// "remove the row" so a filtered view stays consistent.
 func (s *Server) viewImageRow(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -104,6 +109,10 @@ func (s *Server) viewImageRow(w http.ResponseWriter, r *http.Request) {
 	}
 	if img == nil {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.imageMatchesCurrentFilter(r, img) {
+		w.WriteHeader(http.StatusGone)
 		return
 	}
 	s.renderRow(w, r, img)
@@ -157,17 +166,20 @@ func (s *Server) viewImageDetail(w http.ResponseWriter, r *http.Request) {
 // handler parses the trailing form itself:
 //
 //	/repos/{reg}/{path}                          → repo detail page
-//	/repos/{reg}/{path}/row                      → level-1 row partial
+//	/repos/{reg}/{path}/tbody                    → level-1 tbody partial
 //	/repos/{reg}/{path}/tags/{digest}            → tag-set detail page
 //	/repos/{reg}/{path}/tags/{digest}/row        → level-2 row partial
 func (s *Server) viewRepoOrTagSet(w http.ResponseWriter, r *http.Request) {
 	registry := r.PathValue("registry")
 	rest := r.PathValue("path")
 
-	// Strip a trailing /row marker first so we can route partial
-	// requests independently of detail-page requests.
+	wantTbody := false
 	wantRow := false
-	if strings.HasSuffix(rest, "/row") {
+	switch {
+	case strings.HasSuffix(rest, "/tbody"):
+		wantTbody = true
+		rest = strings.TrimSuffix(rest, "/tbody")
+	case strings.HasSuffix(rest, "/row"):
 		wantRow = true
 		rest = strings.TrimSuffix(rest, "/row")
 	}
@@ -191,8 +203,8 @@ func (s *Server) viewRepoOrTagSet(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case wantRow && digest != "":
 		s.viewTagSetRow(w, r, registry, repoPath, digest)
-	case wantRow:
-		s.viewRepoRow(w, r, registry, repoPath)
+	case wantTbody:
+		s.viewRepoTbody(w, r, registry, repoPath)
 	case digest != "":
 		s.viewTagSet(w, r, registry, repoPath, digest)
 	default:
@@ -200,10 +212,11 @@ func (s *Server) viewRepoOrTagSet(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// viewRepoRow re-renders the level-1 (repo) tree row in isolation.
-// Used by the shim when an SSE event fires for a child image whose
-// repo row state-summary chips need to refresh.
-func (s *Server) viewRepoRow(w http.ResponseWriter, r *http.Request, registry, repoPath string) {
+// viewRepoTbody re-renders the level-1 (repo) <tbody> in isolation.  The
+// whole tbody is the swap unit so a refresh has a deterministic
+// boundary — no orphan child rows from the partial-includes-children
+// shape that bit us before.
+func (s *Server) viewRepoTbody(w http.ResponseWriter, r *http.Request, registry, repoPath string) {
 	imgs, err := s.db.List(db.ListFilter{Refs: []string{registry + "/" + repoPath}})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -212,7 +225,7 @@ func (s *Server) viewRepoRow(w http.ResponseWriter, r *http.Request, registry, r
 	tree := groupTree(imgs)
 	for _, repo := range tree {
 		if repo.RegistryURL == registry && repo.Repository == repoPath {
-			s.tmpl.render(w, "_repo_row.html", repo)
+			s.tmpl.render(w, "_repo_tbody.html", repo)
 			return
 		}
 	}
