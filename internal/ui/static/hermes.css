@@ -10,6 +10,18 @@
   --line: #1d232b;
   --panel: #131820;
   --code: #161b22;
+
+  /* Fluid type scale: interpolates 320px → 1280px viewport, 1.25 ratio.
+     Multiply by 1rem at use site; consumers compose with line-height. */
+  --fs-100: clamp(0.6875rem, 0.66rem + 0.14vw, 0.75rem);    /* 11→12 */
+  --fs-200: clamp(0.75rem,   0.71rem + 0.18vw, 0.875rem);   /* 12→14 */
+  --fs-300: clamp(0.8125rem, 0.78rem + 0.18vw, 0.9375rem);  /* 13→15 */
+  --fs-400: clamp(0.875rem,  0.83rem + 0.21vw, 1rem);       /* 14→16 body */
+  --fs-500: clamp(1.094rem,  1.04rem + 0.26vw, 1.25rem);    /* 17.5→20 */
+  --fs-600: clamp(1.367rem,  1.30rem + 0.33vw, 1.5625rem);  /* 21.9→25 */
+  --fs-700: clamp(1.709rem,  1.62rem + 0.41vw, 1.953rem);   /* 27.3→31 */
+
+  --topbar-h: 3rem;
 }
 @media (prefers-color-scheme: light) {
   :root {
@@ -24,7 +36,7 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
 body {
-  font: 14px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
+  font: var(--fs-400)/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
   background: var(--bg); color: var(--fg);
 }
 a { color: var(--accent); text-decoration: none; }
@@ -32,31 +44,58 @@ a:hover { text-decoration: underline; }
 code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 pre.json {
   background: var(--code); border: 1px solid var(--line); border-radius: 4px;
-  padding: 12px; overflow: auto; max-height: 400px; font-size: 12px;
+  padding: 12px; overflow: auto; max-height: 400px; font-size: var(--fs-200);
 }
 .muted { color: var(--muted); }
 
 .topbar {
   display: flex; align-items: center; gap: 24px;
   padding: 10px 20px; border-bottom: 1px solid var(--line);
-  background: var(--panel);
+  background: color-mix(in oklab, var(--panel) 90%, transparent);
+  backdrop-filter: blur(8px);
+  position: sticky; top: 0; z-index: 100;
+  min-height: var(--topbar-h);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .topbar { background: var(--panel); }
 }
 .topbar .brand a { color: var(--fg); font-weight: 600; }
 .topbar nav { display: flex; gap: 16px; flex: 1; }
 .topbar nav a { color: var(--muted); }
 .topbar nav a:hover { color: var(--fg); }
-.topbar .live { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.topbar .live { font-size: var(--fs-200); color: var(--muted); display: flex; align-items: center; gap: 6px; }
 .topbar .live .dot {
   width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
   box-shadow: 0 0 6px var(--accent); animation: pulse 2s infinite;
 }
 @keyframes pulse { 50% { opacity: 0.4; } }
 
-main { max-width: 1200px; margin: 0 auto; padding: 24px 20px; }
-footer { padding: 16px 20px; color: var(--muted); font-size: 12px; text-align: center; }
+main {
+  max-width: 1200px; margin: 0 auto; padding: 24px 20px;
+  /* Container-type so descendant tables react to their parent width
+     rather than the viewport — keeps the transpose intact even when a
+     future side panel narrows <main>. */
+  container-type: inline-size;
+  scroll-padding-top: var(--topbar-h);
+}
+footer { padding: 16px 20px; color: var(--muted); font-size: var(--fs-200); text-align: center; }
 
-h1 { margin: 0 0 12px 0; font-size: 22px; font-weight: 600; }
-h2 { margin: 32px 0 12px 0; font-size: 16px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+h1 { margin: 0 0 12px 0; font-size: var(--fs-600); font-weight: 600; }
+h2 { margin: 32px 0 12px 0; font-size: var(--fs-500); font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+
+/* Heading truncation inside main: long registry/repo:tag identifiers
+   wrap to two lines and ellipsize, instead of pushing the layout
+   horizontally. -webkit-box is the only widely-supported recipe for
+   line-clamp today (Safari still requires the prefix). */
+main :is(h1, h2, h3, h4, h5, h6) {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 16px 0 32px 0; }
 .tile {
@@ -65,11 +104,11 @@ h2 { margin: 32px 0 12px 0; font-size: 16px; font-weight: 600; color: var(--mute
   border-radius: 6px; color: var(--fg);
 }
 .tile:hover { border-color: var(--accent); text-decoration: none; }
-.tile-count { font-size: 28px; font-weight: 600; margin-bottom: 4px; }
+.tile-count { font-size: var(--fs-700); font-weight: 600; margin-bottom: 4px; }
 
 .state {
   display: inline-block; padding: 2px 8px; border-radius: 12px;
-  font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+  font-size: var(--fs-100); text-transform: uppercase; letter-spacing: 0.5px;
   background: var(--line); color: var(--fg);
   white-space: nowrap;
   align-self: flex-start;
@@ -88,12 +127,12 @@ table.images {
 table.images tbody, table.images thead, table.images tr { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; }
 table.images { width: 100%; border-collapse: collapse; }
 table.images th, table.images td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
-table.images th { font-weight: 500; color: var(--muted); font-size: 12px; text-transform: uppercase; }
+table.images th { font-weight: 500; color: var(--muted); font-size: var(--fs-200); text-transform: uppercase; }
 table.images td.row-actions { text-align: right; }
 table.images.compact th, table.images.compact td { padding: 6px 8px; }
 
 .filters { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; align-items: end; }
-.filters label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.filters label { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-200); color: var(--muted); }
 .filters input, .filters select {
   background: var(--panel); color: var(--fg);
   border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px;
@@ -119,7 +158,7 @@ button, .filters button {
 button:hover { filter: brightness(1.1); }
 
 .actions-inline { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
-.actions-inline button { padding: 4px 10px; font-size: 12px; }
+.actions-inline button { padding: 4px 10px; font-size: var(--fs-200); }
 
 /* In-flight scan: button is disabled, sports a small spinner, and the
    row reads as busy via `aria-busy`.  The SSE handler refetches the
@@ -147,7 +186,7 @@ button.scanning .spinner {
   border: 1px solid var(--line); border-radius: 6px; margin: 16px 0;
 }
 .image-detail .meta div { display: flex; flex-direction: column; min-width: 0; }
-.image-detail .meta .muted { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+.image-detail .meta .muted { font-size: var(--fs-100); text-transform: uppercase; letter-spacing: 0.5px; }
 /* Long values (digests, cache URLs) truncate with an ellipsis instead of
    blowing the cell out and forcing horizontal scroll. The full value
    stays available via the inline `code` element's title attribute. */
@@ -155,13 +194,13 @@ button.scanning .spinner {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: var(--fs-200);
 }
 .image-detail .actions { margin: 16px 0; }
 .image-detail .actions-inline { justify-content: flex-start; }
 
 .severities { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
-.sev { padding: 4px 12px; border-radius: 4px; font-size: 12px; }
+.sev { padding: 4px 12px; border-radius: 4px; font-size: var(--fs-200); }
 .sev-CRITICAL { background: var(--bad); color: #fff; }
 .sev-HIGH     { background: #d65a31; color: #fff; }
 .sev-MEDIUM   { background: var(--warn); color: #1a1a1a; }
@@ -176,7 +215,7 @@ table.images.tree td { vertical-align: middle; }
 button.toggle {
   background: transparent; color: var(--muted);
   border: 1px solid var(--line); border-radius: 4px;
-  padding: 2px 10px; font-size: 12px; cursor: pointer;
+  padding: 2px 10px; font-size: var(--fs-200); cursor: pointer;
 }
 button.toggle:hover { color: var(--fg); border-color: var(--accent); }
 button.toggle[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
@@ -186,7 +225,7 @@ code.tag {
   display: inline-block;
   padding: 1px 6px; margin: 0 2px;
   background: var(--line); color: var(--fg);
-  border-radius: 3px; font-size: 11px;
+  border-radius: 3px; font-size: var(--fs-100);
 }
 
 /* Digest container — short hash + copy button on the same line. */
@@ -232,11 +271,11 @@ table.packages tbody, table.packages thead, table.packages tr { display: grid; g
 table.cves th, table.cves td,
 table.packages th, table.packages td {
   text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
-  font-size: 13px;
+  font-size: var(--fs-300);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 table.cves th, table.packages th {
-  font-size: 11px; text-transform: uppercase; color: var(--muted);
+  font-size: var(--fs-100); text-transform: uppercase; color: var(--muted);
 }
 .cve-title { color: var(--muted); }
 .cve-row.sev-row-CRITICAL { background: rgba(249, 65, 68, 0.06); }
@@ -254,4 +293,73 @@ details > summary:first-of-type > :is(h1, h2, h3, h4, h5) {
 }
 details[open] > summary:first-of-type > :is(h1, h2, h3, h4, h5) {
     list-style-type: disclosure-open;
+}
+
+/* ── narrow-container responsive layout ────────────────────────────────────
+   Triggered by <main>'s container-type:inline-size, so the rules apply
+   whenever the table's parent is narrow — phones, future side panels,
+   or a manually resized window. */
+@container (max-width: 640px) {
+  /* Tree-style tables become their own horizontal scroller; the
+     row-identity cell (.tree-col-1 in data rows, the first <th> in
+     the header) sticks to the left edge so the operator never loses
+     track of which row is which while scrolling sideways. */
+  table.images:not(.compact) {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+  }
+  table.images:not(.compact) thead th:first-child,
+  table.images:not(.compact) .tree-col-1,
+  table.images:not(.compact) tbody td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--bg);
+  }
+
+  /* Non-tree tables transpose: every <tr> becomes a vertical card
+     (a column in a horizontal scroller) and the <th>s become a
+     sticky label column on the left.  display:contents on the table
+     wrapper rows hoists every <th>/<td> into the table grid so
+     grid-auto-flow:column can re-orientate them. --fields is set
+     inline on each table to tell the grid how many rows to allocate. */
+  table.cves,
+  table.packages,
+  table.images.compact {
+    display: grid;
+    grid-auto-flow: column;
+    grid-template-rows: repeat(var(--fields, 5), auto);
+    grid-template-columns: max-content;
+    grid-auto-columns: minmax(min(75cqi, 18rem), 1fr);
+    column-gap: 0;
+
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    scroll-padding-inline-start: 9rem;
+    overscroll-behavior-x: contain;
+  }
+  :is(table.cves, table.packages, table.images.compact) :is(thead, tbody, tr) {
+    display: contents;
+  }
+  :is(table.cves, table.packages, table.images.compact) th {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--bg);
+    border-right: 1px solid var(--line);
+    text-align: right;
+    padding-inline-end: 0.75rem;
+    white-space: nowrap;
+  }
+  :is(table.cves, table.packages, table.images.compact) td {
+    border-left: 1px solid var(--line);
+    padding-inline: 0.75rem;
+    scroll-snap-align: start;
+    /* Allow long titles/digests to wrap inside a card column rather
+       than ellipsize on a single line — the card already constrains
+       horizontal space. */
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+  }
 }
